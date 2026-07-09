@@ -95,11 +95,11 @@ Supported request classes include:
 
 The server supports several communication modes:
 
-| Mode | Purpose |
-| --- | --- |
-| `tcp` | Socket-based QEMU/server communication. |
-| `shm` | Shared-memory ring-buffer communication through `/dev/shm`. |
-| `pgas-shm` | PGAS-style shared memory protocol used by `cxl_backend.h` clients. |
+| Mode            | Purpose                                                                 |
+| --------------- | ----------------------------------------------------------------------- |
+| `tcp`         | Socket-based QEMU/server communication.                                 |
+| `shm`         | Shared-memory ring-buffer communication through`/dev/shm`.            |
+| `pgas-shm`    | PGAS-style shared memory protocol used by`cxl_backend.h` clients.     |
 | `distributed` | Multi-node memory server mode with SHM, TCP, RDMA, or hybrid transport. |
 
 The memory pool is managed by `SharedMemoryManager`. It can use POSIX shared memory or a regular file as a backing store. The shared-memory header records a magic value, format version, total size, data offset, base address, and cache-line count. The default cache-line data area is mapped with `mmap()` and is reused when the backing object already exists.
@@ -221,21 +221,21 @@ For memory operations, the shim chunks large transfers through the BAR2 data buf
 
 The Type 2 GPU command interface uses BAR2 for control and data transfer.
 
-| Offset | Register | Description |
-| --- | --- | --- |
-| `0x0000` | `MAGIC` | `0x43584c32`, the string `CXL2`. |
-| `0x0004` | `VERSION` | Command interface version. |
-| `0x0008` | `STATUS` | Ready, busy, error, and context-active bits. |
-| `0x000c` | `CAPS` | Bulk transfer, coherent cache, DMA, pool, and bias capabilities. |
-| `0x0010` | `CMD` | Command register. Writes trigger execution. |
-| `0x0014` | `CMD_STATUS` | Idle, pending, running, complete, or error. |
-| `0x0018` | `CMD_RESULT` | CUDA-compatible result or error code. |
-| `0x0040-0x0078` | `PARAM0-7` | Command parameters. |
-| `0x0080-0x0098` | `RESULT0-3` | Command results. |
-| `0x0100` | `DEV_NAME` | Device name. |
-| `0x0140` | `TOTAL_MEM` | Total device memory. |
-| `0x0148` | `FREE_MEM` | Free device memory. |
-| `0x1000` | `DATA` | 1 MB transfer buffer for PTX, memcpy data, and arguments. |
+| Offset            | Register       | Description                                                      |
+| ----------------- | -------------- | ---------------------------------------------------------------- |
+| `0x0000`        | `MAGIC`      | `0x43584c32`, the string `CXL2`.                             |
+| `0x0004`        | `VERSION`    | Command interface version.                                       |
+| `0x0008`        | `STATUS`     | Ready, busy, error, and context-active bits.                     |
+| `0x000c`        | `CAPS`       | Bulk transfer, coherent cache, DMA, pool, and bias capabilities. |
+| `0x0010`        | `CMD`        | Command register. Writes trigger execution.                      |
+| `0x0014`        | `CMD_STATUS` | Idle, pending, running, complete, or error.                      |
+| `0x0018`        | `CMD_RESULT` | CUDA-compatible result or error code.                            |
+| `0x0040-0x0078` | `PARAM0-7`   | Command parameters.                                              |
+| `0x0080-0x0098` | `RESULT0-3`  | Command results.                                                 |
+| `0x0100`        | `DEV_NAME`   | Device name.                                                     |
+| `0x0140`        | `TOTAL_MEM`  | Total device memory.                                             |
+| `0x0148`        | `FREE_MEM`   | Free device memory.                                              |
+| `0x1000`        | `DATA`       | 1 MB transfer buffer for PTX, memcpy data, and arguments.        |
 
 BAR4 is reserved for larger bulk transfer experiments with a 64 MB transfer region.
 
@@ -428,19 +428,19 @@ qemu_launch_cxl1.sh
 
 The launcher reads the following runtime variables:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `CXL_TRANSPORT_MODE` | `shm` | QEMU transport mode: `shm` or `tcp`. |
-| `CXL_MEMSIM_HOST` | `127.0.0.1` | Local host for TCP mode. |
-| `CXL_MEMSIM_PORT` | `9999` | Local TCP server port. |
-| `CXL_PGAS_SHM` | `/cxlmemsim_pgas` | POSIX shared-memory object used by QEMU SHM mode. |
-| `CXL_MEMSIM_SERVER_BINARY` | package `bin/cxlmemsim_server` | Server binary started before QEMU. |
-| `CXL_MEMSIM_SERVER_AUTOSTART` | `auto` | Set to `1` to require server startup or `0` to disable it. |
-| `CXL_DCD_ENABLE` | `0` | Enables DCD reporting in integration wrappers. |
-| `CXL_GFAM_ENABLE` | `0` | Enables GFAM reporting in integration wrappers. |
-| `CXL_GFAM_HOST_ID` | `0` | Host ID passed to fabric-aware integrations. |
-| `CXL_MEMSIM_EARLY_INIT` | `0` | Connect QEMU's CXL Type 3 device to CXLMemSim during device realize instead of waiting for the first memory access. |
-| `CXL_MEMSIM_FABRIC_REFRESH_NS` | `1000000000` | Minimum interval between QEMU-side DCD/GFAM query refreshes. Set to `0` to disable periodic refreshes. |
+| Variable                         | Default                         | Meaning                                                                                                             |
+| -------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `CXL_TRANSPORT_MODE`           | `shm`                         | QEMU transport mode:`shm` or `tcp`.                                                                             |
+| `CXL_MEMSIM_HOST`              | `127.0.0.1`                   | Local host for TCP mode.                                                                                            |
+| `CXL_MEMSIM_PORT`              | `9999`                        | Local TCP server port.                                                                                              |
+| `CXL_PGAS_SHM`                 | `/cxlmemsim_pgas`             | POSIX shared-memory object used by QEMU SHM mode.                                                                   |
+| `CXL_MEMSIM_SERVER_BINARY`     | package`bin/cxlmemsim_server` | Server binary started before QEMU.                                                                                  |
+| `CXL_MEMSIM_SERVER_AUTOSTART`  | `auto`                        | Set to`1` to require server startup or `0` to disable it.                                                       |
+| `CXL_DCD_ENABLE`               | `0`                           | Enables DCD reporting in integration wrappers.                                                                      |
+| `CXL_GFAM_ENABLE`              | `0`                           | Enables GFAM reporting in integration wrappers.                                                                     |
+| `CXL_GFAM_HOST_ID`             | `0`                           | Host ID passed to fabric-aware integrations.                                                                        |
+| `CXL_MEMSIM_EARLY_INIT`        | `0`                           | Connect QEMU's CXL Type 3 device to CXLMemSim during device realize instead of waiting for the first memory access. |
+| `CXL_MEMSIM_FABRIC_REFRESH_NS` | `1000000000`                  | Minimum interval between QEMU-side DCD/GFAM query refreshes. Set to`0` to disable periodic refreshes.             |
 
 QEMU's `shm` transport uses the PGAS shared-memory protocol, so the packaged launcher maps `CXL_TRANSPORT_MODE=shm` to the server's `--comm-mode pgas-shm`.
 
@@ -622,33 +622,33 @@ Dynamic Capacity Device and GFAM:
 
 Useful options:
 
-| Option | Meaning |
-| --- | --- |
-| `--capacity` | CXL expander capacity in MB. |
-| `--default_latency` | Base device latency in ns. |
-| `--interleave_size` | Interleave granularity in bytes. |
-| `--topology` | Topology file using Newick-style syntax. |
-| `--comm-mode` | `tcp`, `shm`, `pgas-shm`, or `distributed`. |
-| `--backing-file` | Use a regular file instead of POSIX shared memory. |
-| `--ssd-backing-file` | Use persistent SSD streaming storage from a file or raw block device. |
-| `--ssd-cache-mb` | Resident SSD backend cache budget in MB. |
-| `--ssd-page-size` | SSD backend page size in bytes; default is 4096. |
-| `--ssd-io-chunk-size` | SSD backend I/O chunk size in bytes; default is 65536. |
-| `--ssd-read-ahead-pages` | Sequential read-ahead window in backend pages; default is 16. |
-| `--ssd-io-uring` | Use Linux `io_uring` with registered fixed file and buffer when available; default is on. |
-| `--ssd-odirect` | Open the backing file or block device with O_DIRECT when supported; default is on. |
-| `--pgas-shm-name` | POSIX shared memory name for PGAS request slots. |
-| `--node-id` | Distributed node ID. |
-| `--dist-shm-name` | Shared memory name for distributed node queues. |
-| `--transport-mode` | Distributed inter-node transport: `shm`, `tcp`, `rdma`, or `hybrid`. |
-| `--enable-dcd` | Enable the Dynamic Capacity Device model. |
-| `--dcd-granularity-mb` | DCD allocation granularity in MB. |
-| `--dcd-initial-capacity` | Initial DCD capacity in MB. Omit it to allocate the full `--capacity`. |
-| `--enable-gfam` | Enable GFAM access control and fabric latency accounting. |
-| `--gfam-hosts` | Number of GFAM host IDs to register. |
-| `--gfam-fabric-latency` | Per-access GFAM fabric latency in ns. |
-| `--gfam-bandwidth` | Aggregate GFAM bandwidth in GB/s. |
-| `SPDLOG_LEVEL` | Runtime log level, for example `debug` or `trace`. |
+| Option                     | Meaning                                                                                    |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| `--capacity`             | CXL expander capacity in MB.                                                               |
+| `--default_latency`      | Base device latency in ns.                                                                 |
+| `--interleave_size`      | Interleave granularity in bytes.                                                           |
+| `--topology`             | Topology file using Newick-style syntax.                                                   |
+| `--comm-mode`            | `tcp`, `shm`, `pgas-shm`, or `distributed`.                                        |
+| `--backing-file`         | Use a regular file instead of POSIX shared memory.                                         |
+| `--ssd-backing-file`     | Use persistent SSD streaming storage from a file or raw block device.                      |
+| `--ssd-cache-mb`         | Resident SSD backend cache budget in MB.                                                   |
+| `--ssd-page-size`        | SSD backend page size in bytes; default is 4096.                                           |
+| `--ssd-io-chunk-size`    | SSD backend I/O chunk size in bytes; default is 65536.                                     |
+| `--ssd-read-ahead-pages` | Sequential read-ahead window in backend pages; default is 16.                              |
+| `--ssd-io-uring`         | Use Linux`io_uring` with registered fixed file and buffer when available; default is on. |
+| `--ssd-odirect`          | Open the backing file or block device with O_DIRECT when supported; default is on.         |
+| `--pgas-shm-name`        | POSIX shared memory name for PGAS request slots.                                           |
+| `--node-id`              | Distributed node ID.                                                                       |
+| `--dist-shm-name`        | Shared memory name for distributed node queues.                                            |
+| `--transport-mode`       | Distributed inter-node transport:`shm`, `tcp`, `rdma`, or `hybrid`.                |
+| `--enable-dcd`           | Enable the Dynamic Capacity Device model.                                                  |
+| `--dcd-granularity-mb`   | DCD allocation granularity in MB.                                                          |
+| `--dcd-initial-capacity` | Initial DCD capacity in MB. Omit it to allocate the full`--capacity`.                    |
+| `--enable-gfam`          | Enable GFAM access control and fabric latency accounting.                                  |
+| `--gfam-hosts`           | Number of GFAM host IDs to register.                                                       |
+| `--gfam-fabric-latency`  | Per-access GFAM fabric latency in ns.                                                      |
+| `--gfam-bandwidth`       | Aggregate GFAM bandwidth in GB/s.                                                          |
+| `SPDLOG_LEVEL`           | Runtime log level, for example`debug` or `trace`.                                      |
 
 DCD/GFAM protocol operations are available over TCP and the PGAS shared-memory protocol. Query responses use the 64-byte response data area: DCD query returns total capacity, free capacity, active extents, and failed requests; GFAM query returns mappings, shared mappings, read/write/atomic operations, denied accesses, and average access latency.
 
@@ -818,21 +818,21 @@ ctest --test-dir build --output-on-failure
 
 The top-level CMake file builds every test source in `tests/`:
 
-| Target | Purpose | CTest |
-| --- | --- | --- |
-| `test_dcd_gfam` | Standalone DCD allocation and GFAM access-control checks. | Yes |
-| `test_rob` | Parses O3CPU/LSQ debug lines and feeds derived instructions into the ROB model. | Yes |
-| `test_mem_stall` | Compares O3CPU memory-stall debug intervals against modeled ROB stalls. | Yes |
-| `test_bandwidth_model` | Checks MLC-style bandwidth saturation and subtree-scoped fabric accounting. | Yes |
-| `test_distributed_shm` | Two in-process distributed memory servers over SHM/TCP helper paths. | Built only |
-| `test_back_invalidation` | TCP/PGAS client for external back-invalidation experiments. | Built only |
-| `test_dax_back_invalidation` | DAX plus TCP client for external guest/device experiments. | Built only |
+| Target                         | Purpose                                                                         | CTest      |
+| ------------------------------ | ------------------------------------------------------------------------------- | ---------- |
+| `test_dcd_gfam`              | Standalone DCD allocation and GFAM access-control checks.                       | Yes        |
+| `test_rob`                   | Parses O3CPU/LSQ debug lines and feeds derived instructions into the ROB model. | Yes        |
+| `test_mem_stall`             | Compares O3CPU memory-stall debug intervals against modeled ROB stalls.         | Yes        |
+| `test_bandwidth_model`       | Checks MLC-style bandwidth saturation and subtree-scoped fabric accounting.     | Yes        |
+| `test_distributed_shm`       | Two in-process distributed memory servers over SHM/TCP helper paths.            | Built only |
+| `test_back_invalidation`     | TCP/PGAS client for external back-invalidation experiments.                     | Built only |
+| `test_dax_back_invalidation` | DAX plus TCP client for external guest/device experiments.                      | Built only |
 
 `test_rob` and `test_mem_stall` use gem5-style O3CPU, LSQ, and MemDepUnit debug text. Generate compatible traces with gem5 debug flags such as `O3CPU,LSQ,MemDepUnit`.
 
 ## gem5-CXL Integration
 
-`gem5_integration/run.py` is a small launcher for SlugLab's gem5-CXL fork at <https://github.com/SlugLab/gem5-CXL>. It locates a gem5 binary, selects a config script, sets CXLMemSim environment variables, and enables O3CPU trace debug output by default.
+`gem5_integration/run.py` is a small launcher for SlugLab's gem5-CXL fork at [https://github.com/SlugLab/gem5-CXL](https://github.com/SlugLab/gem5-CXL). It locates a gem5 binary, selects a config script, sets CXLMemSim environment variables, and enables O3CPU trace debug output by default.
 
 Dry-run example:
 
@@ -894,19 +894,19 @@ The model applies independently at each CXL memory expander and at each switch i
 
 Common options:
 
-| Option | Meaning |
-| --- | --- |
-| `-t` | Target executable. |
-| `-i` | Simulator epoch or interval in milliseconds. |
-| `-c` | CPU set used to run the target and pin remaining work. |
-| `-d` | Platform DRAM latency in ns. |
-| `-b` | Read/write bandwidth vector. |
-| `-l` | Read/write latency vector. |
-| `--mlc-bandwidth` | Read, write, mixed MLC peak bandwidth in GB/s, plus optional knee ratio. |
-| `--bandwidth-knee` | Utilization where the MLC-style latency curve starts bending upward. |
-| `--bandwidth-window-ns` | Minimum accounting window for bandwidth saturation calculations. |
-| `-w` | Heuristic weights for bandwidth and latency calculations. |
-| `-o` | Newick-style CXL topology. |
+| Option                    | Meaning                                                                  |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `-t`                    | Target executable.                                                       |
+| `-i`                    | Simulator epoch or interval in milliseconds.                             |
+| `-c`                    | CPU set used to run the target and pin remaining work.                   |
+| `-d`                    | Platform DRAM latency in ns.                                             |
+| `-b`                    | Read/write bandwidth vector.                                             |
+| `-l`                    | Read/write latency vector.                                               |
+| `--mlc-bandwidth`       | Read, write, mixed MLC peak bandwidth in GB/s, plus optional knee ratio. |
+| `--bandwidth-knee`      | Utilization where the MLC-style latency curve starts bending upward.     |
+| `--bandwidth-window-ns` | Minimum accounting window for bandwidth saturation calculations.         |
+| `-w`                    | Heuristic weights for bandwidth and latency calculations.                |
+| `-o`                    | Newick-style CXL topology.                                               |
 
 ## Notes and Limitations
 

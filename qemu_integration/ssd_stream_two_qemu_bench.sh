@@ -10,7 +10,7 @@ BASE_DISK=${BASE_DISK:-$ROOT/build/qemu.img}
 BACKING_FILE=${BACKING_FILE:-/mnt/disk0/cxlmemsim-ssd-bench.swap}
 RUN_ROOT=${RUN_ROOT:-/mnt/disk0/cxlmemsim-ssd-stream-bench-artifact}
 TRANSFER_MB=${TRANSFER_MB:-256}
-CAPACITY_MB=${CAPACITY_MB:-1024}
+CAPACITY_MB=${CAPACITY_MB:-$TRANSFER_MB}
 SERVER_PORT=${SERVER_PORT:-19999}
 SSD_CACHE_MB=${SSD_CACHE_MB:-16}
 SSD_PAGE_SIZE=${SSD_PAGE_SIZE:-4096}
@@ -18,13 +18,25 @@ SSD_IO_CHUNK_SIZE=${SSD_IO_CHUNK_SIZE:-65536}
 SSD_READ_AHEAD_PAGES=${SSD_READ_AHEAD_PAGES:-16}
 SSH_PORT0=${SSH_PORT0:-11022}
 SSH_PORT1=${SSH_PORT1:-11023}
+SSH_WAIT_SEC=${SSH_WAIT_SEC:-300}
 VM_MEMORY=${VM_MEMORY:-8G}
 VM_MAX_MEMORY=${VM_MAX_MEMORY:-16G}
 SMP=${SMP:-4}
 CXL_BACKING_SIZE=${CXL_BACKING_SIZE:-${CAPACITY_MB}M}
 CXL_LSA_SIZE=${CXL_LSA_SIZE:-256M}
 CXL_FMW_SIZE=${CXL_FMW_SIZE:-4G}
+CXL_REGION_TYPE=${CXL_REGION_TYPE:-pmem}
+CXL_CREATE_DAX=${CXL_CREATE_DAX:-1}
+CXL_DAX_MODE=${CXL_DAX_MODE:-devdax}
+CXL_CREATE_NDCTL_NAMESPACE=${CXL_CREATE_NDCTL_NAMESPACE:-1}
+CXL_NDCTL_NAMESPACE_MODE=${CXL_NDCTL_NAMESPACE_MODE:-devdax}
+CXL_NDCTL_CREATE_TIMEOUT=${CXL_NDCTL_CREATE_TIMEOUT:-180}
+CXL_WORKER_DEVICE=${CXL_WORKER_DEVICE:-/dev/dax0.0}
+WORKER_ACCESS=${WORKER_ACCESS:-mmap}
+WORKER_WAIT_SEC=${WORKER_WAIT_SEC:-1800}
+KERNEL_APPEND_EXTRA=${KERNEL_APPEND_EXTRA:-systemd.mask=cxl-numa-setup.service}
 KEEP_RUNNING=${KEEP_RUNNING:-0}
+KEEP_RUNNING_WAIT=${KEEP_RUNNING_WAIT:-0}
 SPDLOG_LEVEL=${SPDLOG_LEVEL:-info}
 
 SETUP_HELPER=$ROOT/qemu_integration/setup_cxl_numa.sh
@@ -68,7 +80,12 @@ cleanup() {
     local status=$?
 
     if [[ "$KEEP_RUNNING" == "1" ]]; then
+        disown "$QEMU_PID0" "$QEMU_PID1" "$SERVER_PID" 2>/dev/null || true
         log "KEEP_RUNNING=1; leaving server and QEMU processes running"
+        if [[ "$KEEP_RUNNING_WAIT" =~ ^[0-9]+$ && "$KEEP_RUNNING_WAIT" -gt 0 ]]; then
+            log "KEEP_RUNNING_WAIT=$KEEP_RUNNING_WAIT; holding harness process for inspection"
+            sleep "$KEEP_RUNNING_WAIT"
+        fi
         return "$status"
     fi
 
@@ -258,6 +275,7 @@ start_qemu() {
         CXL_HOST_ID="$node" \
         CXL_MEMSIM_HOST=127.0.0.1 \
         CXL_MEMSIM_PORT="$SERVER_PORT" \
+        KERNEL_APPEND_EXTRA="$KERNEL_APPEND_EXTRA" \
         "$QEMU_LAUNCHER" >"$qemu_log" 2>&1 &
 
     if [[ "$node" == "0" ]]; then
@@ -280,17 +298,17 @@ setup_guest_cxl() {
     scp_to_guest "$port" "$SETUP_HELPER" /tmp/setup_cxl_numa.sh
     ssh_guest "$port" chmod +x /tmp/setup_cxl_numa.sh
 
-    log "Configuring CXL devdax on node$node"
+    log "Configuring CXL $CXL_REGION_TYPE namespace on node$node"
     if ! ssh_guest "$port" \
-        "LOG_FILE=/tmp/cxl_numa_setup.log REGION_SIZE=${CAPACITY_MB}M CXL_REGION_TYPE=pmem CXL_CREATE_DAX=1 CXL_DAX_MODE=devdax CXL_CREATE_NDCTL_NAMESPACE=1 CXL_NDCTL_NAMESPACE_MODE=devdax CXL_CONFIGURE_NET=0 /tmp/setup_cxl_numa.sh" \
+        "LOG_FILE=/tmp/cxl_numa_setup.log REGION_SIZE=${CAPACITY_MB}M CXL_REGION_TYPE=${CXL_REGION_TYPE} CXL_CREATE_DAX=${CXL_CREATE_DAX} CXL_DAX_MODE=${CXL_DAX_MODE} CXL_CREATE_NDCTL_NAMESPACE=${CXL_CREATE_NDCTL_NAMESPACE} CXL_NDCTL_NAMESPACE_MODE=${CXL_NDCTL_NAMESPACE_MODE} CXL_NDCTL_CREATE_TIMEOUT=${CXL_NDCTL_CREATE_TIMEOUT} CXL_CONFIGURE_NET=0 /tmp/setup_cxl_numa.sh" \
         >"$stdout_log" 2>"$stderr_log"; then
         ssh_guest "$port" "cat /tmp/cxl_numa_setup.log" >"$remote_log" 2>/dev/null || true
         die "CXL setup failed on node$node; see $stdout_log, $stderr_log, and $remote_log"
     fi
 
     ssh_guest "$port" "cat /tmp/cxl_numa_setup.log" >"$remote_log" 2>/dev/null || true
-    ssh_guest "$port" "test -c /dev/dax0.0"
-    log "node$node has /dev/dax0.0"
+    ssh_guest "$port" "test -e $CXL_WORKER_DEVICE"
+    log "node$node has $CXL_WORKER_DEVICE"
 }
 
 build_worker() {
@@ -314,11 +332,51 @@ run_worker() {
     local seed=$4
     local bytes=$((TRANSFER_MB * 1024 * 1024))
     local stderr_log=$RUN_DIR/worker-node${node}-${mode}-seed${seed}.stderr.log
+    local stdout_log=$RUN_DIR/worker-node${node}-${mode}-seed${seed}.stdout.log
+    local remote_base=/tmp/dax_stream_bench_node${node}_${mode}_seed${seed}
+    local remote_json=${remote_base}.json
+    local remote_stderr=${remote_base}.stderr
+    local remote_rc=${remote_base}.rc
+    local remote_cmd
+    local remote_cmd_q
+    local pid
+    local start now rc
 
     log "Running node$node $mode seed=$seed bytes=$bytes"
-    ssh_guest "$port" \
-        "/tmp/dax_stream_bench --mode $mode --device /dev/dax0.0 --offset 0 --bytes $bytes --seed $seed" \
-        2> >(tee -a "$stderr_log" >&2) | tee -a "$RESULTS_FILE"
+    remote_cmd="/tmp/dax_stream_bench --mode $mode --access $WORKER_ACCESS --device $CXL_WORKER_DEVICE --offset 0 --bytes $bytes --seed $seed >$remote_json 2>$remote_stderr; echo \$? >$remote_rc"
+    printf -v remote_cmd_q '%q' "$remote_cmd"
+    ssh_guest "$port" "rm -f $remote_json $remote_stderr $remote_rc; nohup bash -lc $remote_cmd_q >/dev/null 2>&1 &"
+
+    if [[ "$node" == "0" ]]; then
+        pid=$QEMU_PID0
+    else
+        pid=$QEMU_PID1
+    fi
+
+    start=$(date +%s)
+    while true; do
+        assert_process_alive "$pid" "node$node QEMU"
+        rc=$(ssh_guest "$port" "cat $remote_rc 2>/dev/null" 2>/dev/null || true)
+        if [[ "$rc" =~ ^[0-9]+$ ]]; then
+            break
+        fi
+
+        now=$(date +%s)
+        if ((now - start >= WORKER_WAIT_SEC)); then
+            ssh_guest "$port" "cat $remote_stderr" >"$stderr_log" 2>/dev/null || true
+            die "Timed out waiting for node$node $mode seed=$seed after ${WORKER_WAIT_SEC}s"
+        fi
+        sleep 5
+    done
+
+    ssh_guest "$port" "cat $remote_stderr" >"$stderr_log" 2>/dev/null || true
+    ssh_guest "$port" "cat $remote_json" >"$stdout_log" 2>/dev/null || true
+    cat "$stderr_log" >&2
+    cat "$stdout_log" | tee -a "$RESULTS_FILE"
+
+    if [[ "$rc" != "0" ]]; then
+        die "node$node $mode seed=$seed failed with rc=$rc; see $stdout_log and $stderr_log"
+    fi
 }
 
 write_config() {
@@ -341,13 +399,25 @@ SSD_IO_CHUNK_SIZE=$SSD_IO_CHUNK_SIZE
 SSD_READ_AHEAD_PAGES=$SSD_READ_AHEAD_PAGES
 SSH_PORT0=$SSH_PORT0
 SSH_PORT1=$SSH_PORT1
+SSH_WAIT_SEC=$SSH_WAIT_SEC
 VM_MEMORY=$VM_MEMORY
 VM_MAX_MEMORY=$VM_MAX_MEMORY
 SMP=$SMP
 CXL_BACKING_SIZE=$CXL_BACKING_SIZE
 CXL_LSA_SIZE=$CXL_LSA_SIZE
 CXL_FMW_SIZE=$CXL_FMW_SIZE
+CXL_REGION_TYPE=$CXL_REGION_TYPE
+CXL_CREATE_DAX=$CXL_CREATE_DAX
+CXL_DAX_MODE=$CXL_DAX_MODE
+CXL_CREATE_NDCTL_NAMESPACE=$CXL_CREATE_NDCTL_NAMESPACE
+CXL_NDCTL_NAMESPACE_MODE=$CXL_NDCTL_NAMESPACE_MODE
+CXL_NDCTL_CREATE_TIMEOUT=$CXL_NDCTL_CREATE_TIMEOUT
+CXL_WORKER_DEVICE=$CXL_WORKER_DEVICE
+WORKER_ACCESS=$WORKER_ACCESS
+WORKER_WAIT_SEC=$WORKER_WAIT_SEC
+KERNEL_APPEND_EXTRA=$KERNEL_APPEND_EXTRA
 KEEP_RUNNING=$KEEP_RUNNING
+KEEP_RUNNING_WAIT=$KEEP_RUNNING_WAIT
 SPDLOG_LEVEL=$SPDLOG_LEVEL
 EOF
 }
@@ -397,8 +467,8 @@ main() {
     start_qemu 0 "$SSH_PORT0" 52:54:00:00:10:20 "$disk0"
     start_qemu 1 "$SSH_PORT1" 52:54:00:00:10:21 "$disk1"
 
-    wait_ssh 0 "$SSH_PORT0"
-    wait_ssh 1 "$SSH_PORT1"
+    wait_ssh 0 "$SSH_PORT0" "$SSH_WAIT_SEC"
+    wait_ssh 1 "$SSH_PORT1" "$SSH_WAIT_SEC"
 
     setup_guest_cxl 0 "$SSH_PORT0"
     setup_guest_cxl 1 "$SSH_PORT1"

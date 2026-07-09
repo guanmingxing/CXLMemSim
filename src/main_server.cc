@@ -1173,7 +1173,7 @@ void ThreadPerConnectionServer::stop() {
     SPDLOG_INFO("  Back Invalidations: {}", back_invalidations.load());
 
     // Print CXL controller topology statistics (switches/expanders/counters)
-    if (controller && comm_mode != CommMode::PGAS_SHM) {
+    if (controller) {
         std::cout << std::format("{}", *controller) << std::endl;
     }
 }
@@ -2542,6 +2542,7 @@ int ThreadPerConnectionServer::poll_pgas_shm_requests() {
                 __atomic_thread_fence(__ATOMIC_RELEASE);
                 slot->resp_status = CXL_SHM_RESP_OK;
                 total_atomic_faa++;
+                controller->record_cxl_access(request_ts, static_cast<uint64_t>(i), addr, true);
                 log_periodic_stats("PGAS_FAA", total_atomic_faa.load());
             } else {
                 slot->resp_status = CXL_SHM_RESP_ERROR;
@@ -2585,6 +2586,7 @@ int ThreadPerConnectionServer::poll_pgas_shm_requests() {
                 __atomic_thread_fence(__ATOMIC_RELEASE);
                 slot->resp_status = CXL_SHM_RESP_OK;
                 total_atomic_cas++;
+                controller->record_cxl_access(request_ts, static_cast<uint64_t>(i), addr, true);
                 log_periodic_stats("PGAS_CAS", total_atomic_cas.load());
             } else {
                 slot->resp_status = CXL_SHM_RESP_ERROR;

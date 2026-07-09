@@ -231,6 +231,7 @@ public:
     std::queue<lbr> ring_buffer;
     // rob info
     std::unordered_map<uint64_t, thread_info> thread_map;
+    std::mutex access_record_mutex_;
     // LRU cache
     LRUCache lru_cache;
 

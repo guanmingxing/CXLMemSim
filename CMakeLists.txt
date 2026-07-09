@@ -154,6 +154,11 @@ target_include_directories(test_bandwidth_model PRIVATE include src ${spdlog_INC
 target_link_libraries(test_bandwidth_model cxlmemsim spdlog::spdlog_header_only ${RT_LIB} ${ATOMIC_LIB})
 add_test(NAME test_bandwidth_model COMMAND test_bandwidth_model)
 
+add_executable(test_pgas_controller_counters tests/test_pgas_controller_counters.cpp)
+target_include_directories(test_pgas_controller_counters PRIVATE include src ${spdlog_INCLUDE_DIR})
+target_link_libraries(test_pgas_controller_counters cxlmemsim spdlog::spdlog_header_only ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_pgas_controller_counters COMMAND test_pgas_controller_counters)
+
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
 add_executable(test_back_invalidation tests/test_back_invalidation.cpp)

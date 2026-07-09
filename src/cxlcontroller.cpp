@@ -412,6 +412,9 @@ int CXLController::insert(uint64_t timestamp, uint64_t tid, uint64_t phys_addr, 
 }
 
 void CXLController::record_cxl_access(uint64_t timestamp, uint64_t tid, uint64_t addr, bool is_write) {
+    std::lock_guard<std::mutex> lock(access_record_mutex_);
+
+    (void)thread_map[tid];
     this->counter.inc_remote();
 
     int endpoint_id = 0;
