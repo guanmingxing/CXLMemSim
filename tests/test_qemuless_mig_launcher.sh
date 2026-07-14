@@ -29,6 +29,10 @@ OUTPUT
         ;;
     mig)
         if [[ "${2:-}" == -i && "${4:-}" == -lgi ]]; then
+            if [[ "${FIXTURE_LGI_EXIT:-0}" != 0 ]]; then
+                printf '%s\n' 'No GPU instances found: Not Found'
+                exit "$FIXTURE_LGI_EXIT"
+            fi
             IFS=, read -r -a profile_ids <<< "${FIXTURE_PROFILE_IDS:-14,14,14,14}"
             printf '%s\n' '| GPU  Name        Profile ID  Instance ID  Placement |'
             for index in "${!profile_ids[@]}"; do
@@ -156,6 +160,12 @@ grep -F -- 'cmake ' "$mutation_log" >/dev/null && {
     exit 1
 }
 test ! -s "$mutation_log"
+
+: > "$mutation_log"
+expect_failure env FIXTURE_LGI_EXIT=6 "$launcher" \
+    --configure-mig --artifact-dir "$tmp/empty-gi-layout" --splash-dir "$splash_dir"
+grep -F -- 'nvidia-smi -i 0 -mig 1' "$mutation_log" >/dev/null
+grep -F -- 'mig -i 0 -cgi' "$mutation_log" >/dev/null
 
 : > "$mutation_log"
 expect_failure env FIXTURE_PROFILE_IDS=13 FIXTURE_FAIL_DCI=1 "$launcher" \
