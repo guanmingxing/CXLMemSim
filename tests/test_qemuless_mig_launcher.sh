@@ -10,7 +10,7 @@ artifact="$tmp/artifact"
 fixture_calls="$tmp/fixture-calls.log"
 mutation_log="$tmp/mutation.log"
 
-trap 'rm -rf "$tmp"' EXIT
+trap 'if [[ "${KEEP_QEMULESS_TEST_TMP:-0}" == 1 ]]; then printf "fixture tmp: %s\\n" "$tmp" >&2; else rm -rf "$tmp"; fi' EXIT
 mkdir -p "$fixture_bin"
 
 cat > "$fixture_bin/nvidia-smi" <<'EOF'
@@ -106,6 +106,14 @@ grep -F -- 'rm -f -- '"$artifact"'/cxlmemsim.ssd' "$artifact/commands.log" >/dev
 grep -F -- "rm -f -- /dev/shm/${shm_name#/}" "$artifact/commands.log" >/dev/null
 ! grep -Fqi 'qemu-system' "$artifact/commands.log"
 
+grep -F -- 'setsid --wait' "$launcher" >/dev/null
+grep -F -- 'terminate_mpi' "$launcher" >/dev/null
+grep -F -- 'jq -c . < "$result" >> "$output"' "$launcher" >/dev/null
+grep -F -- 'QEMULESS_CXL_BUILD' "$launcher" >/dev/null
+grep -F -- 'QEMULESS_SPLASH_BUILD' "$launcher" >/dev/null
+grep -F -- 'QEMULESS_SHM_DIR' "$launcher" >/dev/null
+grep -F -- 'QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS' "$launcher" >/dev/null
+
 jq -e '
     . as $map |
     .migs == [
@@ -151,3 +159,144 @@ expect_failure env FIXTURE_PROFILE_IDS=13 FIXTURE_FAIL_DCI=1 "$launcher" \
 grep -F -- 'mig -i 0 -dci' "$mutation_log" >/dev/null
 ! grep -F -- 'mig -i 0 -dgi' "$mutation_log"
 ! grep -F -- 'mig -i 0 -cgi 14,14,14,14 -C' "$mutation_log"
+
+lifecycle_bin="$tmp/lifecycle-bin"
+lifecycle_cxl_build="$tmp/lifecycle-cxl-build"
+lifecycle_splash_build="$tmp/lifecycle-splash-build"
+lifecycle_shm="$tmp/lifecycle-shm"
+lifecycle_artifact="$tmp/lifecycle-artifact"
+lifecycle_mpi_pid="$tmp/lifecycle-mpi.pid"
+lifecycle_server_pid="$tmp/lifecycle-server.pid"
+lifecycle_signals="$tmp/lifecycle-signals.log"
+mkdir -p "$lifecycle_bin" "$lifecycle_cxl_build" "$lifecycle_splash_build" "$lifecycle_shm"
+
+cat > "$lifecycle_bin/cmake" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$lifecycle_bin/mpirun" <<'EOF'
+#!/usr/bin/env python3
+import glob
+import os
+import signal
+import struct
+import time
+
+paths = glob.glob(os.path.join(os.environ["QEMULESS_SHM_DIR"], "cxlmemsim_pgas_*"))
+if len(paths) != 1:
+    raise SystemExit(91)
+with open(paths[0], "rb", buffering=0) as handle:
+    header = struct.unpack("<QIII", handle.read(20))
+if header != (0x43584C53484D454D, 1, 64, 1):
+    raise SystemExit(92)
+with open(os.environ["LIFECYCLE_MPI_PID"], "w", encoding="ascii") as handle:
+    handle.write(f"{os.getpid()}\n")
+
+def stop(signum, _frame):
+    name = signal.Signals(signum).name.removeprefix("SIG")
+    with open(os.environ["LIFECYCLE_SIGNALS"], "a", encoding="ascii") as handle:
+        handle.write(f"mpi {name}\n")
+    if os.environ.get("LIFECYCLE_STUBBORN") != "1":
+        raise SystemExit(0)
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(1)
+EOF
+cat > "$lifecycle_cxl_build/cxlmemsim_server" <<'EOF'
+#!/usr/bin/env python3
+import os
+import signal
+import struct
+import sys
+import time
+
+shm_name = next(arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("--pgas-shm-name="))
+shm_path = os.path.join(os.environ["QEMULESS_SHM_DIR"], shm_name.lstrip("/"))
+with open(os.environ["LIFECYCLE_SERVER_PID"], "w", encoding="ascii") as handle:
+    handle.write(f"{os.getpid()}\n")
+
+def stop(signum, _frame):
+    name = signal.Signals(signum).name.removeprefix("SIG")
+    with open(os.environ["LIFECYCLE_SIGNALS"], "a", encoding="ascii") as handle:
+        handle.write(f"server {name}\n")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+with open(shm_path, "r+b", buffering=0) as handle:
+    handle.truncate(64 + 64 * 256)
+time.sleep(1)
+with open(shm_path, "r+b", buffering=0) as handle:
+    handle.write(struct.pack("<QIII", 0x43584C53484D454D, 1, 64, 1))
+while True:
+    time.sleep(1)
+EOF
+cat > "$lifecycle_splash_build/qemuless_mig_oversubscribe" <<'EOF'
+#!/usr/bin/env bash
+exit 99
+EOF
+chmod +x "$lifecycle_bin/cmake" "$lifecycle_bin/mpirun" \
+    "$lifecycle_cxl_build/cxlmemsim_server" "$lifecycle_splash_build/qemuless_mig_oversubscribe"
+
+env PATH="$lifecycle_bin:$fixture_bin:$PATH" \
+    FIXTURE_CALLS="$fixture_calls" FIXTURE_MUTATION_LOG="$mutation_log" \
+    QEMULESS_CXL_BUILD="$lifecycle_cxl_build" QEMULESS_SPLASH_BUILD="$lifecycle_splash_build" \
+    QEMULESS_SHM_DIR="$lifecycle_shm" LIFECYCLE_MPI_PID="$lifecycle_mpi_pid" \
+    LIFECYCLE_SERVER_PID="$lifecycle_server_pid" LIFECYCLE_SIGNALS="$lifecycle_signals" \
+    "$launcher" --artifact-dir "$lifecycle_artifact" --splash-dir "$splash_dir" &
+launcher_pid=$!
+
+for _ in $(seq 1 100); do
+    [[ -s "$lifecycle_mpi_pid" && -s "$lifecycle_server_pid" ]] && break
+    kill -0 "$launcher_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[[ -s "$lifecycle_mpi_pid" && -s "$lifecycle_server_pid" ]]
+kill -TERM "$launcher_pid"
+if wait "$launcher_pid"; then
+    printf 'signal-cleanup fixture unexpectedly succeeded\n' >&2
+    exit 1
+else
+    launcher_status=$?
+fi
+[[ "$launcher_status" == 143 ]]
+grep -F -- 'mpi INT' "$lifecycle_signals" >/dev/null
+grep -F -- 'server INT' "$lifecycle_signals" >/dev/null
+! kill -0 "$(cat "$lifecycle_mpi_pid")" 2>/dev/null
+! kill -0 "$(cat "$lifecycle_server_pid")" 2>/dev/null
+[[ -z "$(find "$lifecycle_shm" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+stubborn_artifact="$tmp/stubborn-artifact"
+: > "$lifecycle_signals"
+rm -f -- "$lifecycle_mpi_pid" "$lifecycle_server_pid"
+env PATH="$lifecycle_bin:$fixture_bin:$PATH" \
+    FIXTURE_CALLS="$fixture_calls" FIXTURE_MUTATION_LOG="$mutation_log" \
+    QEMULESS_CXL_BUILD="$lifecycle_cxl_build" QEMULESS_SPLASH_BUILD="$lifecycle_splash_build" \
+    QEMULESS_SHM_DIR="$lifecycle_shm" QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS=1 \
+    LIFECYCLE_MPI_PID="$lifecycle_mpi_pid" LIFECYCLE_SERVER_PID="$lifecycle_server_pid" \
+    LIFECYCLE_SIGNALS="$lifecycle_signals" LIFECYCLE_STUBBORN=1 \
+    "$launcher" --artifact-dir "$stubborn_artifact" --splash-dir "$splash_dir" &
+launcher_pid=$!
+
+for _ in $(seq 1 100); do
+    [[ -s "$lifecycle_mpi_pid" && -s "$lifecycle_server_pid" ]] && break
+    kill -0 "$launcher_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[[ -s "$lifecycle_mpi_pid" && -s "$lifecycle_server_pid" ]]
+kill -TERM "$launcher_pid"
+if wait "$launcher_pid"; then
+    printf 'stubborn signal-cleanup fixture unexpectedly succeeded\n' >&2
+    exit 1
+else
+    launcher_status=$?
+fi
+[[ "$launcher_status" == 143 ]]
+grep -F -- 'mpi INT' "$lifecycle_signals" >/dev/null
+grep -F -- 'mpi TERM' "$lifecycle_signals" >/dev/null
+grep -E -- 'kill -KILL -- -[0-9]+' "$stubborn_artifact/commands.log" >/dev/null
+! kill -0 "$(cat "$lifecycle_mpi_pid")" 2>/dev/null
+! kill -0 "$(cat "$lifecycle_server_pid")" 2>/dev/null
+[[ -z "$(find "$lifecycle_shm" -mindepth 1 -maxdepth 1 -print -quit)" ]]

@@ -7,8 +7,10 @@ capacity_mb=524288
 checkpoint_bytes=$((256 * 1024))
 iterations=100
 shm_name=
-cxl_build=/tmp/cxlmemsim-qemuless-build
-splash_build=/tmp/splash-qemuless-build
+cxl_build=${QEMULESS_CXL_BUILD:-/tmp/cxlmemsim-qemuless-build}
+splash_build=${QEMULESS_SPLASH_BUILD:-/tmp/splash-qemuless-build}
+shm_dir=${QEMULESS_SHM_DIR:-/dev/shm}
+mpi_signal_timeout=${QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS:-5}
 splash_dir=$(realpath "${repo_root}/../Splash")
 artifact_dir="${repo_root}/artifact/qemuless_mig/$(date -u +%Y%m%dT%H%M%SZ)"
 configure_mig=false
@@ -18,6 +20,8 @@ server_pid=
 server_started=false
 server_stopped=false
 server_reaped=false
+mpi_pid=
+mpi_reaped=true
 shm_owned=false
 backing_owned=false
 artifact_ready=false
@@ -148,7 +152,7 @@ prepare_artifact_dir() {
     : > "$artifact_dir/server.log"
     ssd_backing_file="$artifact_dir/cxlmemsim.ssd"
     shm_name="/cxlmemsim_pgas_$(date -u +%Y%m%dT%H%M%S)_${BASHPID}_${RANDOM}${RANDOM}"
-    shm_path="/dev/shm/${shm_name#/}"
+    shm_path="${shm_dir%/}/${shm_name#/}"
     artifact_ready=true
 }
 
@@ -189,6 +193,19 @@ run_or_plan() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+pid_is_running() {
+    local pid=$1
+    local stat
+    local state
+
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/stat" ]] || return 0
+    stat=$(< "/proc/$pid/stat")
+    state=${stat#*) }
+    state=${state%% *}
+    [[ "$state" != Z && "$state" != X ]]
 }
 
 capture_nvidia_snapshot() {
@@ -316,7 +333,8 @@ write_mig_artifacts() {
 
 validate_prerequisites() {
     local command
-    for command in nvidia-smi cmake mpirun jq python3; do
+    validate_positive_decimal QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS "$mpi_signal_timeout" 60
+    for command in nvidia-smi cmake mpirun jq python3 setsid; do
         require_command "$command"
     done
     [[ -x /usr/local/cuda-12.8/bin/nvcc ]] || die "CUDA 12.8 compiler is required at /usr/local/cuda-12.8/bin/nvcc"
@@ -327,6 +345,7 @@ validate_prerequisites() {
     [[ -f "$splash_dir/CMakeLists.txt" ]] || die "missing Splash CMakeLists.txt"
     [[ -x "$splash_dir/script/qemuless_mig_rank_wrapper.sh" ]] ||
         die "missing executable Splash MIG rank wrapper"
+    [[ -d "$shm_dir" ]] || die "PGAS SHM directory is not a directory: $shm_dir"
     [[ ! -e "$shm_path" ]] || die "refusing to reuse pre-existing PGAS SHM object: $shm_path"
     [[ ! -e "$ssd_backing_file" ]] || die "refusing to reuse pre-existing SSD backing file: $ssd_backing_file"
 }
@@ -394,7 +413,7 @@ start_server() {
         if pgas_header_ready; then
             return
         fi
-        if ! kill -0 "$server_pid" 2>/dev/null; then
+        if ! pid_is_running "$server_pid"; then
             wait "$server_pid" || true
             die "CXLMemSim server exited before PGAS SHM became ready; see $artifact_dir/server.log"
         fi
@@ -417,17 +436,61 @@ run_mpi_phase() {
         --checkpoint-bytes "$checkpoint_bytes" --iterations "$iterations"
     )
 
-    record_command_with_redirection "" "$mpi_log" ">" "2>&1" "${command[@]}"
+    record_command_with_redirection "" "$mpi_log" ">" "2>&1 &" setsid --wait "${command[@]}"
     if ! "$dry_run"; then
-        "${command[@]}" > "$mpi_log" 2>&1
+        setsid --wait "${command[@]}" > "$mpi_log" 2>&1 &
+        mpi_pid=$!
+        mpi_reaped=false
+        local mpi_status
+        if wait "$mpi_pid"; then
+            mpi_status=0
+        else
+            mpi_status=$?
+        fi
+        mpi_reaped=true
+        mpi_pid=
+        return "$mpi_status"
     fi
+}
+
+terminate_mpi() {
+    if [[ -z "$mpi_pid" || "$mpi_reaped" == true ]]; then
+        return
+    fi
+    if ! pid_is_running "$mpi_pid"; then
+        wait "$mpi_pid" || true
+        mpi_reaped=true
+        mpi_pid=
+        return
+    fi
+
+    local signal
+    local timeout
+    local deadline
+    for signal in INT TERM KILL; do
+        timeout=$mpi_signal_timeout
+        [[ "$signal" != KILL ]] || timeout=1
+        record_command kill "-$signal" -- "-$mpi_pid"
+        kill "-$signal" -- "-$mpi_pid" 2>/dev/null || true
+        deadline=$((SECONDS + timeout))
+        while pid_is_running "$mpi_pid"; do
+            ((SECONDS < deadline)) || break
+            sleep 1
+        done
+        if ! pid_is_running "$mpi_pid"; then
+            break
+        fi
+    done
+    wait "$mpi_pid" || true
+    mpi_reaped=true
+    mpi_pid=
 }
 
 stop_server() {
     if [[ -z "$server_pid" || "$server_stopped" == true ]]; then
         return
     fi
-    if ! kill -0 "$server_pid" 2>/dev/null; then
+    if ! pid_is_running "$server_pid"; then
         if ! wait "$server_pid"; then
             server_stopped=true
             server_reaped=true
@@ -441,19 +504,19 @@ stop_server() {
     record_command kill -INT "$server_pid"
     kill -INT "$server_pid"
     local deadline=$((SECONDS + 30))
-    while kill -0 "$server_pid" 2>/dev/null; do
+    while pid_is_running "$server_pid"; do
         ((SECONDS < deadline)) || break
         sleep 1
     done
-    if kill -0 "$server_pid" 2>/dev/null; then
+    if pid_is_running "$server_pid"; then
         record_command kill -TERM "$server_pid"
         kill -TERM "$server_pid"
         deadline=$((SECONDS + 5))
-        while kill -0 "$server_pid" 2>/dev/null; do
+        while pid_is_running "$server_pid"; do
             ((SECONDS < deadline)) || break
             sleep 1
         done
-        if kill -0 "$server_pid" 2>/dev/null; then
+        if pid_is_running "$server_pid"; then
             record_command kill -KILL "$server_pid"
             kill -KILL "$server_pid"
         fi
@@ -492,7 +555,7 @@ write_jsonl() {
         fi
         [[ -f "$result" ]] || die "missing rank result: $result"
         record_command_with_redirection "$result" "$output" ">>" "" jq -c .
-        jq -c . "$result" >> "$output"
+        jq -c . < "$result" >> "$output"
     done
 }
 
@@ -514,7 +577,7 @@ cleanup_owned_resources() {
         record_command rm -f -- "$shm_path"
         return
     fi
-    if [[ -n "$server_pid" && "$server_reaped" == false ]] && kill -0 "$server_pid" 2>/dev/null; then
+    if [[ -n "$server_pid" && "$server_reaped" == false ]] && pid_is_running "$server_pid"; then
         printf 'run_qemuless_mig: preserving owned resources because server PID %s is still running\n' "$server_pid" >&2
         return
     fi
@@ -531,9 +594,11 @@ cleanup_owned_resources() {
 on_exit() {
     local status=$?
     trap - EXIT
+    trap - INT TERM
+    terminate_mpi
     if [[ -n "$server_pid" && "$server_stopped" == false ]]; then
         if ! stop_server; then
-            status=1
+            ((status != 0)) || status=1
         fi
     fi
     cleanup_owned_resources
@@ -541,10 +606,16 @@ on_exit() {
     exit "$status"
 }
 
+on_signal() {
+    exit "$1"
+}
+
 main() {
     parse_args "$@"
     prepare_artifact_dir
     trap on_exit EXIT
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
     validate_prerequisites
     capture_nvidia_snapshot "$artifact_dir/nvidia-smi-before.txt"
 
