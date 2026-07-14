@@ -78,6 +78,14 @@ target_link_libraries(cxlmemsim spdlog::spdlog_header_only)
 
 enable_testing()
 
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_qemuless_mig_summary
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p test_qemuless_mig_summary.py -v)
+    set_tests_properties(test_qemuless_mig_summary PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
 # Build latency calculator
 add_executable(cxlmemsim_latency src/calculateLatency.cc)
 set_target_properties(cxlmemsim_latency PROPERTIES
