@@ -241,6 +241,7 @@ capture_mig_listing() {
 
 capture_gpu_instance_listing() {
     local output=$1
+    local listing
     local status
     record_command_with_redirection "" "$output" ">" "2>&1" nvidia-smi mig -i 0 -lgi
     if nvidia-smi mig -i 0 -lgi > "$output" 2>&1; then
@@ -248,10 +249,11 @@ capture_gpu_instance_listing() {
     else
         status=$?
     fi
-    if grep -Eq '^No (GPU instances found|MIG-enabled devices found)(:.*)?$' "$output"; then
-        return
-    fi
-    return "$status"
+    listing=$(< "$output")
+    case "$listing" in
+        'No GPU instances found: Not Found'|'No MIG-enabled devices found.') return ;;
+        *) return "$status" ;;
+    esac
 }
 
 extract_gpu_zero_migs() {
