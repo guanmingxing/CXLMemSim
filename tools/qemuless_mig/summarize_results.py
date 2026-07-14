@@ -12,6 +12,7 @@ from pathlib import Path
 
 RANK_FILE_RE = re.compile(r"rank-(0|[1-9][0-9]*)\.json$")
 MIG_UUID_RE = re.compile(r"MIG-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+UINT64_MAX = (1 << 64) - 1
 REMOTE_RE = re.compile(r"^\s*Remote:\s+(\d+)\s*$", re.MULTILINE)
 LOAD_RE = re.compile(r"^\s*Load:\s+(\d+)\s*$", re.MULTILINE)
 STORE_RE = re.compile(r"^\s*Store:\s+(\d+)\s*$", re.MULTILINE)
@@ -61,6 +62,10 @@ class EvidenceArgumentParser(argparse.ArgumentParser):
 
 def is_integer(value):
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_uint64(value):
+    return is_integer(value) and 0 <= value <= UINT64_MAX
 
 
 def is_nonnegative_number(value):
@@ -178,20 +183,28 @@ def validate_records(records, expected_world_size, label, mig_uuids, builder):
                 records_valid = False
 
         checkpoint_bytes = record.get("checkpoint_bytes")
-        if not is_integer(checkpoint_bytes) or checkpoint_bytes <= 0:
-            builder.fail(record_check, "{} checkpoint_bytes must be positive".format(prefix))
+        checkpoint_valid = is_uint64(checkpoint_bytes) and checkpoint_bytes > 0
+        if not checkpoint_valid:
+            builder.fail(record_check, "{} checkpoint_bytes must be a positive uint64".format(prefix))
             records_valid = False
         for field in ("cxl_bytes_read", "cxl_bytes_written"):
             value = record.get(field)
-            if not is_integer(value) or value <= 0 or value != checkpoint_bytes:
-                builder.fail(record_check, "{} {} must be positive and equal checkpoint_bytes".format(prefix, field))
+            if not is_uint64(value) or value <= 0 or value != checkpoint_bytes:
+                builder.fail(
+                    record_check,
+                    "{} {} must be a positive uint64 equal to checkpoint_bytes".format(prefix, field),
+                )
                 records_valid = False
 
         cxl_addr = record.get("cxl_addr")
-        if not is_integer(cxl_addr) or cxl_addr < 0:
-            builder.fail(range_check, "{} cxl_addr must be a nonnegative integer".format(prefix))
-        elif is_integer(checkpoint_bytes) and checkpoint_bytes > 0:
-            ranges.append((cxl_addr, cxl_addr + checkpoint_bytes, filename_rank))
+        if not is_uint64(cxl_addr):
+            builder.fail(range_check, "{} cxl_addr must be a uint64".format(prefix))
+        elif checkpoint_valid:
+            range_end = cxl_addr + checkpoint_bytes
+            if range_end > UINT64_MAX:
+                builder.fail(range_check, "{} CXL range exceeds the uint64 address space".format(prefix))
+            else:
+                ranges.append((cxl_addr, range_end, filename_rank))
 
         for field in ("kernel_ms", "checkpoint_write_ms", "checkpoint_read_ms"):
             if not is_nonnegative_number(record.get(field)):

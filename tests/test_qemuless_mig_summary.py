@@ -17,6 +17,7 @@ MIG_UUIDS = [
     "MIG-00000000-0000-0000-0000-000000000003",
     "MIG-00000000-0000-0000-0000-000000000004",
 ]
+UINT64_MAX = (1 << 64) - 1
 SERVER_LOG = """Global Counter:
   Local: 0
   Remote: 4096
@@ -258,6 +259,74 @@ class QemuLessMigSummaryTest(unittest.TestCase):
                     record_path.write_text(json.dumps(record), encoding="utf-8")
                 self.assert_fail_summary(self.run_summary())
                 self.write_record(self.oversub_dir, 7, 8)
+
+    def test_maximum_nonoverflowing_cxl_address_passes(self):
+        self.write_record(
+            self.oversub_dir,
+            7,
+            8,
+            cxl_addr=UINT64_MAX - 1,
+            checkpoint_bytes=1,
+            cxl_bytes_read=1,
+            cxl_bytes_written=1,
+        )
+
+        completed = self.run_summary()
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("pass", self.read_summary()["verdict"])
+
+    def test_uint64_max_checkpoint_and_byte_counters_remain_record_valid(self):
+        self.write_record(
+            self.oversub_dir,
+            7,
+            8,
+            cxl_addr=0,
+            checkpoint_bytes=UINT64_MAX,
+            cxl_bytes_read=UINT64_MAX,
+            cxl_bytes_written=UINT64_MAX,
+        )
+
+        self.assert_fail_summary(self.run_summary())
+        summary = self.read_summary()
+        self.assertTrue(summary["checks"]["oversubscription_records"])
+        self.assertFalse(summary["checks"]["oversubscription_ranges"])
+
+    def test_uint64_plus_one_in_each_cxl_scalar_fails(self):
+        invalid_records = [
+            ("cxl_addr", {"cxl_addr": UINT64_MAX + 1}),
+            ("checkpoint_bytes", {"checkpoint_bytes": UINT64_MAX + 1}),
+            ("cxl_bytes_read", {"cxl_bytes_read": UINT64_MAX + 1}),
+            ("cxl_bytes_written", {"cxl_bytes_written": UINT64_MAX + 1}),
+        ]
+
+        for field, overrides in invalid_records:
+            with self.subTest(field=field):
+                self.write_record(self.oversub_dir, 7, 8, **overrides)
+                self.assert_fail_summary(self.run_summary())
+                matching_errors = [
+                    error["error"]
+                    for error in self.read_summary()["errors"]
+                    if field in error["error"]
+                ]
+                self.assertTrue(any("uint64" in error for error in matching_errors))
+                self.write_record(self.oversub_dir, 7, 8)
+
+    def test_cxl_range_endpoint_must_fit_uint64(self):
+        self.write_record(
+            self.oversub_dir,
+            7,
+            8,
+            cxl_addr=UINT64_MAX,
+            checkpoint_bytes=1,
+            cxl_bytes_read=1,
+            cxl_bytes_written=1,
+        )
+
+        self.assert_fail_summary(self.run_summary())
+        summary = self.read_summary()
+        self.assertTrue(summary["checks"]["oversubscription_records"])
+        self.assertFalse(summary["checks"]["oversubscription_ranges"])
 
     def test_accidental_server_counter_matches_fail(self):
         self.server_log.write_text(
