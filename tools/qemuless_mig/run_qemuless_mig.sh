@@ -11,6 +11,8 @@ cxl_build=${QEMULESS_CXL_BUILD:-/tmp/cxlmemsim-qemuless-build}
 splash_build=${QEMULESS_SPLASH_BUILD:-/tmp/splash-qemuless-build}
 shm_dir=${QEMULESS_SHM_DIR:-/dev/shm}
 mpi_signal_timeout=${QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS:-5}
+server_int_timeout=${QEMULESS_SERVER_INT_TIMEOUT_SECONDS:-30}
+server_term_timeout=${QEMULESS_SERVER_TERM_TIMEOUT_SECONDS:-5}
 splash_dir=$(realpath "${repo_root}/../Splash")
 artifact_dir="${repo_root}/artifact/qemuless_mig/$(date -u +%Y%m%dT%H%M%SZ)"
 configure_mig=false
@@ -21,6 +23,7 @@ server_started=false
 server_stopped=false
 server_reaped=false
 mpi_pid=
+mpi_pgid=
 mpi_reaped=true
 shm_owned=false
 backing_owned=false
@@ -208,6 +211,18 @@ pid_is_running() {
     [[ "$state" != Z && "$state" != X ]]
 }
 
+process_group_is_running() {
+    local target_pgid=$1
+    local member_pgid
+    local member_state
+
+    while read -r member_pgid member_state; do
+        [[ "$member_pgid" == "$target_pgid" ]] || continue
+        [[ "$member_state" != Z* && "$member_state" != X* ]] && return 0
+    done < <(ps -eo pgid=,stat=)
+    return 1
+}
+
 capture_nvidia_snapshot() {
     local output=$1
     record_command_with_redirection "" "$output" ">" "2>&1" nvidia-smi
@@ -334,7 +349,9 @@ write_mig_artifacts() {
 validate_prerequisites() {
     local command
     validate_positive_decimal QEMULESS_MPI_SIGNAL_TIMEOUT_SECONDS "$mpi_signal_timeout" 60
-    for command in nvidia-smi cmake mpirun jq python3 setsid; do
+    validate_positive_decimal QEMULESS_SERVER_INT_TIMEOUT_SECONDS "$server_int_timeout" 60
+    validate_positive_decimal QEMULESS_SERVER_TERM_TIMEOUT_SECONDS "$server_term_timeout" 60
+    for command in nvidia-smi cmake mpirun jq python3 ps setsid; do
         require_command "$command"
     done
     [[ -x /usr/local/cuda-12.8/bin/nvcc ]] || die "CUDA 12.8 compiler is required at /usr/local/cuda-12.8/bin/nvcc"
@@ -440,6 +457,7 @@ run_mpi_phase() {
     if ! "$dry_run"; then
         setsid --wait "${command[@]}" > "$mpi_log" 2>&1 &
         mpi_pid=$!
+        mpi_pgid=$mpi_pid
         mpi_reaped=false
         local mpi_status
         if wait "$mpi_pid"; then
@@ -448,19 +466,28 @@ run_mpi_phase() {
             mpi_status=$?
         fi
         mpi_reaped=true
-        mpi_pid=
+        if process_group_is_running "$mpi_pgid"; then
+            terminate_mpi || true
+            ((mpi_status != 0)) || mpi_status=1
+        else
+            mpi_pid=
+            mpi_pgid=
+        fi
         return "$mpi_status"
     fi
 }
 
 terminate_mpi() {
-    if [[ -z "$mpi_pid" || "$mpi_reaped" == true ]]; then
+    if [[ -z "$mpi_pgid" ]]; then
         return
     fi
-    if ! pid_is_running "$mpi_pid"; then
-        wait "$mpi_pid" || true
+    if ! process_group_is_running "$mpi_pgid"; then
+        if [[ "$mpi_reaped" == false ]]; then
+            wait "$mpi_pid" 2>/dev/null || true
+        fi
         mpi_reaped=true
         mpi_pid=
+        mpi_pgid=
         return
     fi
 
@@ -470,20 +497,26 @@ terminate_mpi() {
     for signal in INT TERM KILL; do
         timeout=$mpi_signal_timeout
         [[ "$signal" != KILL ]] || timeout=1
-        record_command kill "-$signal" -- "-$mpi_pid"
-        kill "-$signal" -- "-$mpi_pid" 2>/dev/null || true
+        record_command kill "-$signal" -- "-$mpi_pgid"
+        kill "-$signal" -- "-$mpi_pgid" 2>/dev/null || true
         deadline=$((SECONDS + timeout))
-        while pid_is_running "$mpi_pid"; do
+        while process_group_is_running "$mpi_pgid"; do
             ((SECONDS < deadline)) || break
             sleep 1
         done
-        if ! pid_is_running "$mpi_pid"; then
+        if ! process_group_is_running "$mpi_pgid"; then
             break
         fi
     done
-    wait "$mpi_pid" || true
+    local group_survived=false
+    process_group_is_running "$mpi_pgid" && group_survived=true
+    if [[ "$mpi_reaped" == false ]]; then
+        wait "$mpi_pid" 2>/dev/null || true
+    fi
     mpi_reaped=true
     mpi_pid=
+    mpi_pgid=
+    [[ "$group_survived" == false ]]
 }
 
 stop_server() {
@@ -503,7 +536,7 @@ stop_server() {
 
     record_command kill -INT "$server_pid"
     kill -INT "$server_pid"
-    local deadline=$((SECONDS + 30))
+    local deadline=$((SECONDS + server_int_timeout))
     while pid_is_running "$server_pid"; do
         ((SECONDS < deadline)) || break
         sleep 1
@@ -511,7 +544,7 @@ stop_server() {
     if pid_is_running "$server_pid"; then
         record_command kill -TERM "$server_pid"
         kill -TERM "$server_pid"
-        deadline=$((SECONDS + 5))
+        deadline=$((SECONDS + server_term_timeout))
         while pid_is_running "$server_pid"; do
             ((SECONDS < deadline)) || break
             sleep 1
@@ -594,7 +627,7 @@ cleanup_owned_resources() {
 on_exit() {
     local status=$?
     trap - EXIT
-    trap - INT TERM
+    trap '' INT TERM
     terminate_mpi
     if [[ -n "$server_pid" && "$server_stopped" == false ]]; then
         if ! stop_server; then
