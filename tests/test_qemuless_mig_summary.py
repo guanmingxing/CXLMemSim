@@ -73,22 +73,32 @@ class QemuLessMigSummaryTest(unittest.TestCase):
         record.update(overrides)
         (directory / f"rank-{rank}.json").write_text(json.dumps(record), encoding="utf-8")
 
+    def set_mig_uuid_fixture(self, mig_uuids):
+        self.mig_uuid_file.write_text("\n".join(mig_uuids) + "\n", encoding="utf-8")
+        for directory, world_size in ((self.baseline_dir, 4), (self.oversub_dir, 8)):
+            for rank in range(world_size):
+                self.write_record(directory, rank, world_size, mig_uuid=mig_uuids[rank % 4])
+
     def run_summary(self):
+        return self.run_command(self.summary_args())
+
+    def summary_args(self):
+        return [
+            "--baseline-dir",
+            str(self.baseline_dir),
+            "--oversub-dir",
+            str(self.oversub_dir),
+            "--server-log",
+            str(self.server_log),
+            "--mig-uuid-file",
+            str(self.mig_uuid_file),
+            "--output",
+            str(self.output),
+        ]
+
+    def run_command(self, args):
         return subprocess.run(
-            [
-                sys.executable,
-                str(SUMMARIZER),
-                "--baseline-dir",
-                str(self.baseline_dir),
-                "--oversub-dir",
-                str(self.oversub_dir),
-                "--server-log",
-                str(self.server_log),
-                "--mig-uuid-file",
-                str(self.mig_uuid_file),
-                "--output",
-                str(self.output),
-            ],
+            [sys.executable, str(SUMMARIZER), *args],
             capture_output=True,
             text=True,
             check=False,
@@ -170,6 +180,84 @@ class QemuLessMigSummaryTest(unittest.TestCase):
         )
 
         self.assert_fail_summary(self.run_summary())
+
+    def test_mig_uuid_file_rejects_non_task2_grammar(self):
+        malformed_uuids = [
+            "MIG-A",
+            "mig-00000000-0000-0000-0000-000000000001",
+            "MIG-00000000-0000-0000-0000-00000000000G",
+            "MIG-00000000-0000-0000-0000-00000000001",
+        ]
+
+        for malformed_uuid in malformed_uuids:
+            with self.subTest(malformed_uuid=malformed_uuid):
+                self.set_mig_uuid_fixture([malformed_uuid, *MIG_UUIDS[1:]])
+                self.assert_fail_summary(self.run_summary())
+
+    def test_mig_uuid_file_accepts_mixed_case_hex(self):
+        mixed_case_uuids = [
+            "MIG-aBcD0123-4567-89aB-cDeF-0123456789aB",
+            "MIG-00000000-0000-0000-0000-000000000002",
+            "MIG-00000000-0000-0000-0000-000000000003",
+            "MIG-00000000-0000-0000-0000-000000000004",
+        ]
+        self.set_mig_uuid_fixture(mixed_case_uuids)
+
+        completed = self.run_summary()
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("pass", self.read_summary()["verdict"])
+
+    def test_missing_required_argument_writes_fail_summary(self):
+        args = self.summary_args()
+        server_log_index = args.index("--server-log")
+        del args[server_log_index : server_log_index + 2]
+
+        self.assert_fail_summary(self.run_command(args))
+
+    def test_unknown_argument_with_equals_output_writes_fail_summary(self):
+        args = self.summary_args()
+        output_index = args.index("--output")
+        output = args[output_index + 1]
+        args[output_index : output_index + 2] = ["--output={}".format(output)]
+        args.extend(["--unexpected-option", "value"])
+
+        self.assert_fail_summary(self.run_command(args))
+
+    def test_controller_allows_zero_parent_counters_with_positive_aggregate(self):
+        self.server_log.write_text(
+            "Global Counter:\n"
+            "  Remote: 4096\n"
+            "Switch id=0:\n"
+            "  Events:\n"
+            "    Load: 0\n"
+            "      Load: 2048\n"
+            "    Store: 0\n"
+            "      Store: 2048\n"
+            "Statistics:\n"
+            "  Number of Threads created: 8\n",
+            encoding="utf-8",
+        )
+
+        completed = self.run_summary()
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(2048, self.read_summary()["controller"]["loads"])
+        self.assertEqual(2048, self.read_summary()["controller"]["stores"])
+
+    def test_record_contract_requires_nonempty_string_device_name(self):
+        invalid_records = [{}, {"device_name": ""}, {"device_name": 7}]
+
+        for overrides in invalid_records:
+            with self.subTest(overrides=overrides):
+                self.write_record(self.oversub_dir, 7, 8, **overrides)
+                if not overrides:
+                    record_path = self.oversub_dir / "rank-7.json"
+                    record = json.loads(record_path.read_text(encoding="utf-8"))
+                    del record["device_name"]
+                    record_path.write_text(json.dumps(record), encoding="utf-8")
+                self.assert_fail_summary(self.run_summary())
+                self.write_record(self.oversub_dir, 7, 8)
 
     def test_accidental_server_counter_matches_fail(self):
         self.server_log.write_text(

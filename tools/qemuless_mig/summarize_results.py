@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 RANK_FILE_RE = re.compile(r"rank-(0|[1-9][0-9]*)\.json$")
-MIG_UUID_RE = re.compile(r"MIG-[^\s]+$")
+MIG_UUID_RE = re.compile(r"MIG-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
 REMOTE_RE = re.compile(r"^\s*Remote:\s+(\d+)\s*$", re.MULTILINE)
 LOAD_RE = re.compile(r"^\s*Load:\s+(\d+)\s*$", re.MULTILINE)
 STORE_RE = re.compile(r"^\s*Store:\s+(\d+)\s*$", re.MULTILINE)
@@ -23,6 +23,7 @@ class SummaryBuilder:
         self.summary = {
             "verdict": "fail",
             "checks": {
+                "arguments": False,
                 "mig_uuid_file": False,
                 "baseline_rank_files": False,
                 "baseline_records": False,
@@ -49,6 +50,15 @@ class SummaryBuilder:
             self.summary["checks"][check] = True
 
 
+class ArgumentParseError(Exception):
+    pass
+
+
+class EvidenceArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ArgumentParseError(message)
+
+
 def is_integer(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -73,7 +83,7 @@ def load_mig_uuids(path, builder):
         builder.fail("mig_uuid_file", "expected exactly four MIG UUID lines")
         return []
     if any(not MIG_UUID_RE.fullmatch(uuid) for uuid in lines):
-        builder.fail("mig_uuid_file", "MIG UUID lines must be nonempty canonical MIG identifiers")
+        builder.fail("mig_uuid_file", "MIG UUID lines must use the Task 2 MIG UUID grammar")
         return []
     if len(set(lines)) != 4:
         builder.fail("mig_uuid_file", "MIG UUID lines must be unique")
@@ -158,6 +168,9 @@ def validate_records(records, expected_world_size, label, mig_uuids, builder):
         if record.get("slot") != rank or not is_integer(record.get("slot")):
             builder.fail(record_check, "{} slot must equal rank".format(prefix))
             records_valid = False
+        if not isinstance(record.get("device_name"), str) or not record["device_name"]:
+            builder.fail(record_check, "{} device_name must be a nonempty string".format(prefix))
+            records_valid = False
 
         for field in ("cuda_valid", "checkpoint_valid"):
             if type(record.get(field)) is not bool or not record[field]:
@@ -232,7 +245,10 @@ def parse_controller(server_log, builder):
     store_matches = STORE_RE.findall(log)
     thread_matches = THREADS_RE.findall(log)
     if len(remote_matches) != 1 or not load_matches or not store_matches or len(thread_matches) != 1:
-        builder.fail("controller_counters", "server log must contain one Remote and thread count plus Load and Store counters")
+        builder.fail(
+            "controller_counters",
+            "server log must contain one Remote and thread count plus Load and Store counters",
+        )
         return
 
     remote = int(remote_matches[0])
@@ -245,14 +261,18 @@ def parse_controller(server_log, builder):
         "stores": sum(stores),
         "threads": threads,
     }
-    if remote <= 0 or any(value <= 0 for value in loads) or any(value <= 0 for value in stores) or threads < 8:
-        builder.fail("controller_counters", "Remote, Load, and Store counters must be positive and threads must be at least eight")
+    if remote <= 0 or sum(loads) <= 0 or sum(stores) <= 0 or threads < 8:
+        builder.fail(
+            "controller_counters",
+            "Remote, Load, and Store counters must be positive and threads must be at least eight",
+        )
         return
     builder.pass_check("controller_counters")
 
 
 def validate(args):
     builder = SummaryBuilder()
+    builder.pass_check("arguments")
     mig_uuids = load_mig_uuids(args.mig_uuid_file, builder)
     baseline = load_rank_records(args.baseline_dir, 4, "baseline", builder)
     oversubscription = load_rank_records(args.oversub_dir, 8, "oversubscription", builder)
@@ -270,18 +290,53 @@ def write_summary(path, summary):
     output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def parse_args(argv):
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser():
+    parser = EvidenceArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", required=True)
     parser.add_argument("--oversub-dir", required=True)
     parser.add_argument("--server-log", required=True)
     parser.add_argument("--mig-uuid-file", required=True)
     parser.add_argument("--output", required=True)
-    return parser.parse_args(argv)
+    return parser
+
+
+def output_path_from_argv(argv):
+    output = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--output" and index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+            output = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--output=") and argument != "--output=":
+            output = argument.split("=", 1)[1]
+        index += 1
+    return output
+
+
+def write_argument_failure(output, error):
+    builder = SummaryBuilder()
+    builder.fail("arguments", "argument parsing failed: {}".format(error))
+    try:
+        write_summary(output, builder.summary)
+    except OSError as write_error:
+        print("cannot write summary: {}".format(write_error), file=sys.stderr)
+    return 2
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    try:
+        args = parser.parse_args(raw_argv)
+    except ArgumentParseError as error:
+        output = output_path_from_argv(raw_argv)
+        if output is not None:
+            return write_argument_failure(output, error)
+        parser.print_usage(sys.stderr)
+        print("{}: error: {}".format(parser.prog, error), file=sys.stderr)
+        return 2
     try:
         summary = validate(args)
     except Exception as error:  # Keep evidence output available after malformed input.
