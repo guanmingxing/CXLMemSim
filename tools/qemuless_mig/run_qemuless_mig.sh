@@ -6,7 +6,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 capacity_mb=524288
 checkpoint_bytes=$((256 * 1024))
 iterations=100
-shm_name=/cxlmemsim_pgas
+shm_name=
 cxl_build=/tmp/cxlmemsim-qemuless-build
 splash_build=/tmp/splash-qemuless-build
 splash_dir=$(realpath "${repo_root}/../Splash")
@@ -17,6 +17,7 @@ show_help=false
 server_pid=
 server_started=false
 server_stopped=false
+server_reaped=false
 shm_owned=false
 backing_owned=false
 artifact_ready=false
@@ -26,6 +27,7 @@ shm_path=
 summarizer="$repo_root/tools/qemuless_mig/summarize_results.py"
 
 declare -a mig_uuids=()
+declare -a gpu_instance_profiles=()
 declare -A seen_options=()
 
 usage() {
@@ -35,6 +37,7 @@ Usage: run_qemuless_mig.sh [options]
 Options:
   --configure-mig              Create four profile-14 MIG instances on GPU 0 when needed.
   --dry-run                    Record the production command plan without configuring, building, or launching.
+                               Read-only NVIDIA probes and local jq map generation still run.
   --artifact-dir PATH          Empty directory for experiment artifacts.
   --splash-dir PATH            Splash checkout containing the workload and rank wrapper.
   --checkpoint-bytes BYTES     Checkpoint size in bytes (1 through 16777216).
@@ -144,6 +147,7 @@ prepare_artifact_dir() {
     : > "$commands_log"
     : > "$artifact_dir/server.log"
     ssd_backing_file="$artifact_dir/cxlmemsim.ssd"
+    shm_name="/cxlmemsim_pgas_$(date -u +%Y%m%dT%H%M%S)_${BASHPID}_${RANDOM}${RANDOM}"
     shm_path="/dev/shm/${shm_name#/}"
     artifact_ready=true
 }
@@ -156,15 +160,24 @@ record_command() {
     printf '\n' >> "$commands_log"
 }
 
-record_command_with_io() {
+record_command_with_redirection() {
     local input=$1
     local output=$2
-    shift 2
+    local operator=$3
+    local suffix=$4
+    shift 4
     local argument
     for argument in "$@"; do
         printf '%q ' "$argument" >> "$commands_log"
     done
-    printf '< %q > %q\n' "$input" "$output" >> "$commands_log"
+    if [[ -n "$input" ]]; then
+        printf '< %q ' "$input" >> "$commands_log"
+    fi
+    printf '%s %q' "$operator" "$output" >> "$commands_log"
+    if [[ -n "$suffix" ]]; then
+        printf ' %s' "$suffix" >> "$commands_log"
+    fi
+    printf '\n' >> "$commands_log"
 }
 
 run_or_plan() {
@@ -180,7 +193,7 @@ require_command() {
 
 capture_nvidia_snapshot() {
     local output=$1
-    record_command nvidia-smi
+    record_command_with_redirection "" "$output" ">" "2>&1" nvidia-smi
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi > "$output" 2>&1 || printf 'nvidia-smi snapshot failed\n' >> "$output"
     else
@@ -190,8 +203,14 @@ capture_nvidia_snapshot() {
 
 capture_mig_listing() {
     local output=$1
-    record_command nvidia-smi -L
+    record_command_with_redirection "" "$output" ">" "" nvidia-smi -L
     nvidia-smi -L > "$output"
+}
+
+capture_gpu_instance_listing() {
+    local output=$1
+    record_command_with_redirection "" "$output" ">" "" nvidia-smi mig -i 0 -lgi
+    nvidia-smi mig -i 0 -lgi > "$output"
 }
 
 extract_gpu_zero_migs() {
@@ -207,7 +226,7 @@ extract_gpu_zero_migs() {
             gpu_index=${BASH_REMATCH[1]}
             continue
         fi
-        if [[ "$gpu_index" == 0 && "$line" =~ ^[[:space:]]+MIG[[:space:]]+1g\.24gb[[:space:]]+Device[[:space:]]+([0-9]+):[[:space:]]+\(UUID:[[:space:]]*(MIG-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})\)[[:space:]]*$ ]]; then
+        if [[ "$gpu_index" == 0 && "$line" =~ ^[[:space:]]+MIG[[:space:]].*Device[[:space:]]+([0-9]+):[[:space:]]+\(UUID:[[:space:]]*(MIG-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})\)[[:space:]]*$ ]]; then
             device_index=${BASH_REMATCH[1]}
             uuid=${BASH_REMATCH[2]}
             [[ "$device_index" == "${#mig_uuids[@]}" ]] || return 1
@@ -223,9 +242,46 @@ extract_gpu_zero_migs() {
     done
 }
 
+extract_gpu_zero_profile_ids() {
+    local listing=$1
+    local line
+    local -a fields=()
+    local rows=0
+
+    gpu_instance_profiles=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^\|[[:space:]]*0[[:space:]]+MIG[[:space:]] ]]; then
+            ((rows += 1))
+            line=${line#|}
+            line=${line%|}
+            read -r -a fields <<< "$line"
+            ((${#fields[@]} >= 6)) || return 1
+            [[ "${fields[0]}" == 0 && "${fields[1]}" == MIG ]] || return 1
+            [[ "${fields[3]}" =~ ^[0-9]+$ && "${fields[4]}" =~ ^[0-9]+$ ]] || return 1
+            [[ "${fields[5]}" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+            gpu_instance_profiles+=("${fields[3]}")
+        fi
+    done < "$listing"
+    ((rows == ${#gpu_instance_profiles[@]}))
+}
+
+validate_gpu_zero_mig_layout() {
+    local uuid_listing=$1
+    local gi_listing=$2
+    local profile_id
+
+    extract_gpu_zero_profile_ids "$gi_listing" || return 1
+    extract_gpu_zero_migs "$uuid_listing" || return 1
+    ((${#gpu_instance_profiles[@]} == 4)) || return 1
+    for profile_id in "${gpu_instance_profiles[@]}"; do
+        [[ "$profile_id" == 14 ]] || return 1
+    done
+}
+
 record_compute_pids() {
     local output="$artifact_dir/compute-pids.txt"
-    record_command nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits
+    record_command_with_redirection "" "$output" ">" "" nvidia-smi --query-compute-apps=pid \
+        --format=csv,noheader,nounits
     nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits > "$output"
     [[ -z "$(tr -d '[:space:]' < "$output")" ]]
 }
@@ -236,17 +292,15 @@ configure_gpu_zero_mig() {
     fi
 
     run_or_plan sudo nvidia-smi -i 0 -mig 1
-    if "$dry_run"; then
-        record_command sudo nvidia-smi mig -i 0 -dci
-        record_command sudo nvidia-smi mig -i 0 -dgi
-    else
-        run_or_plan sudo nvidia-smi mig -i 0 -dci || true
-        run_or_plan sudo nvidia-smi mig -i 0 -dgi || true
+    if ((${#gpu_instance_profiles[@]} > 0)); then
+        run_or_plan sudo nvidia-smi mig -i 0 -dci
+        run_or_plan sudo nvidia-smi mig -i 0 -dgi
     fi
     run_or_plan sudo nvidia-smi mig -i 0 -cgi 14,14,14,14 -C
 
     local mig_mode="$artifact_dir/mig-mode.txt"
-    record_command nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader,nounits
+    record_command_with_redirection "" "$mig_mode" ">" "" nvidia-smi -i 0 --query-gpu=mig.mode.current \
+        --format=csv,noheader,nounits
     if ! "$dry_run"; then
         nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader,nounits > "$mig_mode"
         [[ "$(tr -d '[:space:]' < "$mig_mode")" == Enabled ]] || die "GPU 0 did not remain MIG enabled"
@@ -256,7 +310,7 @@ configure_gpu_zero_mig() {
 write_mig_artifacts() {
     printf '%s\n' "${mig_uuids[@]}" > "$artifact_dir/mig-uuids.txt"
     local filter='[inputs] as $u | {migs:$u, ranks:[range(0;8) | {rank:., mig_index:(. % 4), mig_uuid:$u[. % 4]}]}'
-    record_command_with_io "$artifact_dir/mig-uuids.txt" "$artifact_dir/mig-map.json" jq -Rn "$filter"
+    record_command_with_redirection "$artifact_dir/mig-uuids.txt" "$artifact_dir/mig-map.json" ">" "" jq -Rn "$filter"
     jq -Rn "$filter" < "$artifact_dir/mig-uuids.txt" > "$artifact_dir/mig-map.json"
 }
 
@@ -279,10 +333,10 @@ validate_prerequisites() {
 
 configure_builds() {
     run_or_plan env CCACHE_DISABLE=1 cmake -S "$repo_root" -B "$cxl_build" -DCMAKE_BUILD_TYPE=Release
-    run_or_plan cmake --build "$cxl_build" --target cxlmemsim_server -j
+    run_or_plan env CCACHE_DISABLE=1 cmake --build "$cxl_build" --target cxlmemsim_server -j
     run_or_plan env CCACHE_DISABLE=1 cmake -S "$splash_dir" -B "$splash_build" -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
-    run_or_plan cmake --build "$splash_build" --target qemuless_mig_oversubscribe -j
+    run_or_plan env CCACHE_DISABLE=1 cmake --build "$splash_build" --target qemuless_mig_oversubscribe -j
 
     if ! "$dry_run"; then
         [[ -x "$cxl_build/cxlmemsim_server" ]] || die "CXLMemSim server build did not produce cxlmemsim_server"
@@ -290,9 +344,38 @@ configure_builds() {
     fi
 }
 
+claim_shm_name() {
+    local claim_program='import os, sys; fd = os.open(sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600); os.close(fd)'
+
+    [[ ! -e "$shm_path" ]] || die "refusing to reuse pre-existing PGAS SHM object: $shm_path"
+    run_or_plan python3 -c "$claim_program" "$shm_path"
+    if ! "$dry_run"; then
+        shm_owned=true
+    fi
+}
+
+pgas_header_ready() {
+    local probe_program='import os, struct, sys
+path = sys.argv[1]
+try:
+    if os.stat(path).st_size < 64 + 64 * 256:
+        raise ValueError("short PGAS SHM object")
+    with open(path, "rb", buffering=0) as handle:
+        magic, version, num_slots, server_ready = struct.unpack("<QIII", handle.read(20))
+    if (magic, version, num_slots, server_ready) != (0x43584C53484D454D, 1, 64, 1):
+        raise ValueError("invalid PGAS SHM header")
+except (OSError, ValueError, struct.error):
+    sys.exit(1)'
+
+    record_command python3 -c "$probe_program" "$shm_path"
+    python3 -c "$probe_program" "$shm_path"
+}
+
 start_server() {
     local server="$cxl_build/cxlmemsim_server"
-    record_command "$server" --comm-mode=pgas-shm --pgas-shm-name="$shm_name" --capacity="$capacity_mb" \
+    claim_shm_name
+    record_command_with_redirection "" "$artifact_dir/server.log" ">" "2>&1 &" "$server" --comm-mode=pgas-shm \
+        --pgas-shm-name="$shm_name" --capacity="$capacity_mb" \
         --default_latency=100 --backing-mode=ssd-stream --ssd-backing-file="$ssd_backing_file" --ssd-cache-mb=64 \
         --ssd-io-uring=false --ssd-odirect=false
     if "$dry_run"; then
@@ -308,8 +391,7 @@ start_server() {
 
     local deadline=$((SECONDS + 30))
     while ((SECONDS < deadline)); do
-        if [[ -e "$shm_path" ]]; then
-            shm_owned=true
+        if pgas_header_ready; then
             return
         fi
         if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -335,7 +417,7 @@ run_mpi_phase() {
         --checkpoint-bytes "$checkpoint_bytes" --iterations "$iterations"
     )
 
-    record_command "${command[@]}"
+    record_command_with_redirection "" "$mpi_log" ">" "2>&1" "${command[@]}"
     if ! "$dry_run"; then
         "${command[@]}" > "$mpi_log" 2>&1
     fi
@@ -345,10 +427,14 @@ stop_server() {
     if [[ -z "$server_pid" || "$server_stopped" == true ]]; then
         return
     fi
-    server_stopped=true
-
     if ! kill -0 "$server_pid" 2>/dev/null; then
-        wait "$server_pid" || true
+        if ! wait "$server_pid"; then
+            server_stopped=true
+            server_reaped=true
+            return 1
+        fi
+        server_stopped=true
+        server_reaped=true
         return
     fi
 
@@ -356,13 +442,37 @@ stop_server() {
     kill -INT "$server_pid"
     local deadline=$((SECONDS + 30))
     while kill -0 "$server_pid" 2>/dev/null; do
-        if ((SECONDS >= deadline)); then
-            printf 'run_qemuless_mig: timed out waiting for server PID %s after SIGINT\n' "$server_pid" >&2
-            return 1
-        fi
+        ((SECONDS < deadline)) || break
         sleep 1
     done
-    wait "$server_pid" || true
+    if kill -0 "$server_pid" 2>/dev/null; then
+        record_command kill -TERM "$server_pid"
+        kill -TERM "$server_pid"
+        deadline=$((SECONDS + 5))
+        while kill -0 "$server_pid" 2>/dev/null; do
+            ((SECONDS < deadline)) || break
+            sleep 1
+        done
+        if kill -0 "$server_pid" 2>/dev/null; then
+            record_command kill -KILL "$server_pid"
+            kill -KILL "$server_pid"
+        fi
+        if ! wait "$server_pid"; then
+            server_stopped=true
+            server_reaped=true
+            return 1
+        fi
+        server_stopped=true
+        server_reaped=true
+        return 1
+    fi
+    if ! wait "$server_pid"; then
+        server_stopped=true
+        server_reaped=true
+        return 1
+    fi
+    server_stopped=true
+    server_reaped=true
 }
 
 write_jsonl() {
@@ -377,11 +487,11 @@ write_jsonl() {
     for ((rank = 0; rank < ranks; rank++)); do
         result="$result_dir/rank-$rank.json"
         if "$dry_run"; then
-            record_command_with_io "$result" "$output" jq -c .
+            record_command_with_redirection "$result" "$output" ">>" "" jq -c .
             continue
         fi
         [[ -f "$result" ]] || die "missing rank result: $result"
-        record_command_with_io "$result" "$output" jq -c .
+        record_command_with_redirection "$result" "$output" ">>" "" jq -c .
         jq -c . "$result" >> "$output"
     done
 }
@@ -404,7 +514,7 @@ cleanup_owned_resources() {
         record_command rm -f -- "$shm_path"
         return
     fi
-    if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    if [[ -n "$server_pid" && "$server_reaped" == false ]] && kill -0 "$server_pid" 2>/dev/null; then
         printf 'run_qemuless_mig: preserving owned resources because server PID %s is still running\n' "$server_pid" >&2
         return
     fi
@@ -439,15 +549,20 @@ main() {
     capture_nvidia_snapshot "$artifact_dir/nvidia-smi-before.txt"
 
     local mig_listing="$artifact_dir/nvidia-smi-mig-before.txt"
+    local gi_listing="$artifact_dir/nvidia-smi-gi-before.txt"
     capture_mig_listing "$mig_listing"
-    if ! extract_gpu_zero_migs "$mig_listing"; then
+    capture_gpu_instance_listing "$gi_listing"
+    if ! validate_gpu_zero_mig_layout "$mig_listing" "$gi_listing"; then
         if ! "$configure_mig"; then
-            die "GPU 0 must expose exactly four canonical MIG UUIDs; rerun with --configure-mig after stopping compute jobs"
+            die "GPU 0 must expose exactly four canonical UUIDs and GI profile IDs 14; rerun with --configure-mig after stopping compute jobs"
         fi
         configure_gpu_zero_mig
         mig_listing="$artifact_dir/nvidia-smi-mig-after-configure.txt"
+        gi_listing="$artifact_dir/nvidia-smi-gi-after-configure.txt"
         capture_mig_listing "$mig_listing"
-        extract_gpu_zero_migs "$mig_listing" || die "GPU 0 did not expose exactly four canonical MIG UUIDs after configuration"
+        capture_gpu_instance_listing "$gi_listing"
+        validate_gpu_zero_mig_layout "$mig_listing" "$gi_listing" ||
+            die "GPU 0 did not expose exactly four canonical UUIDs and GI profile IDs 14 after configuration"
     fi
     write_mig_artifacts
 
