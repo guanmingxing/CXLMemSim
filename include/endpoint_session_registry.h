@@ -30,6 +30,15 @@ enum class PinResponseResult {
     SessionUnavailable,
     InvalidResponse
 };
+enum class RequestAdmissionResult {
+    Accepted,
+    Duplicate,
+    Conflict,
+    Backpressure,
+    StaleRequest,
+    InvalidRequest,
+    SessionUnavailable
+};
 
 struct RegistrationRequest {
     std::uint16_t host_id;
@@ -75,8 +84,10 @@ public:
 
     RegistrationResult registerEndpoint(const RegistrationRequest &request);
     bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id);
-    protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id);
+    protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id,
+                                      const protocol_v2::CoherenceFrame &unregister_request);
 
+    RequestAdmissionResult admitRequest(SessionId session_id, const protocol_v2::CoherenceFrame &request);
     PinResponseResult pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                   const protocol_v2::CoherenceFrame &response);
     bool acknowledgeResponses(SessionId session_id, std::uint64_t highest_contiguous_consumed);
@@ -113,14 +124,26 @@ private:
         ResponseSender sender;
         std::uint64_t response_watermark{};
         bool closed_final_response_pinned{};
+        std::optional<protocol_v2::CoherenceFrame> close_request;
         std::uint64_t binding_generation{};
         std::unordered_map<std::uint64_t, std::size_t> in_flight_deliveries;
+        std::map<std::uint64_t, protocol_v2::CoherenceFrame> admitted_requests;
         std::map<std::uint64_t, PinnedResponse> pinned_responses;
+        std::uint64_t next_request_id{1};
+        std::uint64_t publication_cursor{1};
+        bool publishing{};
+        std::uint64_t publisher_generation{};
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
     };
 
     bool validHolderSession(const Session &session) const noexcept;
+    bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
+    bool beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender);
+    bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
+                        const ResponseSender &sender);
+    void retireFailedBinding(const std::shared_ptr<Session> &session, std::uint64_t generation);
+    void waitForRetiredGeneration(std::unique_lock<std::mutex> &lock, const Session &session, std::uint64_t generation);
     static bool aligned(std::uint64_t line_address) noexcept;
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
     bool validRegistration(const RegistrationRequest &request) const noexcept;
