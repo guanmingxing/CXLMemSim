@@ -58,6 +58,64 @@ bool isLineCommand(Opcode op) noexcept {
 ValidationResult bad(ValidationError error) noexcept { return {error, Status::BadProtocol}; }
 bool endpoint(std::uint16_t host) noexcept { return host < kMaximumHosts; }
 
+bool zeroScalars(const CoherenceFrame &frame) noexcept {
+    return capabilities(frame) == 0 && expected(frame) == 0 && value(frame) == 0 && oldValue(frame) == 0 &&
+           size(frame) == 0;
+}
+
+ValidationResult validateEnvelope(const CoherenceFrame &frame) noexcept {
+    if (magic(frame) != kMagic)
+        return bad(ValidationError::BadMagic);
+    if (version(frame) != kProtocolVersion)
+        return bad(ValidationError::BadVersion);
+    const auto op = opcode(frame);
+    if (!knownOpcode(op))
+        return bad(ValidationError::UnknownOpcode);
+    if (flags(frame) != 0)
+        return bad(ValidationError::NonzeroFlags);
+    if (static_cast<std::uint16_t>(status(frame)) > 11)
+        return bad(ValidationError::InvalidStatus);
+    if (static_cast<std::uint8_t>(ackStrength(frame)) > 2)
+        return bad(ValidationError::InvalidAckStrength);
+    if (static_cast<std::uint8_t>(lineState(frame)) > 3)
+        return bad(ValidationError::InvalidLineState);
+    if (reserved0(frame) != 0)
+        return bad(ValidationError::NonzeroReserved0);
+    if (reserved1(frame) != 0)
+        return bad(ValidationError::NonzeroReserved1);
+    if (std::any_of(frame.reserved.begin(), frame.reserved.end(), [](auto byte) { return byte != 0; }))
+        return bad(ValidationError::NonzeroReserved);
+    if (payloadLength(frame) > kLineSize)
+        return bad(ValidationError::InvalidPayloadLength);
+    if (std::any_of(frame.data.begin() + payloadLength(frame), frame.data.end(), [](auto byte) { return byte != 0; }))
+        return bad(ValidationError::NonzeroUnusedData);
+    if (srcHost(frame) != kServerHost && !endpoint(srcHost(frame)))
+        return bad(ValidationError::InvalidSourceHost);
+    if (dstHost(frame) != kServerHost && !endpoint(dstHost(frame)))
+        return bad(ValidationError::InvalidDestinationHost);
+    const bool server_to_endpoint = op == Opcode::Response || isSnoop(op);
+    if (server_to_endpoint ? (srcHost(frame) != kServerHost || !endpoint(dstHost(frame)))
+                           : (!endpoint(srcHost(frame)) || dstHost(frame) != kServerHost))
+        return bad(ValidationError::InvalidDirection);
+    return {ValidationError::None, Status::Ok};
+}
+
+bool validRequestState(Opcode op, LineState state, std::uint64_t request_epoch) noexcept {
+    if (op == Opcode::Gets)
+        return state == LineState::I && request_epoch == 0;
+    if (op == Opcode::Getm)
+        return (state == LineState::I && request_epoch == 0) || (state == LineState::S && request_epoch != 0);
+    if (op == Opcode::Upgrade)
+        return state == LineState::E && request_epoch != 0;
+    if (op == Opcode::Puts)
+        return (state == LineState::S || state == LineState::E) && request_epoch != 0;
+    if (op == Opcode::Putm)
+        return state == LineState::M && request_epoch != 0;
+    if (isAtomic(op))
+        return (state == LineState::I && request_epoch == 0) || (state != LineState::I && request_epoch != 0);
+    return true;
+}
+
 } // namespace
 
 EncodedFrame encodeFrame(const CoherenceFrame &frame) noexcept {
@@ -160,40 +218,9 @@ ACCESSOR(std::uint32_t, reserved1, setReserved1, reserved1)
 #undef ACCESSOR
 
 ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
-    if (magic(frame) != kMagic)
-        return bad(ValidationError::BadMagic);
-    if (version(frame) != kProtocolVersion)
-        return bad(ValidationError::BadVersion);
+    if (const auto result = validateEnvelope(frame); !result)
+        return result;
     const auto op = opcode(frame);
-    if (!knownOpcode(op))
-        return bad(ValidationError::UnknownOpcode);
-    if (flags(frame) != 0)
-        return bad(ValidationError::NonzeroFlags);
-    if (static_cast<std::uint16_t>(status(frame)) > 11)
-        return bad(ValidationError::InvalidStatus);
-    if (static_cast<std::uint8_t>(ackStrength(frame)) > 2)
-        return bad(ValidationError::InvalidAckStrength);
-    if (static_cast<std::uint8_t>(lineState(frame)) > 3)
-        return bad(ValidationError::InvalidLineState);
-    if (reserved0(frame) != 0)
-        return bad(ValidationError::NonzeroReserved0);
-    if (reserved1(frame) != 0)
-        return bad(ValidationError::NonzeroReserved1);
-    if (std::any_of(frame.reserved.begin(), frame.reserved.end(), [](auto byte) { return byte != 0; }))
-        return bad(ValidationError::NonzeroReserved);
-    if (payloadLength(frame) > kLineSize)
-        return bad(ValidationError::InvalidPayloadLength);
-    if (std::any_of(frame.data.begin() + payloadLength(frame), frame.data.end(), [](auto byte) { return byte != 0; }))
-        return bad(ValidationError::NonzeroUnusedData);
-    if (srcHost(frame) != kServerHost && !endpoint(srcHost(frame)))
-        return bad(ValidationError::InvalidSourceHost);
-    if (dstHost(frame) != kServerHost && !endpoint(dstHost(frame)))
-        return bad(ValidationError::InvalidDestinationHost);
-
-    const bool server_to_endpoint = op == Opcode::Response || isSnoop(op);
-    if (server_to_endpoint ? (srcHost(frame) != kServerHost || !endpoint(dstHost(frame)))
-                           : (!endpoint(srcHost(frame)) || dstHost(frame) != kServerHost))
-        return bad(ValidationError::InvalidDirection);
     if (op == Opcode::Register) {
         if (requestId(frame) != 0)
             return bad(ValidationError::InvalidRequestId);
@@ -211,8 +238,8 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
             return bad(ValidationError::UnexpectedEpoch);
         if (payloadLength(frame) != 0)
             return bad(ValidationError::InvalidPayloadLength);
-        if (size(frame) != kLineSize || value(frame) == 0 || expected(frame) == 0 ||
-            value(frame) % (expected(frame) * kLineSize) != 0)
+        if (size(frame) != kLineSize || value(frame) == 0 || expected(frame) == 0 || value(frame) % kLineSize != 0 ||
+            (value(frame) / kLineSize) % expected(frame) != 0)
             return bad(ValidationError::InvalidCacheGeometry);
         if ((capabilities(frame) & ~kKnownCapabilities) != 0 ||
             (capabilities(frame) & static_cast<std::uint64_t>(Capability::MODEL_SNOOP)) == 0)
@@ -223,15 +250,8 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
     }
     if (sessionId(frame) == 0)
         return bad(ValidationError::InvalidSessionId);
-    if (op == Opcode::Response) {
-        if (requestId(frame) == 0)
-            return bad(ValidationError::InvalidRequestId);
-        if (snoopId(frame) != 0)
-            return bad(ValidationError::InvalidSnoopId);
-        if (payloadLength(frame) != 0 && payloadLength(frame) != kLineSize)
-            return bad(ValidationError::InvalidPayloadLength);
-        return {ValidationError::None, Status::Ok};
-    }
+    if (op == Opcode::Response || op == Opcode::SnoopAck)
+        return bad(ValidationError::ContextRequired);
     if (isSnoop(op)) {
         if (requestId(frame) != 0)
             return bad(ValidationError::InvalidRequestId);
@@ -243,27 +263,21 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
             return bad(ValidationError::InvalidPayloadLength);
         if (ackStrength(frame) != AckStrength::NONE)
             return bad(ValidationError::UnexpectedAckStrength);
-        if (capabilities(frame) || expected(frame) || value(frame) || oldValue(frame) || size(frame))
+        if (!zeroScalars(frame))
             return bad(ValidationError::UnexpectedValue);
-        if (op != Opcode::HostFence && address(frame) % kLineSize != 0)
-            return bad(ValidationError::UnalignedAddress);
-        if (op == Opcode::HostFence && address(frame) != 0)
-            return bad(ValidationError::UnexpectedAddress);
-        return {ValidationError::None, Status::Ok};
-    }
-    if (op == Opcode::SnoopAck) {
-        if (requestId(frame) != 0)
-            return bad(ValidationError::InvalidRequestId);
-        if (snoopId(frame) == 0)
-            return bad(ValidationError::InvalidSnoopId);
-        if (payloadLength(frame) != 0 && payloadLength(frame) != kLineSize)
-            return bad(ValidationError::InvalidPayloadLength);
-        if (address(frame) % kLineSize != 0)
-            return bad(ValidationError::UnalignedAddress);
-        if (capabilities(frame) != 0)
-            return bad(ValidationError::UnexpectedCapabilities);
-        if (expected(frame) || value(frame) || oldValue(frame) || size(frame))
-            return bad(ValidationError::UnexpectedValue);
+        if (lineState(frame) != LineState::I)
+            return bad(ValidationError::UnexpectedState);
+        if (op == Opcode::HostFence) {
+            if (address(frame) != 0)
+                return bad(ValidationError::UnexpectedAddress);
+            if (epoch(frame) != 0)
+                return bad(ValidationError::UnexpectedEpoch);
+        } else {
+            if (address(frame) % kLineSize != 0)
+                return bad(ValidationError::UnalignedAddress);
+            if (epoch(frame) == 0)
+                return bad(ValidationError::UnexpectedEpoch);
+        }
         return {ValidationError::None, Status::Ok};
     }
     if (requestId(frame) == 0)
@@ -290,7 +304,7 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
     if (isAtomic(op)) {
         if (size(frame) != 8)
             return bad(ValidationError::UnexpectedSize);
-        if (address(frame) % 8 != 0)
+        if (address(frame) % 8 != 0 || (address(frame) & (kLineSize - 1)) > kLineSize - size(frame))
             return bad(ValidationError::UnalignedAddress);
         if (payloadLength(frame) != 0)
             return bad(ValidationError::InvalidPayloadLength);
@@ -298,6 +312,9 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
             return bad(ValidationError::UnexpectedExpected);
         if (capabilities(frame) || oldValue(frame))
             return bad(ValidationError::UnexpectedCapabilities);
+        if (!validRequestState(op, lineState(frame), epoch(frame)))
+            return lineState(frame) == LineState::I ? bad(ValidationError::UnexpectedEpoch)
+                                                    : bad(ValidationError::UnexpectedState);
         return {ValidationError::None, Status::Ok};
     }
     if (op == Opcode::Fence || op == Opcode::Unregister) {
@@ -310,11 +327,144 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
     }
     if (isLineCommand(op) && address(frame) % kLineSize != 0)
         return bad(ValidationError::UnalignedAddress);
+    if (isLineCommand(op) && !validRequestState(op, lineState(frame), epoch(frame)))
+        return bad(ValidationError::UnexpectedState);
     const auto required_payload = op == Opcode::Putm ? kLineSize : 0;
     if (payloadLength(frame) != required_payload)
         return bad(ValidationError::InvalidPayloadLength);
     if (capabilities(frame) || expected(frame) || value(frame) || oldValue(frame) || size(frame))
         return bad(ValidationError::UnexpectedValue);
+    return {ValidationError::None, Status::Ok};
+}
+
+ValidationResult validateResponse(const CoherenceFrame &response, const CoherenceFrame &request) noexcept {
+    if (const auto result = validateEnvelope(response); !result)
+        return result;
+    if (const auto result = validateFrame(request); !result)
+        return bad(ValidationError::ContextRequired);
+    if (opcode(response) != Opcode::Response)
+        return bad(ValidationError::UnknownOpcode);
+    if (opcode(request) == Opcode::Response || opcode(request) == Opcode::SnoopAck || isSnoop(opcode(request)))
+        return bad(ValidationError::ContextRequired);
+    if (srcHost(response) != dstHost(request))
+        return bad(ValidationError::InvalidSourceHost);
+    if (dstHost(response) != srcHost(request))
+        return bad(ValidationError::InvalidDestinationHost);
+    if (requestId(response) != requestId(request))
+        return bad(ValidationError::InvalidRequestId);
+    if (snoopId(response) != 0)
+        return bad(ValidationError::InvalidSnoopId);
+    if (address(response) != address(request))
+        return bad(ValidationError::UnexpectedAddress);
+
+    const auto request_op = opcode(request);
+    if (request_op == Opcode::Register) {
+        if (requestId(response) != 0)
+            return bad(ValidationError::InvalidRequestId);
+        if (status(response) != Status::Ok) {
+            if (sessionId(response) != sessionId(request))
+                return bad(ValidationError::InvalidSessionId);
+            if (lineState(response) != LineState::I || epoch(response) != 0 || payloadLength(response) != 0 ||
+                ackStrength(response) != AckStrength::NONE || !zeroScalars(response))
+                return bad(ValidationError::UnexpectedState);
+            return {ValidationError::None, Status::Ok};
+        }
+        if (sessionId(response) == 0)
+            return bad(ValidationError::InvalidSessionId);
+        if (sessionId(request) != 0 && sessionId(response) != sessionId(request))
+            return bad(ValidationError::InvalidSessionId);
+        if (lineState(response) != LineState::I)
+            return bad(ValidationError::UnexpectedState);
+        if (epoch(response) != 0)
+            return bad(ValidationError::UnexpectedEpoch);
+        if (payloadLength(response) != 0)
+            return bad(ValidationError::InvalidPayloadLength);
+        if (size(response) != size(request) || value(response) != value(request) ||
+            expected(response) != expected(request))
+            return bad(ValidationError::InvalidCacheGeometry);
+        if (capabilities(response) == 0 || (capabilities(response) & ~capabilities(request)) != 0 ||
+            (capabilities(response) & static_cast<std::uint64_t>(Capability::MODEL_SNOOP)) == 0)
+            return bad(ValidationError::InvalidCapabilities);
+        const auto required_strength = (capabilities(response) & static_cast<std::uint64_t>(Capability::NATIVE_FLUSH))
+                                           ? AckStrength::NATIVE
+                                           : AckStrength::MODEL;
+        if (ackStrength(response) != required_strength)
+            return bad(ValidationError::UnexpectedAckStrength);
+        if (oldValue(response) == 0)
+            return bad(ValidationError::UnexpectedOldValue);
+        return {ValidationError::None, Status::Ok};
+    }
+
+    if (sessionId(response) != sessionId(request) || sessionId(response) == 0)
+        return bad(ValidationError::InvalidSessionId);
+    if (ackStrength(response) != AckStrength::NONE || capabilities(response) != 0 || expected(response) != 0 ||
+        value(response) != 0 || size(response) != 0)
+        return bad(ValidationError::UnexpectedValue);
+    if (status(response) != Status::Ok) {
+        if (lineState(response) != LineState::I)
+            return bad(ValidationError::UnexpectedState);
+        if (epoch(response) != 0)
+            return bad(ValidationError::UnexpectedEpoch);
+        if (payloadLength(response) != 0)
+            return bad(ValidationError::InvalidPayloadLength);
+        if (status(response) == Status::StaleRequest ? oldValue(response) == 0 : oldValue(response) != 0)
+            return bad(ValidationError::UnexpectedOldValue);
+        return {ValidationError::None, Status::Ok};
+    }
+
+    const bool data_response = request_op == Opcode::Gets || request_op == Opcode::Getm || isAtomic(request_op);
+    if (payloadLength(response) != (data_response ? kLineSize : 0))
+        return bad(ValidationError::InvalidPayloadLength);
+    if (epoch(response) == 0 && (isLineCommand(request_op) || isAtomic(request_op)))
+        return bad(ValidationError::UnexpectedEpoch);
+    LineState required_state = LineState::I;
+    if (request_op == Opcode::Gets) {
+        if (lineState(response) != LineState::S && lineState(response) != LineState::E)
+            return bad(ValidationError::UnexpectedState);
+    } else {
+        if (request_op == Opcode::Getm || request_op == Opcode::Upgrade || isAtomic(request_op))
+            required_state = LineState::M;
+        if (lineState(response) != required_state)
+            return bad(ValidationError::UnexpectedState);
+    }
+    if (isAtomic(request_op) ? false : oldValue(response) != 0)
+        return bad(ValidationError::UnexpectedOldValue);
+    return {ValidationError::None, Status::Ok};
+}
+
+ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFrame &snoop,
+                                  AckStrength negotiated_strength) noexcept {
+    if (const auto result = validateEnvelope(ack); !result)
+        return result;
+    if (const auto result = validateFrame(snoop); !result)
+        return bad(ValidationError::ContextRequired);
+    if (opcode(ack) != Opcode::SnoopAck || !isSnoop(opcode(snoop)))
+        return bad(ValidationError::ContextRequired);
+    if (srcHost(ack) != dstHost(snoop) || dstHost(ack) != srcHost(snoop))
+        return bad(ValidationError::InvalidDirection);
+    if (requestId(ack) != 0)
+        return bad(ValidationError::InvalidRequestId);
+    if (snoopId(ack) == 0 || snoopId(ack) != snoopId(snoop))
+        return bad(ValidationError::InvalidSnoopId);
+    if (sessionId(ack) == 0 || sessionId(ack) != sessionId(snoop))
+        return bad(ValidationError::InvalidSessionId);
+    if (address(ack) != address(snoop))
+        return bad(ValidationError::UnexpectedAddress);
+    if (epoch(ack) != epoch(snoop))
+        return bad(ValidationError::UnexpectedEpoch);
+    if (negotiated_strength == AckStrength::NONE || ackStrength(ack) != negotiated_strength)
+        return bad(ValidationError::UnexpectedAckStrength);
+    if (!zeroScalars(ack))
+        return bad(ValidationError::UnexpectedValue);
+    const bool success = status(ack) == Status::Ok;
+    const bool data_snoop = opcode(snoop) == Opcode::SnpDataInv || opcode(snoop) == Opcode::SnpDataDowngrade;
+    if (payloadLength(ack) != (success && data_snoop ? kLineSize : 0))
+        return bad(ValidationError::InvalidPayloadLength);
+    const auto expected_state =
+        success && (opcode(snoop) == Opcode::SnpDowngrade || opcode(snoop) == Opcode::SnpDataDowngrade) ? LineState::S
+                                                                                                        : LineState::I;
+    if (lineState(ack) != expected_state)
+        return bad(ValidationError::UnexpectedState);
     return {ValidationError::None, Status::Ok};
 }
 
@@ -404,7 +554,8 @@ std::string_view toString(ValidationError value) noexcept {
                                       "unexpected expected",
                                       "unexpected value",
                                       "unexpected old value",
-                                      "unexpected size"};
+                                      "unexpected size",
+                                      "context required"};
     const auto index = static_cast<std::size_t>(value);
     return index < names.size() ? names[index] : "unknown validation error";
 }

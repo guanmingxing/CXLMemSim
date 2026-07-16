@@ -176,6 +176,7 @@ enum class ValidationError {
     UnexpectedValue,
     UnexpectedOldValue,
     UnexpectedSize,
+    ContextRequired,
 };
 
 struct ValidationResult {
@@ -185,6 +186,9 @@ struct ValidationResult {
 };
 
 ValidationResult validateFrame(const CoherenceFrame &frame) noexcept;
+ValidationResult validateResponse(const CoherenceFrame &response, const CoherenceFrame &request) noexcept;
+ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFrame &snoop,
+                                  AckStrength negotiated_strength) noexcept;
 std::string_view toString(Opcode value) noexcept;
 std::string_view toString(Status value) noexcept;
 std::string_view toString(AckStrength value) noexcept;
