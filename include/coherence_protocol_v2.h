@@ -3,7 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
+#include <type_traits>
 
 namespace cxlmemsim::protocol_v2 {
 
@@ -56,7 +58,7 @@ inline constexpr std::uint64_t kSupportedCapabilities = static_cast<std::uint64_
 enum class AckStrength : std::uint8_t { NONE = 0, MODEL = 1, NATIVE = 2 };
 enum class LineState : std::uint8_t { I = 0, S = 1, E = 2, M = 3 };
 
-// Host-order logical representation. Wire I/O must use encodeFrame/decodeFrame.
+// Layout assertions mirror the wire contract; wire I/O must still use encodeFrame/decodeFrame.
 struct CoherenceFrame {
     std::uint32_t magic;
     std::uint16_t version;
@@ -84,6 +86,7 @@ struct CoherenceFrame {
     std::array<std::uint8_t, 24> reserved;
 };
 
+static_assert(std::is_standard_layout_v<CoherenceFrame>);
 static_assert(sizeof(CoherenceFrame) == kFrameSize);
 #define ASSERT_OFFSET(field, offset) static_assert(offsetof(CoherenceFrame, field) == offset)
 ASSERT_OFFSET(magic, 0);
@@ -114,7 +117,7 @@ ASSERT_OFFSET(reserved, 168);
 
 using EncodedFrame = std::array<std::uint8_t, kFrameSize>;
 EncodedFrame encodeFrame(const CoherenceFrame &frame) noexcept;
-bool decodeFrame(const EncodedFrame &bytes, CoherenceFrame &frame) noexcept;
+bool decodeFrame(std::span<const std::uint8_t> bytes, CoherenceFrame &frame) noexcept;
 CoherenceFrame initializeFrame(Opcode type) noexcept;
 
 #define DECLARE_ACCESSORS(type, name, setter)                                                                          \

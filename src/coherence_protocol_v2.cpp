@@ -12,7 +12,7 @@ template <typename T> void putLe(EncodedFrame &bytes, std::size_t offset, T valu
     }
 }
 
-template <typename T> T getLe(const EncodedFrame &bytes, std::size_t offset) noexcept {
+template <typename T> T getLe(std::span<const std::uint8_t> bytes, std::size_t offset) noexcept {
     T value = 0;
     for (std::size_t index = 0; index < sizeof(T); ++index) {
         value |= static_cast<T>(bytes[offset + index]) << (index * 8U);
@@ -156,16 +156,19 @@ EncodedFrame encodeFrame(const CoherenceFrame &frame) noexcept {
     return bytes;
 }
 
-bool decodeFrame(const EncodedFrame &bytes, CoherenceFrame &frame) noexcept {
-    frame = {};
-#define GET(member, offset, type) frame.member = getLe<type>(bytes, offset)
+bool decodeFrame(std::span<const std::uint8_t> bytes, CoherenceFrame &frame) noexcept {
+    if (bytes.size() != kFrameSize)
+        return false;
+
+    CoherenceFrame decoded{};
+#define GET(member, offset, type) decoded.member = getLe<type>(bytes, offset)
     GET(magic, 0, std::uint32_t);
     GET(version, 4, std::uint16_t);
     GET(type, 6, std::uint16_t);
     GET(flags, 8, std::uint32_t);
     GET(status, 12, std::uint16_t);
-    frame.ack_strength = bytes[14];
-    frame.state = bytes[15];
+    decoded.ack_strength = bytes[14];
+    decoded.state = bytes[15];
     GET(src_host, 16, std::uint16_t);
     GET(dst_host, 18, std::uint16_t);
     GET(payload_len, 20, std::uint16_t);
@@ -182,8 +185,9 @@ bool decodeFrame(const EncodedFrame &bytes, CoherenceFrame &frame) noexcept {
     GET(size, 96, std::uint32_t);
     GET(reserved1, 100, std::uint32_t);
 #undef GET
-    std::copy_n(bytes.begin() + 104, kLineSize, frame.data.begin());
-    std::copy_n(bytes.begin() + 168, frame.reserved.size(), frame.reserved.begin());
+    std::copy_n(bytes.begin() + 104, kLineSize, decoded.data.begin());
+    std::copy_n(bytes.begin() + 168, decoded.reserved.size(), decoded.reserved.begin());
+    frame = decoded;
     return true;
 }
 

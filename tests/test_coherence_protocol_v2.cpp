@@ -1,5 +1,6 @@
 #include "coherence_protocol_v2.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,8 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -27,30 +30,65 @@ int failures = 0;
 
 using Bytes = protocol::EncodedFrame;
 
+bool parseFixtureHex(std::string_view name, std::size_t line_number, std::string_view hex, Bytes &bytes,
+                     std::ostream &diagnostics) {
+    if (hex.size() != protocol::kFrameSize * 2) {
+        diagnostics << "fixture '" << name << "' on line " << line_number << " has " << hex.size()
+                    << " hex characters; expected " << protocol::kFrameSize * 2 << '\n';
+        return false;
+    }
+
+    const auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9')
+            return value - '0';
+        if (value >= 'a' && value <= 'f')
+            return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F')
+            return value - 'A' + 10;
+        return -1;
+    };
+
+    Bytes parsed{};
+    for (std::size_t index = 0; index < parsed.size(); ++index) {
+        const int high = nibble(hex[index * 2]);
+        const int low = nibble(hex[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+            diagnostics << "fixture '" << name << "' on line " << line_number << " has non-hex character at column "
+                        << (index * 2 + (high < 0 ? 1 : 2)) << '\n';
+            return false;
+        }
+        parsed[index] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    bytes = parsed;
+    return true;
+}
+
 std::unordered_map<std::string, Bytes> loadGoldenFrames() {
     std::ifstream input(COHERENCE_PROTOCOL_V2_FIXTURE_PATH);
     CHECK(input.is_open());
     std::unordered_map<std::string, Bytes> fixtures;
     std::string line;
+    std::size_t line_number = 0;
     while (std::getline(input, line)) {
+        ++line_number;
         const auto separator = line.find('\t');
-        CHECK(separator != std::string::npos);
-        if (separator == std::string::npos)
+        if (separator == std::string::npos) {
+            std::cerr << "fixture line " << line_number << " has no tab separator\n";
+            ++failures;
             continue;
+        }
         const auto name = line.substr(0, separator);
         const auto hex = line.substr(separator + 1);
-        CHECK(hex.size() == protocol::kFrameSize * 2);
-        if (hex.size() != protocol::kFrameSize * 2)
-            continue;
         Bytes bytes{};
-        for (std::size_t index = 0; index < bytes.size(); ++index) {
-            const auto byte = hex.substr(index * 2, 2);
-            const auto parsed = std::strtoul(byte.c_str(), nullptr, 16);
-            bytes[index] = static_cast<std::uint8_t>(parsed);
+        if (!parseFixtureHex(name, line_number, hex, bytes, std::cerr)) {
+            ++failures;
+            continue;
         }
-        CHECK(fixtures.emplace(name, bytes).second);
+        if (!fixtures.emplace(name, bytes).second) {
+            std::cerr << "duplicate fixture '" << name << "' on line " << line_number << '\n';
+            ++failures;
+        }
     }
-    CHECK(fixtures.size() == 5);
     return fixtures;
 }
 
@@ -60,6 +98,36 @@ void expectEncoding(const protocol::CoherenceFrame &frame, const Bytes &golden) 
     protocol::CoherenceFrame decoded{};
     CHECK(protocol::decodeFrame(encoded, decoded));
     CHECK(protocol::encodeFrame(decoded) == golden);
+}
+
+void testFixtureHexParsingRejectsInvalidInput() {
+    Bytes bytes{};
+    std::ostringstream diagnostics;
+    std::string invalid_hex(protocol::kFrameSize * 2, '0');
+    invalid_hex[17] = 'g';
+    CHECK(!parseFixtureHex("BAD_CHARACTER", 7, invalid_hex, bytes, diagnostics));
+    CHECK(diagnostics.str().find("BAD_CHARACTER") != std::string::npos);
+    CHECK(diagnostics.str().find("line 7") != std::string::npos);
+
+    diagnostics.str({});
+    diagnostics.clear();
+    CHECK(!parseFixtureHex("BAD_LENGTH", 11, std::string(protocol::kFrameSize * 2 - 1, '0'), bytes, diagnostics));
+    CHECK(diagnostics.str().find("BAD_LENGTH") != std::string::npos);
+    CHECK(diagnostics.str().find("line 11") != std::string::npos);
+}
+
+void testDecodeRejectsShortFrameWithoutModifyingOutput() {
+    auto output = protocol::initializeFrame(protocol::Opcode::Heartbeat);
+    protocol::setSrcHost(output, 3);
+    protocol::setDstHost(output, protocol::kServerHost);
+    protocol::setSessionId(output, 0x1122334455667788ULL);
+    protocol::setRequestId(output, 0x0102030405060708ULL);
+    protocol::setOldValue(output, 42);
+    const auto original = protocol::encodeFrame(output);
+    const std::array<std::uint8_t, protocol::kFrameSize - 1> short_frame{};
+
+    CHECK(!protocol::decodeFrame(std::span<const std::uint8_t>(short_frame), output));
+    CHECK(protocol::encodeFrame(output) == original);
 }
 
 protocol::CoherenceFrame command(protocol::Opcode type) {
@@ -145,6 +213,17 @@ void testExactAbiAndValues() {
 
 void testGoldenFrames() {
     const auto fixtures = loadGoldenFrames();
+    constexpr std::array required_names{"REGISTER", "GETS", "SNP_DATA_INV", "SNOOP_ACK", "HEARTBEAT"};
+    for (const auto *name : required_names) {
+        if (!fixtures.contains(name)) {
+            std::cerr << "required fixture '" << name << "' is missing\n";
+            ++failures;
+        }
+    }
+    if (std::any_of(required_names.begin(), required_names.end(),
+                    [&fixtures](const auto *name) { return !fixtures.contains(name); }))
+        return;
+
     auto registration = protocol::initializeFrame(protocol::Opcode::Register);
     protocol::setSrcHost(registration, 3);
     protocol::setDstHost(registration, protocol::kServerHost);
@@ -152,16 +231,16 @@ void testGoldenFrames() {
     protocol::setValue(registration, 0x10000);
     protocol::setExpected(registration, 8);
     protocol::setCapabilities(registration, static_cast<std::uint64_t>(protocol::Capability::MODEL_SNOOP));
-    expectEncoding(registration, fixtures.at("REGISTER"));
+    expectEncoding(registration, fixtures.find("REGISTER")->second);
     CHECK(protocol::validateFrame(registration));
 
     auto gets = command(protocol::Opcode::Gets);
     protocol::setAddress(gets, 0x1000);
-    expectEncoding(gets, fixtures.at("GETS"));
+    expectEncoding(gets, fixtures.find("GETS")->second);
     CHECK(protocol::validateFrame(gets));
 
     auto data_snoop = snoop(protocol::Opcode::SnpDataInv);
-    expectEncoding(data_snoop, fixtures.at("SNP_DATA_INV"));
+    expectEncoding(data_snoop, fixtures.find("SNP_DATA_INV")->second);
     CHECK(protocol::validateFrame(data_snoop));
 
     auto ack = protocol::initializeFrame(protocol::Opcode::SnoopAck);
@@ -186,14 +265,14 @@ void testGoldenFrames() {
     for (std::size_t i = 0; i < 64; ++i) {
         ack.data[i] = static_cast<std::uint8_t>(i);
     }
-    expectEncoding(ack, fixtures.at("SNOOP_ACK"));
+    expectEncoding(ack, fixtures.find("SNOOP_ACK")->second);
     protocol::setOpcode(acked_snoop, protocol::Opcode::SnpDataInv);
     CHECK(protocol::validateSnoopAck(ack, acked_snoop,
                                      {protocol::AckStrength::MODEL, protocol::LineState::I, protocol::LineState::M}));
 
     auto heartbeat = command(protocol::Opcode::Heartbeat);
     protocol::setOldValue(heartbeat, 42);
-    expectEncoding(heartbeat, fixtures.at("HEARTBEAT"));
+    expectEncoding(heartbeat, fixtures.find("HEARTBEAT")->second);
     CHECK(protocol::validateFrame(heartbeat));
 }
 
@@ -838,6 +917,8 @@ void testValidationAndSemantics() {
 
 int main() {
     testExactAbiAndValues();
+    testFixtureHexParsingRejectsInvalidInput();
+    testDecodeRejectsShortFrameWithoutModifyingOutput();
     testGoldenFrames();
     testValidationAndSemantics();
     testRegisterResponseValidation();
