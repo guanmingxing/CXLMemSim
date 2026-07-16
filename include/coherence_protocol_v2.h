@@ -52,6 +52,7 @@ enum class Status : std::uint16_t {
 
 enum class Capability : std::uint64_t { MODEL_SNOOP = 1ULL << 0, NATIVE_FLUSH = 1ULL << 1 };
 inline constexpr std::uint64_t kKnownCapabilities = 0x3ULL;
+inline constexpr std::uint64_t kSupportedCapabilities = static_cast<std::uint64_t>(Capability::MODEL_SNOOP);
 enum class AckStrength : std::uint8_t { NONE = 0, MODEL = 1, NATIVE = 2 };
 enum class LineState : std::uint8_t { I = 0, S = 1, E = 2, M = 3 };
 
@@ -187,8 +188,15 @@ struct ValidationResult {
 
 ValidationResult validateFrame(const CoherenceFrame &frame) noexcept;
 ValidationResult validateResponse(const CoherenceFrame &response, const CoherenceFrame &request) noexcept;
+
+struct SnoopAckContext {
+    AckStrength negotiated_strength;
+    LineState success_state;
+    LineState failure_state;
+};
+
 ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFrame &snoop,
-                                  AckStrength negotiated_strength) noexcept;
+                                  SnoopAckContext context) noexcept;
 std::string_view toString(Opcode value) noexcept;
 std::string_view toString(Status value) noexcept;
 std::string_view toString(AckStrength value) noexcept;

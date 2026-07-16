@@ -241,7 +241,7 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
         if (size(frame) != kLineSize || value(frame) == 0 || expected(frame) == 0 || value(frame) % kLineSize != 0 ||
             (value(frame) / kLineSize) % expected(frame) != 0)
             return bad(ValidationError::InvalidCacheGeometry);
-        if ((capabilities(frame) & ~kKnownCapabilities) != 0 ||
+        if ((capabilities(frame) & ~kSupportedCapabilities) != 0 ||
             (capabilities(frame) & static_cast<std::uint64_t>(Capability::MODEL_SNOOP)) == 0)
             return bad(ValidationError::InvalidCapabilities);
         if (oldValue(frame) != 0)
@@ -382,13 +382,11 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
         if (size(response) != size(request) || value(response) != value(request) ||
             expected(response) != expected(request))
             return bad(ValidationError::InvalidCacheGeometry);
-        if (capabilities(response) == 0 || (capabilities(response) & ~capabilities(request)) != 0 ||
+        if (capabilities(response) == 0 || (capabilities(response) & ~kSupportedCapabilities) != 0 ||
+            (capabilities(response) & ~capabilities(request)) != 0 ||
             (capabilities(response) & static_cast<std::uint64_t>(Capability::MODEL_SNOOP)) == 0)
             return bad(ValidationError::InvalidCapabilities);
-        const auto required_strength = (capabilities(response) & static_cast<std::uint64_t>(Capability::NATIVE_FLUSH))
-                                           ? AckStrength::NATIVE
-                                           : AckStrength::MODEL;
-        if (ackStrength(response) != required_strength)
+        if (ackStrength(response) != AckStrength::MODEL)
             return bad(ValidationError::UnexpectedAckStrength);
         if (oldValue(response) == 0)
             return bad(ValidationError::UnexpectedOldValue);
@@ -401,9 +399,9 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
         value(response) != 0 || size(response) != 0)
         return bad(ValidationError::UnexpectedValue);
     if (status(response) != Status::Ok) {
-        if (lineState(response) != LineState::I)
+        if (lineState(response) != lineState(request))
             return bad(ValidationError::UnexpectedState);
-        if (epoch(response) != 0)
+        if (epoch(response) != epoch(request))
             return bad(ValidationError::UnexpectedEpoch);
         if (payloadLength(response) != 0)
             return bad(ValidationError::InvalidPayloadLength);
@@ -433,7 +431,7 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
 }
 
 ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFrame &snoop,
-                                  AckStrength negotiated_strength) noexcept {
+                                  SnoopAckContext context) noexcept {
     if (const auto result = validateEnvelope(ack); !result)
         return result;
     if (const auto result = validateFrame(snoop); !result)
@@ -452,7 +450,7 @@ ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFram
         return bad(ValidationError::UnexpectedAddress);
     if (epoch(ack) != epoch(snoop))
         return bad(ValidationError::UnexpectedEpoch);
-    if (negotiated_strength == AckStrength::NONE || ackStrength(ack) != negotiated_strength)
+    if (context.negotiated_strength != AckStrength::MODEL || ackStrength(ack) != AckStrength::MODEL)
         return bad(ValidationError::UnexpectedAckStrength);
     if (!zeroScalars(ack))
         return bad(ValidationError::UnexpectedValue);
@@ -460,9 +458,14 @@ ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFram
     const bool data_snoop = opcode(snoop) == Opcode::SnpDataInv || opcode(snoop) == Opcode::SnpDataDowngrade;
     if (payloadLength(ack) != (success && data_snoop ? kLineSize : 0))
         return bad(ValidationError::InvalidPayloadLength);
-    const auto expected_state =
-        success && (opcode(snoop) == Opcode::SnpDowngrade || opcode(snoop) == Opcode::SnpDataDowngrade) ? LineState::S
-                                                                                                        : LineState::I;
+    const auto required_success_state =
+        opcode(snoop) == Opcode::SnpDowngrade || opcode(snoop) == Opcode::SnpDataDowngrade ? LineState::S
+                                                                                           : LineState::I;
+    if (static_cast<std::uint8_t>(context.failure_state) > static_cast<std::uint8_t>(LineState::M) ||
+        context.success_state != required_success_state ||
+        (opcode(snoop) == Opcode::HostFence && context.failure_state != LineState::I))
+        return bad(ValidationError::ContextRequired);
+    const auto expected_state = success ? context.success_state : context.failure_state;
     if (lineState(ack) != expected_state)
         return bad(ValidationError::UnexpectedState);
     return {ValidationError::None, Status::Ok};

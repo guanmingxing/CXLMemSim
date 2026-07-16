@@ -125,6 +125,8 @@ void testExactAbiAndValues() {
     CHECK(static_cast<std::uint16_t>(protocol::Status::HostFenced) == 9);
     CHECK(static_cast<std::uint16_t>(protocol::Status::NoCapability) == 10);
     CHECK(static_cast<std::uint16_t>(protocol::Status::IoError) == 11);
+    CHECK(protocol::kKnownCapabilities == 3);
+    CHECK(protocol::kSupportedCapabilities == 1);
 }
 
 void testGoldenFrames() {
@@ -184,7 +186,8 @@ void testGoldenFrames() {
     protocol::setSnoopId(acked_snoop, 99);
     protocol::setAddress(acked_snoop, 0x3000);
     protocol::setEpoch(acked_snoop, 7);
-    CHECK(protocol::validateSnoopAck(ack, acked_snoop, protocol::AckStrength::MODEL));
+    CHECK(protocol::validateSnoopAck(ack, acked_snoop,
+                                     {protocol::AckStrength::MODEL, protocol::LineState::I, protocol::LineState::S}));
     protocol::setPayloadLength(ack, 64);
     for (std::size_t i = 0; i < 64; ++i) {
         ack.data[i] = static_cast<std::uint8_t>(i);
@@ -193,7 +196,8 @@ void testGoldenFrames() {
     putLe(ack_golden, 20, std::uint16_t{64});
     expectEncoding(ack, ack_golden);
     protocol::setOpcode(acked_snoop, protocol::Opcode::SnpDataInv);
-    CHECK(protocol::validateSnoopAck(ack, acked_snoop, protocol::AckStrength::MODEL));
+    CHECK(protocol::validateSnoopAck(ack, acked_snoop,
+                                     {protocol::AckStrength::MODEL, protocol::LineState::I, protocol::LineState::M}));
 
     auto heartbeat = command(protocol::Opcode::Heartbeat);
     protocol::setOldValue(heartbeat, 42);
@@ -228,8 +232,8 @@ void expectResponseError(const protocol::CoherenceFrame &response, const protoco
 }
 
 void expectAckError(const protocol::CoherenceFrame &ack, const protocol::CoherenceFrame &request,
-                    protocol::AckStrength strength, protocol::ValidationError expected) {
-    const auto result = protocol::validateSnoopAck(ack, request, strength);
+                    protocol::SnoopAckContext context, protocol::ValidationError expected) {
+    const auto result = protocol::validateSnoopAck(ack, request, context);
     CHECK(!result);
     CHECK(result.error == expected);
 }
@@ -304,9 +308,32 @@ void testRegisterResponseValidation() {
 
     auto resume = request;
     protocol::setSessionId(resume, 41);
+    auto resumed = response;
+    protocol::setSessionId(resumed, 41);
+    CHECK(protocol::validateResponse(resumed, resume));
     bad = response;
     protocol::setSessionId(bad, 42);
     expectResponseError(bad, resume, protocol::ValidationError::InvalidSessionId);
+
+    for (const auto request_session : {0ULL, 41ULL}) {
+        auto failed_request = request;
+        protocol::setSessionId(failed_request, request_session);
+        auto failed = responseFor(failed_request, protocol::LineState::I, 0);
+        protocol::setStatus(failed, protocol::Status::NoCapability);
+        CHECK(protocol::validateResponse(failed, failed_request));
+    }
+
+    auto native_request = request;
+    protocol::setCapabilities(native_request, protocol::kKnownCapabilities);
+    CHECK(!protocol::validateFrame(native_request));
+    auto native_response = response;
+    protocol::setCapabilities(native_response, protocol::kKnownCapabilities);
+    protocol::setAckStrength(native_response, protocol::AckStrength::NATIVE);
+    expectResponseError(native_response, request, protocol::ValidationError::InvalidCapabilities);
+    protocol::setStatus(native_response, protocol::Status::NoCapability);
+    protocol::setAckStrength(native_response, protocol::AckStrength::NONE);
+    protocol::setSessionId(native_response, 0);
+    expectResponseError(native_response, request, protocol::ValidationError::UnexpectedState);
 }
 
 void testContextualResponses() {
@@ -361,21 +388,67 @@ void testContextualResponses() {
         expectResponseError(bad, request, protocol::ValidationError::InvalidPayloadLength);
     }
 
+    for (const auto op :
+         {protocol::Opcode::Gets, protocol::Opcode::Getm, protocol::Opcode::Upgrade, protocol::Opcode::Puts,
+          protocol::Opcode::Putm, protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas, protocol::Opcode::Fence,
+          protocol::Opcode::Heartbeat, protocol::Opcode::Unregister}) {
+        auto request = command(op);
+        auto unchanged_state = protocol::LineState::I;
+        std::uint64_t unchanged_epoch = 0;
+        if (op == protocol::Opcode::Getm) {
+            protocol::setAddress(request, 0x1000);
+            unchanged_state = protocol::LineState::S;
+            unchanged_epoch = 11;
+        } else if (op == protocol::Opcode::Upgrade) {
+            protocol::setAddress(request, 0x1000);
+            unchanged_state = protocol::LineState::E;
+            unchanged_epoch = 12;
+        } else if (op == protocol::Opcode::Puts) {
+            protocol::setAddress(request, 0x1000);
+            unchanged_state = protocol::LineState::S;
+            unchanged_epoch = 13;
+        } else if (op == protocol::Opcode::Putm) {
+            protocol::setAddress(request, 0x1000);
+            unchanged_state = protocol::LineState::M;
+            unchanged_epoch = 14;
+            fillLine(request);
+        } else if (op == protocol::Opcode::Gets) {
+            protocol::setAddress(request, 0x1000);
+        } else if (op == protocol::Opcode::AtomicFaa || op == protocol::Opcode::AtomicCas) {
+            protocol::setAddress(request, 0x1038);
+            protocol::setSize(request, 8);
+            protocol::setValue(request, 9);
+            if (op == protocol::Opcode::AtomicCas)
+                protocol::setExpected(request, 4);
+            unchanged_state = protocol::LineState::S;
+            unchanged_epoch = 15;
+        }
+        protocol::setLineState(request, unchanged_state);
+        protocol::setEpoch(request, unchanged_epoch);
+
+        for (const auto failure_status : {protocol::Status::StaleSession, protocol::Status::StaleEpoch,
+                                          protocol::Status::InvalidState, protocol::Status::CoherenceTimeout}) {
+            auto failure = responseFor(request, unchanged_state, unchanged_epoch);
+            protocol::setStatus(failure, failure_status);
+            CHECK(protocol::validateResponse(failure, request));
+            auto bad = failure;
+            protocol::setLineState(bad, unchanged_state == protocol::LineState::I ? protocol::LineState::S
+                                                                                  : protocol::LineState::I);
+            expectResponseError(bad, request, protocol::ValidationError::UnexpectedState);
+        }
+        auto stale = responseFor(request, unchanged_state, unchanged_epoch);
+        protocol::setStatus(stale, protocol::Status::StaleRequest);
+        protocol::setOldValue(stale, 17);
+        CHECK(protocol::validateResponse(stale, request));
+        auto bad = stale;
+        protocol::setOldValue(bad, 0);
+        expectResponseError(bad, request, protocol::ValidationError::UnexpectedOldValue);
+    }
+
     auto request = command(protocol::Opcode::Gets);
     protocol::setAddress(request, 0x1000);
-    auto failure = responseFor(request, protocol::LineState::I, 0);
-    protocol::setStatus(failure, protocol::Status::CoherenceTimeout);
-    CHECK(protocol::validateResponse(failure, request));
-    auto bad = failure;
-    protocol::setEpoch(bad, 3);
-    expectResponseError(bad, request, protocol::ValidationError::UnexpectedEpoch);
-    bad = failure;
-    protocol::setOldValue(bad, 2);
-    expectResponseError(bad, request, protocol::ValidationError::UnexpectedOldValue);
-    protocol::setStatus(bad, protocol::Status::StaleRequest);
-    CHECK(protocol::validateResponse(bad, request));
 
-    bad = responseFor(request, protocol::LineState::E, 3);
+    auto bad = responseFor(request, protocol::LineState::E, 3);
     fillLine(bad);
     protocol::setDstHost(bad, 4);
     expectResponseError(bad, request, protocol::ValidationError::InvalidDestinationHost);
@@ -396,29 +469,75 @@ void testContextualSnoopAcks() {
         auto ack = ackFor(request, post_state);
         if (op == protocol::Opcode::SnpDataInv || op == protocol::Opcode::SnpDataDowngrade)
             fillLine(ack);
-        CHECK(protocol::validateSnoopAck(ack, request, protocol::AckStrength::MODEL));
+        const protocol::SnoopAckContext context{protocol::AckStrength::MODEL, post_state, protocol::LineState::M};
+        CHECK(protocol::validateSnoopAck(ack, request, context));
         CHECK(!protocol::validateFrame(ack));
         auto bad = ack;
         protocol::setLineState(bad, protocol::LineState::M);
-        expectAckError(bad, request, protocol::AckStrength::MODEL, protocol::ValidationError::UnexpectedState);
+        expectAckError(bad, request, context, protocol::ValidationError::UnexpectedState);
         bad = ack;
         protocol::setEpoch(bad, 10);
-        expectAckError(bad, request, protocol::AckStrength::MODEL, protocol::ValidationError::UnexpectedEpoch);
+        expectAckError(bad, request, context, protocol::ValidationError::UnexpectedEpoch);
+
+        for (const auto failure_status :
+             {protocol::Status::StaleSession, protocol::Status::StaleEpoch, protocol::Status::InvalidState}) {
+            auto failed = ackFor(request, protocol::LineState::M);
+            protocol::setStatus(failed, failure_status);
+            CHECK(protocol::validateSnoopAck(failed, request, context));
+        }
     }
 
     auto request = snoop(protocol::Opcode::SnpDataInv);
-    auto failed = ackFor(request, protocol::LineState::I);
+    const protocol::SnoopAckContext context{protocol::AckStrength::MODEL, protocol::LineState::I,
+                                            protocol::LineState::M};
+    auto failed = ackFor(request, protocol::LineState::M);
     protocol::setStatus(failed, protocol::Status::StaleEpoch);
-    CHECK(protocol::validateSnoopAck(failed, request, protocol::AckStrength::MODEL));
+    CHECK(protocol::validateSnoopAck(failed, request, context));
     auto bad = failed;
     fillLine(bad);
-    expectAckError(bad, request, protocol::AckStrength::MODEL, protocol::ValidationError::InvalidPayloadLength);
+    expectAckError(bad, request, context, protocol::ValidationError::InvalidPayloadLength);
     bad = failed;
     protocol::setAckStrength(bad, protocol::AckStrength::NONE);
-    expectAckError(bad, request, protocol::AckStrength::MODEL, protocol::ValidationError::UnexpectedAckStrength);
+    expectAckError(bad, request, context, protocol::ValidationError::UnexpectedAckStrength);
+    bad = failed;
+    protocol::setAckStrength(bad, protocol::AckStrength::NATIVE);
+    expectAckError(bad, request, {protocol::AckStrength::NATIVE, protocol::LineState::I, protocol::LineState::M},
+                   protocol::ValidationError::UnexpectedAckStrength);
+    bad = failed;
+    protocol::setSnoopId(bad, protocol::snoopId(request) + 1);
+    expectAckError(bad, request, context, protocol::ValidationError::InvalidSnoopId);
+    bad = failed;
+    protocol::setSessionId(bad, protocol::sessionId(request) + 1);
+    expectAckError(bad, request, context, protocol::ValidationError::InvalidSessionId);
+    bad = failed;
+    protocol::setAddress(bad, protocol::address(request) + protocol::kLineSize);
+    expectAckError(bad, request, context, protocol::ValidationError::UnexpectedAddress);
+    bad = failed;
+    protocol::setOldValue(bad, 1);
+    expectAckError(bad, request, context, protocol::ValidationError::UnexpectedValue);
     auto malformed_snoop = request;
     protocol::setLineState(malformed_snoop, protocol::LineState::S);
-    expectAckError(failed, malformed_snoop, protocol::AckStrength::MODEL, protocol::ValidationError::ContextRequired);
+    expectAckError(failed, malformed_snoop, context, protocol::ValidationError::ContextRequired);
+
+    auto host_fence = snoop(protocol::Opcode::HostFence);
+    protocol::setAddress(host_fence, 0);
+    protocol::setEpoch(host_fence, 0);
+    const protocol::SnoopAckContext fence_context{protocol::AckStrength::MODEL, protocol::LineState::I,
+                                                  protocol::LineState::I};
+    auto fence_ack = ackFor(host_fence, protocol::LineState::I);
+    CHECK(protocol::validateSnoopAck(fence_ack, host_fence, fence_context));
+    protocol::setStatus(fence_ack, protocol::Status::HostFenced);
+    CHECK(protocol::validateSnoopAck(fence_ack, host_fence, fence_context));
+
+    expectAckError(failed, request, {protocol::AckStrength::NONE, protocol::LineState::I, protocol::LineState::M},
+                   protocol::ValidationError::UnexpectedAckStrength);
+    expectAckError(failed, request, {protocol::AckStrength::MODEL, protocol::LineState::S, protocol::LineState::M},
+                   protocol::ValidationError::ContextRequired);
+    auto successful = ackFor(request, protocol::LineState::I);
+    fillLine(successful);
+    expectAckError(successful, request,
+                   {protocol::AckStrength::MODEL, protocol::LineState::I, static_cast<protocol::LineState>(4)},
+                   protocol::ValidationError::ContextRequired);
 }
 
 void testRequestStateEpochMatrixAndUnusedFields() {
