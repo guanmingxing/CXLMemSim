@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -19,7 +20,15 @@ using SessionId = std::uint64_t;
 using ResponseSender = std::function<bool(const protocol_v2::CoherenceFrame &)>;
 
 enum class SessionState { Active, OfflineRetained, Fenced, Closed };
-enum class PinResponseResult { Pinned, Duplicate, Backpressure, StaleRequest, SessionUnavailable, InvalidResponse };
+enum class PinResponseResult {
+    Pinned,
+    Duplicate,
+    Conflict,
+    Backpressure,
+    StaleRequest,
+    SessionUnavailable,
+    InvalidResponse
+};
 
 struct RegistrationRequest {
     std::uint16_t host_id;
@@ -55,6 +64,7 @@ struct SessionSnapshot {
     std::size_t pinned_response_count;
     std::size_t pinned_response_limit;
     bool response_backpressured;
+    bool closed_final_response_pinned;
 };
 
 class EndpointSessionRegistry {
@@ -84,15 +94,22 @@ public:
 
 private:
     struct Session {
-        SessionId id;
-        std::uint16_t host_id;
-        SessionState state;
-        std::uint64_t capabilities;
-        std::uint32_t cache_capacity;
-        std::uint16_t cache_ways;
+        Session(SessionId session_id, std::uint16_t host, std::uint64_t negotiated_capabilities, std::uint32_t capacity,
+                std::uint16_t ways, std::string transport, ResponseSender response_sender);
+
+        SessionId id{};
+        std::uint16_t host_id{};
+        SessionState state{SessionState::Active};
+        std::uint64_t capabilities{};
+        std::uint32_t cache_capacity{};
+        std::uint16_t cache_ways{};
         std::string transport_name;
         ResponseSender sender;
         std::uint64_t response_watermark{};
+        std::uint64_t highest_pinned_request_id{};
+        bool closed_final_response_pinned{};
+        // Acquire without mutex_; sender callbacks run while this gate is held but never while mutex_ is held.
+        std::mutex delivery_mutex;
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> pinned_responses;
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
@@ -101,12 +118,13 @@ private:
     bool validHolderSession(const Session &session) const noexcept;
     static bool aligned(std::uint64_t line_address) noexcept;
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
+    bool validRegistration(const RegistrationRequest &request) const noexcept;
 
     const std::uint16_t max_hosts_;
     const std::size_t max_pinned_responses_per_session_;
     mutable std::mutex mutex_;
     SessionId next_session_id_{1};
-    std::unordered_map<SessionId, Session> sessions_;
+    std::unordered_map<SessionId, std::shared_ptr<Session>> sessions_;
     std::unordered_map<std::uint16_t, SessionId> host_sessions_;
 };
 
