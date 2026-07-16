@@ -53,6 +53,7 @@ set(SOURCE_FILES
     src/dcd_gfam.cpp
     src/hdm_decoder.cpp
     src/coherency_engine.cpp
+    src/coherence_protocol_v2.cpp
     src/policy.cpp
     src/helper.cpp
     src/monitor.cpp
@@ -166,6 +167,11 @@ add_executable(test_pgas_controller_counters tests/test_pgas_controller_counters
 target_include_directories(test_pgas_controller_counters PRIVATE include src ${spdlog_INCLUDE_DIR})
 target_link_libraries(test_pgas_controller_counters cxlmemsim spdlog::spdlog_header_only ${RT_LIB} ${ATOMIC_LIB})
 add_test(NAME test_pgas_controller_counters COMMAND test_pgas_controller_counters)
+
+add_executable(test_coherence_protocol_v2 tests/test_coherence_protocol_v2.cpp)
+target_include_directories(test_coherence_protocol_v2 PRIVATE include)
+target_link_libraries(test_coherence_protocol_v2 cxlmemsim)
+add_test(NAME test_coherence_protocol_v2 COMMAND test_coherence_protocol_v2)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
