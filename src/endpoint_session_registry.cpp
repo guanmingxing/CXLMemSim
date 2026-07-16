@@ -9,8 +9,9 @@ namespace {
 constexpr std::uint64_t kModelSnoop = static_cast<std::uint64_t>(protocol_v2::Capability::MODEL_SNOOP);
 }
 
-EndpointSessionRegistry::EndpointSessionRegistry(std::uint16_t max_hosts)
-    : max_hosts_(max_hosts <= protocol_v2::kMaximumHosts ? max_hosts : protocol_v2::kMaximumHosts) {}
+EndpointSessionRegistry::EndpointSessionRegistry(std::uint16_t max_hosts, std::size_t max_pinned_responses_per_session)
+    : max_hosts_(max_hosts <= protocol_v2::kMaximumHosts ? max_hosts : protocol_v2::kMaximumHosts),
+      max_pinned_responses_per_session_(max_pinned_responses_per_session == 0 ? 1 : max_pinned_responses_per_session) {}
 
 RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationRequest &request) {
     std::vector<protocol_v2::CoherenceFrame> replay;
@@ -109,27 +110,37 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
     session.state = SessionState::Closed;
     session.clean_holders.clear();
     session.modified_holders.clear();
-    session.pinned_responses.clear();
-    session.sender = {};
-    session.transport_name.clear();
     return protocol_v2::Status::Ok;
 }
 
-bool EndpointSessionRegistry::pinResponse(SessionId session_id, std::uint64_t request_id,
-                                          const protocol_v2::CoherenceFrame &response) {
+PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, std::uint64_t request_id,
+                                                       const protocol_v2::CoherenceFrame &response) {
     std::lock_guard lock(mutex_);
     const auto position = sessions_.find(session_id);
-    if (position == sessions_.end() || position->second.state == SessionState::Closed || request_id == 0 ||
-        protocol_v2::requestId(response) != request_id || request_id <= position->second.response_watermark) {
-        return false;
+    if (position == sessions_.end()) {
+        return PinResponseResult::SessionUnavailable;
     }
-    return position->second.pinned_responses.emplace(request_id, response).second;
+    auto &session = position->second;
+    if (request_id == 0 || protocol_v2::requestId(response) != request_id) {
+        return PinResponseResult::InvalidResponse;
+    }
+    if (request_id <= session.response_watermark) {
+        return PinResponseResult::StaleRequest;
+    }
+    if (session.pinned_responses.contains(request_id)) {
+        return PinResponseResult::Duplicate;
+    }
+    if (session.pinned_responses.size() >= max_pinned_responses_per_session_) {
+        return PinResponseResult::Backpressure;
+    }
+    session.pinned_responses.emplace(request_id, response);
+    return PinResponseResult::Pinned;
 }
 
 bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::uint64_t highest_contiguous_consumed) {
     std::lock_guard lock(mutex_);
     const auto position = sessions_.find(session_id);
-    if (position == sessions_.end() || position->second.state == SessionState::Closed) {
+    if (position == sessions_.end()) {
         return false;
     }
     auto &session = position->second;
@@ -234,7 +245,10 @@ std::optional<SessionSnapshot> EndpointSessionRegistry::inspect(SessionId sessio
                            session.response_watermark,
                            session.response_watermark == std::numeric_limits<std::uint64_t>::max()
                                ? session.response_watermark
-                               : session.response_watermark + 1};
+                               : session.response_watermark + 1,
+                           session.pinned_responses.size(),
+                           max_pinned_responses_per_session_,
+                           session.pinned_responses.size() >= max_pinned_responses_per_session_};
 }
 
 bool EndpointSessionRegistry::validHolderSession(const Session &session) const noexcept {

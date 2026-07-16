@@ -75,8 +75,8 @@ void testDisconnectResumeAndReplay() {
     const auto original = registry.registerEndpoint(request(7));
     CHECK(registry.addCleanHolder(original.session_id, 0x1000));
     CHECK(registry.addModifiedHolder(original.session_id, 0x2000));
-    CHECK(registry.pinResponse(original.session_id, 9, response(9)));
-    CHECK(registry.pinResponse(original.session_id, 3, response(3)));
+    CHECK(registry.pinResponse(original.session_id, 9, response(9)) == PinResponseResult::Pinned);
+    CHECK(registry.pinResponse(original.session_id, 3, response(3)) == PinResponseResult::Pinned);
     CHECK(registry.disconnectAbruptly(7, original.session_id));
     CHECK(registry.inspect(original.session_id)->state == SessionState::OfflineRetained);
     CHECK(registry.cleanHolders(original.session_id) == std::vector<std::uint64_t>{0x1000});
@@ -90,6 +90,14 @@ void testDisconnectResumeAndReplay() {
     mismatch.requested_session_id = original.session_id;
     mismatch.cache_ways = 8;
     CHECK(registry.registerEndpoint(mismatch).status == Status::StaleSession);
+    auto capability_mismatch = request(7);
+    capability_mismatch.requested_session_id = original.session_id;
+    capability_mismatch.capabilities |= 1ULL << 10;
+    CHECK(registry.registerEndpoint(capability_mismatch).status == Status::StaleSession);
+    auto capacity_mismatch = request(7);
+    capacity_mismatch.requested_session_id = original.session_id;
+    capacity_mismatch.cache_capacity *= 2;
+    CHECK(registry.registerEndpoint(capacity_mismatch).status == Status::StaleSession);
     auto wrong_host = request(8);
     wrong_host.requested_session_id = original.session_id;
     CHECK(registry.registerEndpoint(wrong_host).status == Status::StaleSession);
@@ -116,7 +124,7 @@ void testDisconnectResumeAndReplay() {
 void testReplayDoesNotBlockRegistry() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(1));
-    CHECK(registry.pinResponse(registered.session_id, 1, response(1)));
+    CHECK(registry.pinResponse(registered.session_id, 1, response(1)) == PinResponseResult::Pinned);
     CHECK(registry.disconnectAbruptly(1, registered.session_id));
 
     std::promise<void> callback_entered;
@@ -141,7 +149,7 @@ void testHeartbeatWatermark() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(2));
     for (const auto id : {1ULL, 2ULL, 4ULL}) {
-        CHECK(registry.pinResponse(registered.session_id, id, response(id)));
+        CHECK(registry.pinResponse(registered.session_id, id, response(id)) == PinResponseResult::Pinned);
     }
     CHECK(registry.acknowledgeResponses(registered.session_id, 2));
     CHECK(registry.responseWatermark(registered.session_id) == 2);
@@ -159,7 +167,7 @@ void testHeartbeatWatermark() {
 
 void testHolderIndexesAndGracefulClose() {
     EndpointSessionRegistry registry;
-    const auto registered = registry.registerEndpoint(request(6));
+    const auto registered = registry.registerEndpoint(request(6, "tcp", [](const CoherenceFrame &) { return true; }));
     CHECK(!registry.addCleanHolder(registered.session_id, 0x1001));
     CHECK(registry.addCleanHolder(registered.session_id, 0x1000));
     CHECK(!registry.addModifiedHolder(registered.session_id, 0x1000));
@@ -167,7 +175,7 @@ void testHolderIndexesAndGracefulClose() {
     CHECK(registry.addModifiedHolder(registered.session_id, 0x1000));
     CHECK(!registry.addCleanHolder(registered.session_id, 0x1000));
     CHECK(registry.addCleanHolder(registered.session_id, 0x2000));
-    CHECK(registry.pinResponse(registered.session_id, 1, response(1)));
+    CHECK(registry.pinResponse(registered.session_id, 1, response(1)) == PinResponseResult::Pinned);
     CHECK(registry.gracefulClose(6, registered.session_id) == Status::InvalidState);
     CHECK(registry.removeModifiedHolder(registered.session_id, 0x1000));
     CHECK(registry.gracefulClose(7, registered.session_id) == Status::StaleSession);
@@ -175,9 +183,60 @@ void testHolderIndexesAndGracefulClose() {
     CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
     CHECK(registry.cleanHolders(registered.session_id).empty());
     CHECK(registry.modifiedHolders(registered.session_id).empty());
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+    CHECK(registry.inspect(registered.session_id)->has_sender);
+    CHECK(registry.pinResponse(registered.session_id, 2, response(2)) == PinResponseResult::Pinned);
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{2});
+    CHECK(registry.acknowledgeResponses(registered.session_id, 2));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
+    auto closed_resume = request(6);
+    closed_resume.requested_session_id = registered.session_id;
+    CHECK(registry.registerEndpoint(closed_resume).status == Status::StaleSession);
     CHECK(registry.gracefulClose(6, registered.session_id) == Status::InvalidState);
     CHECK(!registry.disconnectAbruptly(6, registered.session_id));
+}
+
+void testPinnedResponseBoundAndRecovery() {
+    EndpointSessionRegistry registry(64, 2);
+    const auto registered = registry.registerEndpoint(request(11));
+    CHECK(registry.pinResponse(registered.session_id, 1, response(1)) == PinResponseResult::Pinned);
+    CHECK(registry.pinResponse(registered.session_id, 2, response(2)) == PinResponseResult::Pinned);
+    const auto full = registry.inspect(registered.session_id);
+    CHECK(full->pinned_response_count == 2);
+    CHECK(full->pinned_response_limit == 2);
+    CHECK(full->response_backpressured);
+    CHECK(registry.pinResponse(registered.session_id, 2, response(2)) == PinResponseResult::Duplicate);
+    CHECK(registry.pinResponse(registered.session_id, 3, response(3)) == PinResponseResult::Backpressure);
+    CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{1, 2}));
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(!registry.inspect(registered.session_id)->response_backpressured);
+    CHECK(registry.pinResponse(registered.session_id, 3, response(3)) == PinResponseResult::Pinned);
+    CHECK(registry.pinResponse(registered.session_id, 1, response(1)) == PinResponseResult::StaleRequest);
+    CHECK(registry.pinResponse(registered.session_id, 4, response(5)) == PinResponseResult::InvalidResponse);
+    CHECK(registry.pinResponse(registered.session_id + 1, 4, response(4)) == PinResponseResult::SessionUnavailable);
+    CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{2, 3}));
+
+    CHECK(registry.disconnectAbruptly(11, registered.session_id));
+    CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{2, 3}));
+
+    EndpointSessionRegistry zero_limit(64, 0);
+    const auto zero_registered = zero_limit.registerEndpoint(request(12));
+    CHECK(zero_limit.inspect(zero_registered.session_id)->pinned_response_limit == 1);
+    CHECK(zero_limit.pinResponse(zero_registered.session_id, 1, response(1)) == PinResponseResult::Pinned);
+    CHECK(zero_limit.pinResponse(zero_registered.session_id, 2, response(2)) == PinResponseResult::Backpressure);
+}
+
+void testDefaultHostBoundaryAndClamp() {
+    EndpointSessionRegistry registry;
+    for (std::uint16_t host = 0; host < 64; ++host) {
+        CHECK(registry.registerEndpoint(request(host)).status == Status::Ok);
+    }
+    CHECK(registry.registerEndpoint(request(64)).status == Status::InvalidState);
+
+    EndpointSessionRegistry clamped(100);
+    CHECK(clamped.registerEndpoint(request(63)).status == Status::Ok);
+    CHECK(clamped.registerEndpoint(request(64)).status == Status::InvalidState);
 }
 
 } // namespace
@@ -188,6 +247,8 @@ int main() {
     testReplayDoesNotBlockRegistry();
     testHeartbeatWatermark();
     testHolderIndexesAndGracefulClose();
+    testPinnedResponseBoundAndRecovery();
+    testDefaultHostBoundaryAndClamp();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
         return EXIT_FAILURE;

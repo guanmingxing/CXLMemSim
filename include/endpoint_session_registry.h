@@ -2,6 +2,7 @@
 
 #include "coherence_protocol_v2.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -18,6 +19,7 @@ using SessionId = std::uint64_t;
 using ResponseSender = std::function<bool(const protocol_v2::CoherenceFrame &)>;
 
 enum class SessionState { Active, OfflineRetained, Fenced, Closed };
+enum class PinResponseResult { Pinned, Duplicate, Backpressure, StaleRequest, SessionUnavailable, InvalidResponse };
 
 struct RegistrationRequest {
     std::uint16_t host_id;
@@ -50,17 +52,22 @@ struct SessionSnapshot {
     bool has_sender;
     std::uint64_t response_watermark;
     std::uint64_t replay_floor;
+    std::size_t pinned_response_count;
+    std::size_t pinned_response_limit;
+    bool response_backpressured;
 };
 
 class EndpointSessionRegistry {
 public:
-    explicit EndpointSessionRegistry(std::uint16_t max_hosts = protocol_v2::kMaximumHosts);
+    explicit EndpointSessionRegistry(std::uint16_t max_hosts = protocol_v2::kMaximumHosts,
+                                     std::size_t max_pinned_responses_per_session = 1024);
 
     RegistrationResult registerEndpoint(const RegistrationRequest &request);
     bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id);
     protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id);
 
-    bool pinResponse(SessionId session_id, std::uint64_t request_id, const protocol_v2::CoherenceFrame &response);
+    PinResponseResult pinResponse(SessionId session_id, std::uint64_t request_id,
+                                  const protocol_v2::CoherenceFrame &response);
     bool acknowledgeResponses(SessionId session_id, std::uint64_t highest_contiguous_consumed);
     std::uint64_t responseWatermark(SessionId session_id) const;
     std::uint64_t replayFloor(SessionId session_id) const;
@@ -96,6 +103,7 @@ private:
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
 
     const std::uint16_t max_hosts_;
+    const std::size_t max_pinned_responses_per_session_;
     mutable std::mutex mutex_;
     SessionId next_session_id_{1};
     std::unordered_map<SessionId, Session> sessions_;
