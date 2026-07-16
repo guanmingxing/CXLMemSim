@@ -8,6 +8,14 @@ namespace cxlmemsim {
 namespace {
 constexpr std::uint64_t kModelSnoop = static_cast<std::uint64_t>(protocol_v2::Capability::MODEL_SNOOP);
 
+struct DeliveryContext {
+    const EndpointSessionRegistry *registry{};
+    SessionId session_id{};
+    std::uint64_t generation{};
+};
+
+thread_local DeliveryContext current_delivery;
+
 bool sameFrame(const protocol_v2::CoherenceFrame &left, const protocol_v2::CoherenceFrame &right) noexcept {
     return protocol_v2::encodeFrame(left) == protocol_v2::encodeFrame(right);
 }
@@ -25,7 +33,6 @@ EndpointSessionRegistry::EndpointSessionRegistry(std::uint16_t max_hosts, std::s
 
 RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationRequest &request) {
     std::vector<protocol_v2::CoherenceFrame> replay;
-    ResponseSender sender;
     RegistrationResult result;
     std::shared_ptr<Session> resumed_session;
     {
@@ -81,7 +88,6 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         resumed_session = position->second;
     }
 
-    std::lock_guard delivery_lock(resumed_session->delivery_mutex);
     {
         std::lock_guard lock(mutex_);
         const auto position = sessions_.find(request.requested_session_id);
@@ -100,61 +106,85 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         session.state = SessionState::Active;
         session.transport_name = request.transport_name;
         session.sender = request.sender;
-        sender = session.sender;
+        ++session.binding_generation;
         for (const auto &[request_id, frame] : session.pinned_responses) {
             (void)request_id;
             replay.push_back(frame);
         }
         result = resultFor(session, protocol_v2::Status::Ok);
     }
-    if (sender) {
-        for (const auto &frame : replay)
-            (void)sender(frame);
+    for (const auto &frame : replay) {
+        ResponseSender sender;
+        std::uint64_t generation{};
+        {
+            std::lock_guard lock(mutex_);
+            if (resumed_session->state != SessionState::Active || !resumed_session->sender)
+                break;
+            generation = resumed_session->binding_generation;
+            sender = resumed_session->sender;
+            ++resumed_session->in_flight_deliveries[generation];
+        }
+
+        const auto previous_delivery = current_delivery;
+        current_delivery = {this, resumed_session->id, generation};
+        const bool delivered = sender(frame);
+        current_delivery = previous_delivery;
+
+        {
+            std::lock_guard lock(mutex_);
+            auto &count = resumed_session->in_flight_deliveries.at(generation);
+            if (--count == 0) {
+                resumed_session->in_flight_deliveries.erase(generation);
+                delivery_finished_.notify_all();
+            }
+        }
+        if (!delivered)
+            break;
     }
     return result;
 }
 
 bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionId session_id) {
-    std::shared_ptr<Session> session;
-    {
-        std::lock_guard lock(mutex_);
-        const auto position = sessions_.find(session_id);
-        if (position == sessions_.end() || position->second->host_id != host_id)
-            return false;
-        session = position->second;
-    }
-    std::lock_guard delivery_lock(session->delivery_mutex);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    const auto position = sessions_.find(session_id);
+    if (position == sessions_.end() || position->second->host_id != host_id)
+        return false;
+    const auto &session = position->second;
     if (session->state != SessionState::Active)
         return false;
+    const auto retired_generation = session->binding_generation;
     session->state = SessionState::OfflineRetained;
     session->sender = {};
     session->transport_name.clear();
+    ++session->binding_generation;
+    if (current_delivery.registry != this || current_delivery.session_id != session_id ||
+        current_delivery.generation != retired_generation) {
+        delivery_finished_.wait(lock, [&] { return !session->in_flight_deliveries.contains(retired_generation); });
+    }
     return true;
 }
 
 protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id, SessionId session_id) {
-    std::shared_ptr<Session> session_ptr;
-    {
-        std::lock_guard lock(mutex_);
-        const auto position = sessions_.find(session_id);
-        if (position == sessions_.end() || position->second->host_id != host_id)
-            return protocol_v2::Status::StaleSession;
-        session_ptr = position->second;
-    }
-    std::lock_guard delivery_lock(session_ptr->delivery_mutex);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    const auto position = sessions_.find(session_id);
+    if (position == sessions_.end() || position->second->host_id != host_id)
+        return protocol_v2::Status::StaleSession;
+    const auto &session_ptr = position->second;
     auto &session = *session_ptr;
-    if (session.state != SessionState::Active || !session.modified_holders.empty()) {
+    if (session.state != SessionState::Active || !session.clean_holders.empty() || !session.modified_holders.empty()) {
         return protocol_v2::Status::InvalidState;
     }
+    const auto retired_generation = session.binding_generation;
     session.state = SessionState::Closed;
-    session.clean_holders.clear();
-    session.modified_holders.clear();
+    ++session.binding_generation;
+    if (current_delivery.registry != this || current_delivery.session_id != session_id ||
+        current_delivery.generation != retired_generation) {
+        delivery_finished_.wait(lock, [&] { return !session.in_flight_deliveries.contains(retired_generation); });
+    }
     return protocol_v2::Status::Ok;
 }
 
-PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, std::uint64_t request_id,
+PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                                        const protocol_v2::CoherenceFrame &response) {
     std::lock_guard lock(mutex_);
     const auto position = sessions_.find(session_id);
@@ -163,15 +193,15 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, std
     }
     auto &session = position->second;
     auto &value = *session;
-    const auto envelope = protocol_v2::validateFrame(response);
+    const auto request_id = protocol_v2::requestId(request);
     if (request_id == 0 || request_id == std::numeric_limits<std::uint64_t>::max() ||
-        envelope.error != protocol_v2::ValidationError::ContextRequired ||
-        protocol_v2::opcode(response) != protocol_v2::Opcode::Response ||
-        protocol_v2::requestId(response) != request_id || protocol_v2::sessionId(response) != session_id ||
-        protocol_v2::srcHost(response) != protocol_v2::kServerHost || protocol_v2::dstHost(response) != value.host_id ||
-        protocol_v2::snoopId(response) != 0) {
+        !protocol_v2::validateFrame(request) || !protocol_v2::validateResponse(response, request) ||
+        protocol_v2::sessionId(request) != session_id || protocol_v2::srcHost(request) != value.host_id ||
+        protocol_v2::dstHost(request) != protocol_v2::kServerHost) {
         return PinResponseResult::InvalidResponse;
     }
+    if (value.state == SessionState::Closed && protocol_v2::opcode(request) != protocol_v2::Opcode::Unregister)
+        return PinResponseResult::InvalidResponse;
     if (request_id <= value.response_watermark) {
         return PinResponseResult::StaleRequest;
     }
@@ -184,7 +214,6 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, std
         return PinResponseResult::Backpressure;
     }
     value.pinned_responses.emplace(request_id, response);
-    value.highest_pinned_request_id = std::max(value.highest_pinned_request_id, request_id);
     if (value.state == SessionState::Closed)
         value.closed_final_response_pinned = true;
     return PinResponseResult::Pinned;
@@ -200,8 +229,16 @@ bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::ui
     if (highest_contiguous_consumed <= session.response_watermark) {
         return true;
     }
-    if (highest_contiguous_consumed > session.highest_pinned_request_id)
+    if (highest_contiguous_consumed == std::numeric_limits<std::uint64_t>::max())
         return false;
+    auto expected = session.response_watermark + 1;
+    auto pinned = session.pinned_responses.lower_bound(expected);
+    while (expected <= highest_contiguous_consumed) {
+        if (pinned == session.pinned_responses.end() || pinned->first != expected)
+            return false;
+        ++pinned;
+        ++expected;
+    }
     session.response_watermark = highest_contiguous_consumed;
     session.pinned_responses.erase(session.pinned_responses.begin(),
                                    session.pinned_responses.upper_bound(highest_contiguous_consumed));

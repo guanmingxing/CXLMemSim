@@ -2,6 +2,7 @@
 
 #include "coherence_protocol_v2.h"
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -76,7 +77,7 @@ public:
     bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id);
     protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id);
 
-    PinResponseResult pinResponse(SessionId session_id, std::uint64_t request_id,
+    PinResponseResult pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                   const protocol_v2::CoherenceFrame &response);
     bool acknowledgeResponses(SessionId session_id, std::uint64_t highest_contiguous_consumed);
     std::uint64_t responseWatermark(SessionId session_id) const;
@@ -106,10 +107,9 @@ private:
         std::string transport_name;
         ResponseSender sender;
         std::uint64_t response_watermark{};
-        std::uint64_t highest_pinned_request_id{};
         bool closed_final_response_pinned{};
-        // Acquire without mutex_; sender callbacks run while this gate is held but never while mutex_ is held.
-        std::mutex delivery_mutex;
+        std::uint64_t binding_generation{};
+        std::unordered_map<std::uint64_t, std::size_t> in_flight_deliveries;
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> pinned_responses;
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
@@ -123,6 +123,7 @@ private:
     const std::uint16_t max_hosts_;
     const std::size_t max_pinned_responses_per_session_;
     mutable std::mutex mutex_;
+    std::condition_variable delivery_finished_;
     SessionId next_session_id_{1};
     std::unordered_map<SessionId, std::shared_ptr<Session>> sessions_;
     std::unordered_map<std::uint16_t, SessionId> host_sessions_;
