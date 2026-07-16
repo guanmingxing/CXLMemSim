@@ -16,6 +16,17 @@ struct DeliveryContext {
 
 thread_local DeliveryContext current_delivery;
 
+template <typename Cleanup> class ScopeCleanup {
+public:
+    explicit ScopeCleanup(Cleanup cleanup) : cleanup_(std::move(cleanup)) {}
+    ScopeCleanup(const ScopeCleanup &) = delete;
+    ScopeCleanup &operator=(const ScopeCleanup &) = delete;
+    ~ScopeCleanup() noexcept { cleanup_(); }
+
+private:
+    Cleanup cleanup_;
+};
+
 bool sameFrame(const protocol_v2::CoherenceFrame &left, const protocol_v2::CoherenceFrame &right) noexcept {
     return protocol_v2::encodeFrame(left) == protocol_v2::encodeFrame(right);
 }
@@ -107,9 +118,9 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         session.transport_name = request.transport_name;
         session.sender = request.sender;
         ++session.binding_generation;
-        for (const auto &[request_id, frame] : session.pinned_responses) {
+        for (const auto &[request_id, pinned] : session.pinned_responses) {
             (void)request_id;
-            replay.push_back(frame);
+            replay.push_back(pinned.response);
         }
         result = resultFor(session, protocol_v2::Status::Ok);
     }
@@ -127,17 +138,16 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
 
         const auto previous_delivery = current_delivery;
         current_delivery = {this, resumed_session->id, generation};
-        const bool delivered = sender(frame);
-        current_delivery = previous_delivery;
-
-        {
+        const ScopeCleanup cleanup([&, previous_delivery, generation] {
+            current_delivery = previous_delivery;
             std::lock_guard lock(mutex_);
             auto &count = resumed_session->in_flight_deliveries.at(generation);
             if (--count == 0) {
                 resumed_session->in_flight_deliveries.erase(generation);
                 delivery_finished_.notify_all();
             }
-        }
+        });
+        const bool delivered = sender(frame);
         if (!delivered)
             break;
     }
@@ -206,14 +216,16 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
         return PinResponseResult::StaleRequest;
     }
     if (const auto existing = value.pinned_responses.find(request_id); existing != value.pinned_responses.end()) {
-        return sameFrame(existing->second, response) ? PinResponseResult::Duplicate : PinResponseResult::Conflict;
+        return sameFrame(existing->second.request, request) && sameFrame(existing->second.response, response)
+                   ? PinResponseResult::Duplicate
+                   : PinResponseResult::Conflict;
     }
     if (value.state == SessionState::Closed && value.closed_final_response_pinned)
         return PinResponseResult::SessionUnavailable;
     if (value.pinned_responses.size() >= max_pinned_responses_per_session_) {
         return PinResponseResult::Backpressure;
     }
-    value.pinned_responses.emplace(request_id, response);
+    value.pinned_responses.emplace(request_id, PinnedResponse{request, response});
     if (value.state == SessionState::Closed)
         value.closed_final_response_pinned = true;
     return PinResponseResult::Pinned;

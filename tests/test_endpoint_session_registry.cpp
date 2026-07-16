@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -247,6 +248,58 @@ void testCallbackCanDisconnectItsOwnBinding() {
     CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
 }
 
+void testThrowingReplayReleasesItsBinding() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(4));
+    CHECK(pinHeartbeat(registry, registered.session_id, 1, 4) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(4, registered.session_id));
+
+    auto resume = request(4, "tcp-throwing",
+                          [](const CoherenceFrame &) -> bool { throw std::runtime_error("replay delivery failed"); });
+    resume.requested_session_id = registered.session_id;
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(resume);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+
+    auto disconnect =
+        std::async(std::launch::async, [&] { return registry.disconnectAbruptly(4, registered.session_id); });
+    CHECK(disconnect.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    CHECK(disconnect.get());
+}
+
+void testNestedThrowingReplayRestoresOuterDeliveryContext() {
+    EndpointSessionRegistry registry;
+    const auto outer = registry.registerEndpoint(request(5));
+    const auto inner = registry.registerEndpoint(request(6));
+    CHECK(pinHeartbeat(registry, outer.session_id, 1, 5) == PinResponseResult::Pinned);
+    CHECK(pinHeartbeat(registry, inner.session_id, 1, 6) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(5, outer.session_id));
+    CHECK(registry.disconnectAbruptly(6, inner.session_id));
+
+    auto inner_resume = request(6, "tcp-inner", [](const CoherenceFrame &) -> bool {
+        throw std::runtime_error("nested replay delivery failed");
+    });
+    inner_resume.requested_session_id = inner.session_id;
+    auto outer_resume = request(5, "tcp-outer", [&](const CoherenceFrame &) {
+        try {
+            (void)registry.registerEndpoint(inner_resume);
+        } catch (const std::runtime_error &) {
+        }
+        CHECK(registry.disconnectAbruptly(5, outer.session_id));
+        return true;
+    });
+    outer_resume.requested_session_id = outer.session_id;
+
+    auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(outer_resume); });
+    CHECK(replay.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    CHECK(replay.get().status == Status::Ok);
+    CHECK(registry.inspect(outer.session_id)->state == SessionState::OfflineRetained);
+}
+
 void testHeartbeatWatermark() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(2));
@@ -281,6 +334,11 @@ void testPinResponseCorrelationAndConflict() {
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, first.session_id, 14);
     CHECK(registry.pinResponse(first.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(first.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Duplicate);
+
+    const auto same_id_different_request = protocolRequest(Opcode::Fence, 1, first.session_id, 14);
+    CHECK(validateFrame(same_id_different_request));
+    CHECK(registry.pinResponse(first.session_id, same_id_different_request, response(same_id_different_request)) ==
+          PinResponseResult::Conflict);
 
     auto conflict = response(heartbeat);
     setStatus(conflict, Status::IoError);
@@ -412,6 +470,8 @@ int main() {
     testReplayDoesNotBlockRegistry();
     testDisconnectWaitsForCurrentBindingReplay();
     testCallbackCanDisconnectItsOwnBinding();
+    testThrowingReplayReleasesItsBinding();
+    testNestedThrowingReplayRestoresOuterDeliveryContext();
     testHeartbeatWatermark();
     testPinResponseCorrelationAndConflict();
     testHolderIndexesAndGracefulClose();

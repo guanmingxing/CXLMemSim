@@ -94,6 +94,11 @@ public:
     std::optional<SessionSnapshot> inspect(SessionId session_id) const;
 
 private:
+    struct PinnedResponse {
+        protocol_v2::CoherenceFrame request;
+        protocol_v2::CoherenceFrame response;
+    };
+
     struct Session {
         Session(SessionId session_id, std::uint16_t host, std::uint64_t negotiated_capabilities, std::uint32_t capacity,
                 std::uint16_t ways, std::string transport, ResponseSender response_sender);
@@ -110,7 +115,7 @@ private:
         bool closed_final_response_pinned{};
         std::uint64_t binding_generation{};
         std::unordered_map<std::uint64_t, std::size_t> in_flight_deliveries;
-        std::map<std::uint64_t, protocol_v2::CoherenceFrame> pinned_responses;
+        std::map<std::uint64_t, PinnedResponse> pinned_responses;
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
     };
