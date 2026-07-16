@@ -241,7 +241,7 @@ ValidationResult validateFrame(const CoherenceFrame &frame) noexcept {
         if (size(frame) != kLineSize || value(frame) == 0 || expected(frame) == 0 || value(frame) % kLineSize != 0 ||
             (value(frame) / kLineSize) % expected(frame) != 0)
             return bad(ValidationError::InvalidCacheGeometry);
-        if ((capabilities(frame) & ~kSupportedCapabilities) != 0 ||
+        if ((capabilities(frame) & ~kKnownCapabilities) != 0 ||
             (capabilities(frame) & static_cast<std::uint64_t>(Capability::MODEL_SNOOP)) == 0)
             return bad(ValidationError::InvalidCapabilities);
         if (oldValue(frame) != 0)
@@ -362,6 +362,8 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
         if (requestId(response) != 0)
             return bad(ValidationError::InvalidRequestId);
         if (status(response) != Status::Ok) {
+            if (status(response) == Status::StaleRequest)
+                return bad(ValidationError::InvalidRequestId);
             if (sessionId(response) != sessionId(request))
                 return bad(ValidationError::InvalidSessionId);
             if (lineState(response) != LineState::I || epoch(response) != 0 || payloadLength(response) != 0 ||
@@ -405,7 +407,8 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
             return bad(ValidationError::UnexpectedEpoch);
         if (payloadLength(response) != 0)
             return bad(ValidationError::InvalidPayloadLength);
-        if (status(response) == Status::StaleRequest ? oldValue(response) == 0 : oldValue(response) != 0)
+        if (status(response) == Status::StaleRequest ? oldValue(response) <= requestId(request)
+                                                     : oldValue(response) != 0)
             return bad(ValidationError::UnexpectedOldValue);
         return {ValidationError::None, Status::Ok};
     }
@@ -414,6 +417,11 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
     if (payloadLength(response) != (data_response ? kLineSize : 0))
         return bad(ValidationError::InvalidPayloadLength);
     if (epoch(response) == 0 && (isLineCommand(request_op) || isAtomic(request_op)))
+        return bad(ValidationError::UnexpectedEpoch);
+    const bool state_changing_response = (request_op == Opcode::Getm && lineState(request) == LineState::S) ||
+                                         request_op == Opcode::Upgrade || request_op == Opcode::Puts ||
+                                         request_op == Opcode::Putm || isAtomic(request_op);
+    if (state_changing_response && epoch(response) <= epoch(request))
         return bad(ValidationError::UnexpectedEpoch);
     LineState required_state = LineState::I;
     if (request_op == Opcode::Gets) {
@@ -461,9 +469,14 @@ ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFram
     const auto required_success_state =
         opcode(snoop) == Opcode::SnpDowngrade || opcode(snoop) == Opcode::SnpDataDowngrade ? LineState::S
                                                                                            : LineState::I;
+    const bool valid_failure_state =
+        opcode(snoop) == Opcode::SnpInv ? context.failure_state == LineState::S || context.failure_state == LineState::E
+        : opcode(snoop) == Opcode::SnpDowngrade ? context.failure_state == LineState::E
+        : opcode(snoop) == Opcode::SnpDataInv || opcode(snoop) == Opcode::SnpDataDowngrade
+            ? context.failure_state == LineState::M
+            : context.failure_state == LineState::I;
     if (static_cast<std::uint8_t>(context.failure_state) > static_cast<std::uint8_t>(LineState::M) ||
-        context.success_state != required_success_state ||
-        (opcode(snoop) == Opcode::HostFence && context.failure_state != LineState::I))
+        context.success_state != required_success_state || !valid_failure_state)
         return bad(ValidationError::ContextRequired);
     const auto expected_state = success ? context.success_state : context.failure_state;
     if (lineState(ack) != expected_state)
