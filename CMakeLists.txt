@@ -171,6 +171,9 @@ add_test(NAME test_pgas_controller_counters COMMAND test_pgas_controller_counter
 add_executable(test_coherence_protocol_v2 tests/test_coherence_protocol_v2.cpp)
 target_include_directories(test_coherence_protocol_v2 PRIVATE include)
 target_link_libraries(test_coherence_protocol_v2 cxlmemsim)
+set(COHERENCE_PROTOCOL_V2_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/coherence_protocol_v2_frames.tsv")
+target_compile_definitions(test_coherence_protocol_v2
+                           PRIVATE COHERENCE_PROTOCOL_V2_FIXTURE_PATH="${COHERENCE_PROTOCOL_V2_FIXTURE}")
 add_test(NAME test_coherence_protocol_v2 COMMAND test_coherence_protocol_v2)
 
 # Integration-style test clients. They require an external server/DAX setup, so

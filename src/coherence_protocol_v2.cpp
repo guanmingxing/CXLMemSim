@@ -58,6 +58,13 @@ bool isLineCommand(Opcode op) noexcept {
 ValidationResult bad(ValidationError error) noexcept { return {error, Status::BadProtocol}; }
 bool endpoint(std::uint16_t host) noexcept { return host < kMaximumHosts; }
 
+bool permittedSnoopFailure(Status failure, Opcode snoop_op) noexcept {
+    if (failure == Status::BadProtocol || failure == Status::StaleSession || failure == Status::HostFenced ||
+        failure == Status::IoError)
+        return true;
+    return snoop_op != Opcode::HostFence && (failure == Status::StaleEpoch || failure == Status::InvalidState);
+}
+
 bool zeroScalars(const CoherenceFrame &frame) noexcept {
     return capabilities(frame) == 0 && expected(frame) == 0 && value(frame) == 0 && oldValue(frame) == 0 &&
            size(frame) == 0;
@@ -423,6 +430,15 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
                                          request_op == Opcode::Putm || isAtomic(request_op);
     if (state_changing_response && epoch(response) <= epoch(request))
         return bad(ValidationError::UnexpectedEpoch);
+    const bool exact_owner_epoch =
+        request_op == Opcode::Upgrade || request_op == Opcode::Putm ||
+        (request_op == Opcode::Puts && lineState(request) == LineState::E) ||
+        (isAtomic(request_op) && (lineState(request) == LineState::E || lineState(request) == LineState::M));
+    if (exact_owner_epoch && epoch(response) - epoch(request) != 1)
+        return bad(ValidationError::UnexpectedEpoch);
+    if ((request_op == Opcode::Fence || request_op == Opcode::Heartbeat || request_op == Opcode::Unregister) &&
+        epoch(response) != 0)
+        return bad(ValidationError::UnexpectedEpoch);
     LineState required_state = LineState::I;
     if (request_op == Opcode::Gets) {
         if (lineState(response) != LineState::S && lineState(response) != LineState::E)
@@ -463,6 +479,8 @@ ValidationResult validateSnoopAck(const CoherenceFrame &ack, const CoherenceFram
     if (!zeroScalars(ack))
         return bad(ValidationError::UnexpectedValue);
     const bool success = status(ack) == Status::Ok;
+    if (!success && !permittedSnoopFailure(status(ack), opcode(snoop)))
+        return bad(ValidationError::UnexpectedStatus);
     const bool data_snoop = opcode(snoop) == Opcode::SnpDataInv || opcode(snoop) == Opcode::SnpDataDowngrade;
     if (payloadLength(ack) != (success && data_snoop ? kLineSize : 0))
         return bad(ValidationError::InvalidPayloadLength);

@@ -4,9 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace protocol = cxlmemsim::protocol_v2;
 
@@ -24,20 +27,31 @@ int failures = 0;
 
 using Bytes = protocol::EncodedFrame;
 
-template <typename T> void putLe(Bytes &bytes, std::size_t offset, T value) {
-    for (std::size_t index = 0; index < sizeof(T); ++index) {
-        bytes[offset + index] = static_cast<std::uint8_t>(value >> (index * 8U));
+std::unordered_map<std::string, Bytes> loadGoldenFrames() {
+    std::ifstream input(COHERENCE_PROTOCOL_V2_FIXTURE_PATH);
+    CHECK(input.is_open());
+    std::unordered_map<std::string, Bytes> fixtures;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('\t');
+        CHECK(separator != std::string::npos);
+        if (separator == std::string::npos)
+            continue;
+        const auto name = line.substr(0, separator);
+        const auto hex = line.substr(separator + 1);
+        CHECK(hex.size() == protocol::kFrameSize * 2);
+        if (hex.size() != protocol::kFrameSize * 2)
+            continue;
+        Bytes bytes{};
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            const auto byte = hex.substr(index * 2, 2);
+            const auto parsed = std::strtoul(byte.c_str(), nullptr, 16);
+            bytes[index] = static_cast<std::uint8_t>(parsed);
+        }
+        CHECK(fixtures.emplace(name, bytes).second);
     }
-}
-
-Bytes goldenBase(protocol::Opcode type, std::uint16_t src_host, std::uint16_t dst_host) {
-    Bytes bytes{};
-    putLe(bytes, 0, protocol::kMagic);
-    putLe(bytes, 4, protocol::kProtocolVersion);
-    putLe(bytes, 6, static_cast<std::uint16_t>(type));
-    putLe(bytes, 16, src_host);
-    putLe(bytes, 18, dst_host);
-    return bytes;
+    CHECK(fixtures.size() == 5);
+    return fixtures;
 }
 
 void expectEncoding(const protocol::CoherenceFrame &frame, const Bytes &golden) {
@@ -130,6 +144,7 @@ void testExactAbiAndValues() {
 }
 
 void testGoldenFrames() {
+    const auto fixtures = loadGoldenFrames();
     auto registration = protocol::initializeFrame(protocol::Opcode::Register);
     protocol::setSrcHost(registration, 3);
     protocol::setDstHost(registration, protocol::kServerHost);
@@ -137,30 +152,16 @@ void testGoldenFrames() {
     protocol::setValue(registration, 0x10000);
     protocol::setExpected(registration, 8);
     protocol::setCapabilities(registration, static_cast<std::uint64_t>(protocol::Capability::MODEL_SNOOP));
-    auto register_golden = goldenBase(protocol::Opcode::Register, 3, protocol::kServerHost);
-    putLe(register_golden, 64, 1ULL);
-    putLe(register_golden, 72, 8ULL);
-    putLe(register_golden, 80, 0x10000ULL);
-    putLe(register_golden, 96, 64U);
-    expectEncoding(registration, register_golden);
+    expectEncoding(registration, fixtures.at("REGISTER"));
     CHECK(protocol::validateFrame(registration));
 
     auto gets = command(protocol::Opcode::Gets);
     protocol::setAddress(gets, 0x1000);
-    auto gets_golden = goldenBase(protocol::Opcode::Gets, 3, protocol::kServerHost);
-    putLe(gets_golden, 24, 0x0102030405060708ULL);
-    putLe(gets_golden, 40, 0x1122334455667788ULL);
-    putLe(gets_golden, 48, 0x1000ULL);
-    expectEncoding(gets, gets_golden);
+    expectEncoding(gets, fixtures.at("GETS"));
     CHECK(protocol::validateFrame(gets));
 
     auto data_snoop = snoop(protocol::Opcode::SnpDataInv);
-    auto snoop_golden = goldenBase(protocol::Opcode::SnpDataInv, protocol::kServerHost, 3);
-    putLe(snoop_golden, 32, 0xaabbccddeeff0011ULL);
-    putLe(snoop_golden, 40, 0x1122334455667788ULL);
-    putLe(snoop_golden, 48, 0x2040ULL);
-    putLe(snoop_golden, 56, 9ULL);
-    expectEncoding(data_snoop, snoop_golden);
+    expectEncoding(data_snoop, fixtures.at("SNP_DATA_INV"));
     CHECK(protocol::validateFrame(data_snoop));
 
     auto ack = protocol::initializeFrame(protocol::Opcode::SnoopAck);
@@ -172,13 +173,6 @@ void testGoldenFrames() {
     protocol::setEpoch(ack, 7);
     protocol::setAckStrength(ack, protocol::AckStrength::MODEL);
     protocol::setLineState(ack, protocol::LineState::I);
-    auto ack_golden = goldenBase(protocol::Opcode::SnoopAck, 3, protocol::kServerHost);
-    ack_golden[14] = 1;
-    putLe(ack_golden, 32, 99ULL);
-    putLe(ack_golden, 40, 0x1122334455667788ULL);
-    putLe(ack_golden, 48, 0x3000ULL);
-    putLe(ack_golden, 56, 7ULL);
-    expectEncoding(ack, ack_golden);
     auto acked_snoop = protocol::initializeFrame(protocol::Opcode::SnpInv);
     protocol::setSrcHost(acked_snoop, protocol::kServerHost);
     protocol::setDstHost(acked_snoop, 3);
@@ -191,21 +185,15 @@ void testGoldenFrames() {
     protocol::setPayloadLength(ack, 64);
     for (std::size_t i = 0; i < 64; ++i) {
         ack.data[i] = static_cast<std::uint8_t>(i);
-        ack_golden[104 + i] = static_cast<std::uint8_t>(i);
     }
-    putLe(ack_golden, 20, std::uint16_t{64});
-    expectEncoding(ack, ack_golden);
+    expectEncoding(ack, fixtures.at("SNOOP_ACK"));
     protocol::setOpcode(acked_snoop, protocol::Opcode::SnpDataInv);
     CHECK(protocol::validateSnoopAck(ack, acked_snoop,
                                      {protocol::AckStrength::MODEL, protocol::LineState::I, protocol::LineState::M}));
 
     auto heartbeat = command(protocol::Opcode::Heartbeat);
     protocol::setOldValue(heartbeat, 42);
-    auto heartbeat_golden = goldenBase(protocol::Opcode::Heartbeat, 3, protocol::kServerHost);
-    putLe(heartbeat_golden, 24, 0x0102030405060708ULL);
-    putLe(heartbeat_golden, 40, 0x1122334455667788ULL);
-    putLe(heartbeat_golden, 88, 42ULL);
-    expectEncoding(heartbeat, heartbeat_golden);
+    expectEncoding(heartbeat, fixtures.at("HEARTBEAT"));
     CHECK(protocol::validateFrame(heartbeat));
 }
 
@@ -431,6 +419,76 @@ void testContextualResponses() {
         expectResponseError(bad, request, protocol::ValidationError::InvalidPayloadLength);
     }
 
+    for (const auto op : {protocol::Opcode::Upgrade, protocol::Opcode::Puts, protocol::Opcode::Putm,
+                          protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas}) {
+        const bool atomic = op == protocol::Opcode::AtomicFaa || op == protocol::Opcode::AtomicCas;
+        auto request = command(op);
+        protocol::setAddress(request, atomic ? 0x1038 : 0x1000);
+        protocol::setEpoch(request, 9);
+        protocol::setLineState(request, op == protocol::Opcode::Putm ? protocol::LineState::M : protocol::LineState::E);
+        if (op == protocol::Opcode::Putm)
+            fillLine(request);
+        if (atomic) {
+            protocol::setSize(request, 8);
+            protocol::setValue(request, 3);
+            if (op == protocol::Opcode::AtomicCas)
+                protocol::setExpected(request, 2);
+        }
+        auto response =
+            responseFor(request,
+                        op == protocol::Opcode::Puts || op == protocol::Opcode::Putm ? protocol::LineState::I
+                                                                                     : protocol::LineState::M,
+                        11);
+        if (atomic)
+            fillLine(response);
+        expectResponseError(response, request, protocol::ValidationError::UnexpectedEpoch);
+    }
+
+    for (const auto state : {protocol::LineState::I, protocol::LineState::S}) {
+        auto request = command(protocol::Opcode::AtomicFaa);
+        protocol::setAddress(request, 0x1038);
+        protocol::setSize(request, 8);
+        protocol::setValue(request, 3);
+        protocol::setLineState(request, state);
+        protocol::setEpoch(request, state == protocol::LineState::I ? 0 : 9);
+        auto response = responseFor(request, protocol::LineState::M, 12);
+        fillLine(response);
+        CHECK(protocol::validateResponse(response, request));
+    }
+
+    for (const auto op : {protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas}) {
+        auto request = command(op);
+        protocol::setAddress(request, 0x1038);
+        protocol::setSize(request, 8);
+        protocol::setValue(request, 3);
+        protocol::setLineState(request, protocol::LineState::M);
+        protocol::setEpoch(request, 9);
+        if (op == protocol::Opcode::AtomicCas)
+            protocol::setExpected(request, 2);
+        auto response = responseFor(request, protocol::LineState::M, 11);
+        fillLine(response);
+        expectResponseError(response, request, protocol::ValidationError::UnexpectedEpoch);
+    }
+
+    auto lagging_puts = command(protocol::Opcode::Puts);
+    protocol::setAddress(lagging_puts, 0x1000);
+    protocol::setLineState(lagging_puts, protocol::LineState::S);
+    protocol::setEpoch(lagging_puts, 9);
+    CHECK(protocol::validateResponse(responseFor(lagging_puts, protocol::LineState::I, 12), lagging_puts));
+
+    auto max_epoch_upgrade = command(protocol::Opcode::Upgrade);
+    protocol::setAddress(max_epoch_upgrade, 0x1000);
+    protocol::setLineState(max_epoch_upgrade, protocol::LineState::E);
+    protocol::setEpoch(max_epoch_upgrade, std::numeric_limits<std::uint64_t>::max());
+    expectResponseError(responseFor(max_epoch_upgrade, protocol::LineState::M, 0), max_epoch_upgrade,
+                        protocol::ValidationError::UnexpectedEpoch);
+
+    for (const auto op : {protocol::Opcode::Fence, protocol::Opcode::Heartbeat, protocol::Opcode::Unregister}) {
+        auto request = command(op);
+        auto response = responseFor(request, protocol::LineState::I, 1);
+        expectResponseError(response, request, protocol::ValidationError::UnexpectedEpoch);
+    }
+
     for (const auto op :
          {protocol::Opcode::Gets, protocol::Opcode::Getm, protocol::Opcode::Upgrade, protocol::Opcode::Puts,
           protocol::Opcode::Putm, protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas, protocol::Opcode::Fence,
@@ -535,6 +593,20 @@ void testContextualSnoopAcks() {
             CHECK(protocol::validateSnoopAck(failed, request, context));
         }
 
+        for (std::uint16_t raw_status = 1; raw_status <= 11; ++raw_status) {
+            const auto failure_status = static_cast<protocol::Status>(raw_status);
+            const bool permitted =
+                failure_status == protocol::Status::BadProtocol || failure_status == protocol::Status::StaleSession ||
+                failure_status == protocol::Status::StaleEpoch || failure_status == protocol::Status::InvalidState ||
+                failure_status == protocol::Status::HostFenced || failure_status == protocol::Status::IoError;
+            auto failed = ackFor(request, failure_state);
+            protocol::setStatus(failed, failure_status);
+            if (permitted)
+                CHECK(protocol::validateSnoopAck(failed, request, context));
+            else
+                expectAckError(failed, request, context, protocol::ValidationError::UnexpectedStatus);
+        }
+
         for (const auto illegal_state :
              {protocol::LineState::I, protocol::LineState::S, protocol::LineState::E, protocol::LineState::M}) {
             const bool legal = op == protocol::Opcode::SnpInv
@@ -595,8 +667,18 @@ void testContextualSnoopAcks() {
                                                   protocol::LineState::I};
     auto fence_ack = ackFor(host_fence, protocol::LineState::I);
     CHECK(protocol::validateSnoopAck(fence_ack, host_fence, fence_context));
-    protocol::setStatus(fence_ack, protocol::Status::HostFenced);
-    CHECK(protocol::validateSnoopAck(fence_ack, host_fence, fence_context));
+    for (std::uint16_t raw_status = 1; raw_status <= 11; ++raw_status) {
+        const auto failure_status = static_cast<protocol::Status>(raw_status);
+        const bool permitted =
+            failure_status == protocol::Status::BadProtocol || failure_status == protocol::Status::StaleSession ||
+            failure_status == protocol::Status::HostFenced || failure_status == protocol::Status::IoError;
+        auto failed_fence = fence_ack;
+        protocol::setStatus(failed_fence, failure_status);
+        if (permitted)
+            CHECK(protocol::validateSnoopAck(failed_fence, host_fence, fence_context));
+        else
+            expectAckError(failed_fence, host_fence, fence_context, protocol::ValidationError::UnexpectedStatus);
+    }
     for (const auto illegal_state : {protocol::LineState::S, protocol::LineState::E, protocol::LineState::M}) {
         auto failed_fence = ackFor(host_fence, illegal_state);
         protocol::setStatus(failed_fence, protocol::Status::HostFenced);
