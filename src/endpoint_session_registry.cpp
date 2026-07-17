@@ -159,6 +159,8 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
     if (session.state != SessionState::Active || !session.clean_holders.empty() || !session.modified_holders.empty() ||
         protocol_v2::opcode(unregister_request) != protocol_v2::Opcode::Unregister ||
         admitted == session.admitted_requests.end() || !sameFrame(admitted->second, unregister_request) ||
+        session.unregister_request_id != id ||
+        session.admitted_requests.upper_bound(id) != session.admitted_requests.end() ||
         session.binding_generation == std::numeric_limits<std::uint64_t>::max())
         return protocol_v2::Status::InvalidState;
     for (auto lower = session.admitted_requests.begin(); lower != admitted; ++lower) {
@@ -201,6 +203,8 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     if (const auto existing = session.admitted_requests.find(id); existing != session.admitted_requests.end())
         return sameFrame(existing->second, request) ? RequestAdmissionResult::Duplicate
                                                     : RequestAdmissionResult::Conflict;
+    if (session.unregister_request_id)
+        return RequestAdmissionResult::InvalidRequest;
     if (id < session.next_request_id || id <= session.response_watermark)
         return RequestAdmissionResult::StaleRequest;
     if (id != session.next_request_id)
@@ -208,6 +212,8 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     if (session.admitted_requests.size() >= max_pinned_responses_per_session_)
         return RequestAdmissionResult::Backpressure;
     session.admitted_requests.emplace(id, request);
+    if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister)
+        session.unregister_request_id = id;
     if (session.next_request_id == std::numeric_limits<std::uint64_t>::max())
         return RequestAdmissionResult::InvalidRequest;
     ++session.next_request_id;

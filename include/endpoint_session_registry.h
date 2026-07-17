@@ -130,6 +130,7 @@ private:
         std::unordered_map<std::uint64_t, std::size_t> in_flight_deliveries;
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> admitted_requests;
         std::map<std::uint64_t, PinnedResponse> pinned_responses;
+        std::optional<std::uint64_t> unregister_request_id;
         std::uint64_t next_request_id{1};
         std::uint64_t publication_cursor{1};
         bool publishing{};

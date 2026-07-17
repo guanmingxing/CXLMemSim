@@ -1006,6 +1006,39 @@ void testClosedAbruptDisconnectBeforeFinalPinResumesClosed() {
     CHECK(registry.acknowledgeResponses(registered.session_id, 1));
 }
 
+void testUnregisterAdmissionIsTerminal() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(38));
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 38);
+    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Duplicate);
+
+    auto conflicting_duplicate = unregister_request;
+    setOpcode(conflicting_duplicate, Opcode::Heartbeat);
+    CHECK(registry.admitRequest(registered.session_id, conflicting_duplicate) == RequestAdmissionResult::Conflict);
+
+    const auto next_heartbeat = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 38);
+    CHECK(registry.admitRequest(registered.session_id, next_heartbeat) == RequestAdmissionResult::InvalidRequest);
+    const auto same_next_id = protocolRequest(Opcode::Fence, 2, registered.session_id, 38);
+    CHECK(registry.admitRequest(registered.session_id, same_next_id) == RequestAdmissionResult::InvalidRequest);
+    const auto later_unregister = protocolRequest(Opcode::Unregister, 3, registered.session_id, 38);
+    CHECK(registry.admitRequest(registered.session_id, later_unregister) == RequestAdmissionResult::InvalidRequest);
+
+    CHECK(registry.gracefulClose(38, registered.session_id, unregister_request) == Status::Ok);
+}
+
+void testUnregisterNeverClosesOverLaterAdmittedWork() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(39));
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 39);
+    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    const auto later_request = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 39);
+    const auto later_admission = registry.admitRequest(registered.session_id, later_request);
+
+    CHECK(later_admission != RequestAdmissionResult::Accepted ||
+          registry.gracefulClose(39, registered.session_id, unregister_request) == Status::InvalidState);
+}
+
 void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
     EndpointSessionRegistry registry;
     SessionId session_id{};
@@ -1063,6 +1096,8 @@ int main() {
     testClosedFinalResponsePublishesAndRemainsPinnedUntilAck();
     testClosedFinalSendFailureResumesWithoutReopeningAdmission();
     testClosedAbruptDisconnectBeforeFinalPinResumesClosed();
+    testUnregisterAdmissionIsTerminal();
+    testUnregisterNeverClosesOverLaterAdmittedWork();
     testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
