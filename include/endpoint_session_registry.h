@@ -140,7 +140,8 @@ private:
 
     bool validHolderSession(const Session &session) const noexcept;
     bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
-    bool beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender);
+    bool beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender,
+                          ResponseSender staged_sender = {});
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                         const ResponseSender &sender);
     void retireFailedBinding(const std::shared_ptr<Session> &session, std::uint64_t generation);

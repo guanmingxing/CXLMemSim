@@ -51,16 +51,20 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                 if (old->state != SessionState::Closed || !old->closed_final_response_pinned ||
                     !old->pinned_responses.empty())
                     return {.status = protocol_v2::Status::DuplicateHost};
-                sessions_.erase(old->id);
-                host_sessions_.erase(host);
             }
             if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max())
                 return {.status = protocol_v2::Status::InvalidState};
+            ResponseSender staged_sender = request.sender;
+            std::string staged_transport = request.transport_name;
             const auto id = next_session_id_;
-            ++next_session_id_;
             session = std::make_shared<Session>(
                 id, request.host_id, request.capabilities & protocol_v2::kSupportedCapabilities, request.cache_capacity,
-                request.cache_ways, request.transport_name, request.sender);
+                request.cache_ways, std::move(staged_transport), std::move(staged_sender));
+            if (host != host_sessions_.end()) {
+                sessions_.erase(host->second);
+                host_sessions_.erase(host);
+            }
+            ++next_session_id_;
             sessions_.emplace(id, session);
             host_sessions_.emplace(request.host_id, id);
             return resultFor(*session, protocol_v2::Status::Ok);
@@ -82,15 +86,21 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
             return {.status = protocol_v2::Status::StaleSession};
         if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
             return {.status = protocol_v2::Status::InvalidState};
+        ResponseSender staged_sender = request.sender;
+        std::string staged_transport = request.transport_name;
+        const auto staged_publication_cursor = session->response_watermark + 1;
+        ResponseSender staged_drain_sender;
+        if (staged_sender && !session->publishing && session->pinned_responses.contains(staged_publication_cursor))
+            staged_drain_sender = staged_sender;
         ++session->binding_generation;
         generation = session->binding_generation;
         if (session->state == SessionState::OfflineRetained)
             session->state = SessionState::Active;
-        session->transport_name = request.transport_name;
-        session->sender = request.sender;
-        session->publication_cursor = session->response_watermark + 1;
+        session->transport_name = std::move(staged_transport);
+        session->sender = std::move(staged_sender);
+        session->publication_cursor = staged_publication_cursor;
         result = resultFor(*session, protocol_v2::Status::Ok);
-        (void)beginDrainLocked(*session, generation, sender);
+        (void)beginDrainLocked(*session, generation, sender, std::move(staged_drain_sender));
     }
     if (sender && !drainResponses(session, generation, sender)) {
         result.status = protocol_v2::Status::IoError;
@@ -204,13 +214,16 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     return RequestAdmissionResult::Accepted;
 }
 
-bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender) {
+bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender,
+                                               ResponseSender staged_sender) {
     const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Closed;
     if (!deliverable_state || !session.sender || session.publishing ||
         !session.pinned_responses.contains(session.publication_cursor))
         return false;
+    if (!staged_sender)
+        staged_sender = session.sender;
+    sender = std::move(staged_sender);
     generation = session.binding_generation;
-    sender = session.sender;
     session.publishing = true;
     session.publisher_generation = generation;
     return true;
@@ -312,20 +325,22 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
             return PinResponseResult::Conflict;
         if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister && session->state != SessionState::Closed)
             return PinResponseResult::InvalidResponse;
-        if (const auto existing = session->pinned_responses.find(id); existing != session->pinned_responses.end())
-            return sameFrame(existing->second.request, request) && sameFrame(existing->second.response, response_frame)
-                       ? PinResponseResult::Duplicate
-                       : PinResponseResult::Conflict;
-        if (session->state == SessionState::Closed &&
-            (!session->close_request || !sameFrame(*session->close_request, request) ||
-             session->closed_final_response_pinned))
-            return PinResponseResult::InvalidResponse;
-        if (session->state != SessionState::Active && session->state != SessionState::OfflineRetained &&
-            session->state != SessionState::Closed)
-            return PinResponseResult::SessionUnavailable;
-        session->pinned_responses.emplace(id, PinnedResponse{request, response_frame});
-        if (session->state == SessionState::Closed)
-            session->closed_final_response_pinned = true;
+        if (const auto existing = session->pinned_responses.find(id); existing != session->pinned_responses.end()) {
+            if (!sameFrame(existing->second.request, request) || !sameFrame(existing->second.response, response_frame))
+                return PinResponseResult::Conflict;
+            result = PinResponseResult::Duplicate;
+        } else {
+            if (session->state == SessionState::Closed &&
+                (!session->close_request || !sameFrame(*session->close_request, request) ||
+                 session->closed_final_response_pinned))
+                return PinResponseResult::InvalidResponse;
+            if (session->state != SessionState::Active && session->state != SessionState::OfflineRetained &&
+                session->state != SessionState::Closed)
+                return PinResponseResult::SessionUnavailable;
+            session->pinned_responses.emplace(id, PinnedResponse{request, response_frame});
+            if (session->state == SessionState::Closed)
+                session->closed_final_response_pinned = true;
+        }
         (void)beginDrainLocked(*session, generation, sender);
     }
     if (sender)

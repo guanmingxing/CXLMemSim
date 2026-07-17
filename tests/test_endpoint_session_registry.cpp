@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,6 +30,46 @@ int failures = 0;
 
 constexpr std::uint64_t kModelSnoop = static_cast<std::uint64_t>(Capability::MODEL_SNOOP);
 constexpr std::uint64_t kNativeFlush = static_cast<std::uint64_t>(Capability::NATIVE_FLUSH);
+
+struct ThrowingCopySender {
+    std::shared_ptr<bool> throw_on_copy;
+    std::shared_ptr<std::size_t> deliveries;
+
+    ThrowingCopySender(std::shared_ptr<bool> should_throw, std::shared_ptr<std::size_t> delivery_count)
+        : throw_on_copy(std::move(should_throw)), deliveries(std::move(delivery_count)) {}
+    ThrowingCopySender(const ThrowingCopySender &other)
+        : throw_on_copy(other.throw_on_copy), deliveries(other.deliveries) {
+        if (*throw_on_copy)
+            throw std::runtime_error("sender copy failed");
+    }
+    ThrowingCopySender(ThrowingCopySender &&) noexcept = default;
+
+    bool operator()(const CoherenceFrame &) const {
+        ++*deliveries;
+        return true;
+    }
+};
+
+struct ThrowOnNthCopySender {
+    std::shared_ptr<std::size_t> copies;
+    std::shared_ptr<std::size_t> deliveries;
+    std::size_t throw_on_copy;
+
+    ThrowOnNthCopySender(std::shared_ptr<std::size_t> copy_count, std::shared_ptr<std::size_t> delivery_count,
+                         std::size_t throw_on)
+        : copies(std::move(copy_count)), deliveries(std::move(delivery_count)), throw_on_copy(throw_on) {}
+    ThrowOnNthCopySender(const ThrowOnNthCopySender &other)
+        : copies(other.copies), deliveries(other.deliveries), throw_on_copy(other.throw_on_copy) {
+        if (++*copies == throw_on_copy)
+            throw std::runtime_error("sender copy failed");
+    }
+    ThrowOnNthCopySender(ThrowOnNthCopySender &&) noexcept = default;
+
+    bool operator()(const CoherenceFrame &) const {
+        ++*deliveries;
+        return true;
+    }
+};
 
 RegistrationRequest request(std::uint16_t host, std::string transport = "tcp", ResponseSender sender = {}) {
     return {host, 0, kModelSnoop, 256 * 1024, 4, std::move(transport), std::move(sender)};
@@ -184,6 +225,155 @@ void testDisconnectResumeAndReplay() {
     auto exact_negotiated_resume = request(7);
     exact_negotiated_resume.requested_session_id = original.session_id;
     CHECK(registry.registerEndpoint(exact_negotiated_resume).status == Status::Ok);
+}
+
+void testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId() {
+    EndpointSessionRegistry registry;
+    auto throw_on_copy = std::make_shared<bool>(false);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowingCopySender{throw_on_copy, deliveries}};
+    auto failing = request(33, "copy-fails", std::move(sender));
+    *throw_on_copy = true;
+
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(failing);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+
+    const auto retry = registry.registerEndpoint(request(33));
+    CHECK(retry.status == Status::Ok);
+    CHECK(retry.session_id == 1);
+    CHECK(*deliveries == 0);
+}
+
+void testReplacementSenderCopyFailurePreservesClosedSession() {
+    EndpointSessionRegistry registry;
+    const auto registered =
+        registry.registerEndpoint(request(36, "original", [](const CoherenceFrame &) { return true; }));
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 36);
+    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(36, registered.session_id, unregister_request) == Status::Ok);
+    CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+
+    auto throw_on_copy = std::make_shared<bool>(false);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowingCopySender{throw_on_copy, deliveries}};
+    auto failing = request(36, "copy-fails", std::move(sender));
+    *throw_on_copy = true;
+
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(failing);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    const auto after_failure = registry.inspect(registered.session_id);
+    CHECK(after_failure.has_value());
+    if (after_failure)
+        CHECK(after_failure->state == SessionState::Closed);
+
+    CHECK(registry.registerEndpoint(request(36)).status == Status::Ok);
+    CHECK(*deliveries == 0);
+}
+
+void testResumeSenderCopyFailurePreservesOfflineBinding() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(34));
+    CHECK(registry.disconnectAbruptly(34, registered.session_id));
+
+    auto throw_on_copy = std::make_shared<bool>(false);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowingCopySender{throw_on_copy, deliveries}};
+    auto failing = request(34, "copy-fails", std::move(sender));
+    failing.requested_session_id = registered.session_id;
+    *throw_on_copy = true;
+
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(failing);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    const auto after_failure = registry.inspect(registered.session_id);
+    CHECK(after_failure->state == SessionState::OfflineRetained);
+    CHECK(!after_failure->has_sender);
+    CHECK(after_failure->transport_name.empty());
+
+    auto retry = request(34, "retry", [](const CoherenceFrame &) { return true; });
+    retry.requested_session_id = registered.session_id;
+    CHECK(registry.registerEndpoint(retry).status == Status::Ok);
+    CHECK(*deliveries == 0);
+}
+
+void testResumeDrainCopyFailurePreservesOfflineBinding() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(37));
+    CHECK(pinHeartbeat(registry, registered.session_id, 1, 37) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(37, registered.session_id));
+
+    auto copies = std::make_shared<std::size_t>(0);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowOnNthCopySender{copies, deliveries, 2}};
+    auto failing = request(37, "second-copy-fails", std::move(sender));
+    failing.requested_session_id = registered.session_id;
+
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(failing);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    CHECK(*copies == 2);
+    const auto after_failure = registry.inspect(registered.session_id);
+    CHECK(after_failure->state == SessionState::OfflineRetained);
+    CHECK(!after_failure->has_sender);
+    CHECK(after_failure->transport_name.empty());
+    CHECK(*deliveries == 0);
+
+    auto retry = request(37, "retry", [&](const CoherenceFrame &) {
+        ++*deliveries;
+        return true;
+    });
+    retry.requested_session_id = registered.session_id;
+    CHECK(registry.registerEndpoint(retry).status == Status::Ok);
+    CHECK(*deliveries == 1);
+}
+
+void testDuplicatePinRestartsDrainAfterSenderCopyFailure() {
+    EndpointSessionRegistry registry;
+    auto throw_on_copy = std::make_shared<bool>(false);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowingCopySender{throw_on_copy, deliveries}};
+    const auto registered = registry.registerEndpoint(request(35, "throwing-copy", std::move(sender)));
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 35);
+    const auto heartbeat_response = response(heartbeat);
+    CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+    *throw_on_copy = true;
+
+    bool propagated = false;
+    try {
+        (void)registry.pinResponse(registered.session_id, heartbeat, heartbeat_response);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    CHECK(registry.inspect(registered.session_id)->state == SessionState::Active);
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+    CHECK(*deliveries == 0);
+
+    *throw_on_copy = false;
+    CHECK(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response) == PinResponseResult::Duplicate);
+    CHECK(*deliveries == 1);
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.pinnedResponseIds(registered.session_id).empty());
 }
 
 void testReplayDoesNotBlockRegistry() {
@@ -847,6 +1037,11 @@ void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
 int main() {
     testFreshRegistrationAndValidation();
     testDisconnectResumeAndReplay();
+    testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId();
+    testReplacementSenderCopyFailurePreservesClosedSession();
+    testResumeSenderCopyFailurePreservesOfflineBinding();
+    testResumeDrainCopyFailurePreservesOfflineBinding();
+    testDuplicatePinRestartsDrainAfterSenderCopyFailure();
     testReplayDoesNotBlockRegistry();
     testDisconnectWaitsForCurrentBindingReplay();
     testCallbackCanDisconnectItsOwnBinding();
