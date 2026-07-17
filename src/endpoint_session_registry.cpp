@@ -248,6 +248,34 @@ void EndpointSessionRegistry::retireFailedBinding(const std::shared_ptr<Session>
     session->publishing = false;
 }
 
+void EndpointSessionRegistry::reclaimResponsesLocked(Session &session, std::uint64_t consumed) {
+    session.response_watermark = consumed;
+    session.pinned_responses.erase(session.pinned_responses.begin(), session.pinned_responses.upper_bound(consumed));
+    session.admitted_requests.erase(session.admitted_requests.begin(), session.admitted_requests.upper_bound(consumed));
+    if (session.state == SessionState::Closed && session.closed_final_response_pinned &&
+        session.pinned_responses.empty()) {
+        session.sender = {};
+        session.transport_name.clear();
+    }
+}
+
+void EndpointSessionRegistry::finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered) {
+    const auto found = session.in_flight_response_deliveries.find(response_id);
+    if (found != session.in_flight_response_deliveries.end() && --found->second == 0)
+        session.in_flight_response_deliveries.erase(found);
+
+    if (delivered) {
+        session.published_response_watermark = std::max(session.published_response_watermark, response_id);
+        if (session.pending_response_ack && *session.pending_response_ack <= session.published_response_watermark) {
+            reclaimResponsesLocked(session, *session.pending_response_ack);
+            session.pending_response_ack.reset();
+        }
+    } else if (session.pending_response_ack && *session.pending_response_ack > session.published_response_watermark &&
+               !session.in_flight_response_deliveries.contains(*session.pending_response_ack)) {
+        session.pending_response_ack.reset();
+    }
+}
+
 bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                                              const ResponseSender &sender) {
     for (;;) {
@@ -266,6 +294,7 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
             }
             frame = found->second.response;
             ++session->in_flight_deliveries[generation];
+            ++session->in_flight_response_deliveries[protocol_v2::requestId(frame)];
         }
         delivery_stack.push_back({this, session->id, generation});
         bool delivered;
@@ -278,6 +307,7 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
                 auto found = session->in_flight_deliveries.find(generation);
                 if (found != session->in_flight_deliveries.end() && --found->second == 0)
                     session->in_flight_deliveries.erase(found);
+                finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), false);
                 delivery_finished_.notify_all();
             }
             retireFailedBinding(session, generation);
@@ -289,10 +319,8 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
             auto found = session->in_flight_deliveries.find(generation);
             if (found != session->in_flight_deliveries.end() && --found->second == 0)
                 session->in_flight_deliveries.erase(found);
+            finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), delivered);
             delivery_finished_.notify_all();
-            if (delivered)
-                session->published_response_watermark =
-                    std::max(session->published_response_watermark, protocol_v2::requestId(frame));
             if (session->binding_generation != generation)
                 return true;
             if (!delivered) {
@@ -364,7 +392,10 @@ bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::ui
         return true;
     if (consumed == std::numeric_limits<std::uint64_t>::max())
         return false;
-    if (consumed > session.published_response_watermark)
+    const bool speculative = consumed > session.published_response_watermark;
+    if (speculative && session.pending_response_ack && consumed <= *session.pending_response_ack)
+        return true;
+    if (speculative && !session.in_flight_response_deliveries.contains(consumed))
         return false;
     std::uint64_t expected = session.response_watermark + 1;
     while (expected <= consumed) {
@@ -374,14 +405,11 @@ bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::ui
             return false;
         ++expected;
     }
-    session.response_watermark = consumed;
-    session.pinned_responses.erase(session.pinned_responses.begin(), session.pinned_responses.upper_bound(consumed));
-    session.admitted_requests.erase(session.admitted_requests.begin(), session.admitted_requests.upper_bound(consumed));
-    if (session.state == SessionState::Closed && session.closed_final_response_pinned &&
-        session.pinned_responses.empty()) {
-        session.sender = {};
-        session.transport_name.clear();
+    if (speculative) {
+        session.pending_response_ack = consumed;
+        return true;
     }
+    reclaimResponsesLocked(session, consumed);
     return true;
 }
 

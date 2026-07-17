@@ -124,10 +124,12 @@ private:
         ResponseSender sender;
         std::uint64_t response_watermark{};
         std::uint64_t published_response_watermark{};
+        std::optional<std::uint64_t> pending_response_ack;
         bool closed_final_response_pinned{};
         std::optional<protocol_v2::CoherenceFrame> close_request;
         std::uint64_t binding_generation{};
         std::unordered_map<std::uint64_t, std::size_t> in_flight_deliveries;
+        std::unordered_map<std::uint64_t, std::size_t> in_flight_response_deliveries;
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> admitted_requests;
         std::map<std::uint64_t, PinnedResponse> pinned_responses;
         std::optional<std::uint64_t> unregister_request_id;
@@ -145,6 +147,8 @@ private:
                           ResponseSender staged_sender = {});
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                         const ResponseSender &sender);
+    void finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered);
+    void reclaimResponsesLocked(Session &session, std::uint64_t consumed);
     void retireFailedBinding(const std::shared_ptr<Session> &session, std::uint64_t generation);
     void waitForRetiredGeneration(std::unique_lock<std::mutex> &lock, const Session &session, std::uint64_t generation);
     static bool aligned(std::uint64_t line_address) noexcept;

@@ -560,6 +560,196 @@ void testAcknowledgementRequiresSuccessfulPublication() {
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
 }
 
+void testReentrantAcknowledgementDuringSuccessfulPublication() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool acknowledged = false;
+    const auto registered = registry.registerEndpoint(request(40, "tcp", [&](const CoherenceFrame &frame) {
+        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        return true;
+    }));
+    session_id = registered.session_id;
+
+    CHECK(pinHeartbeat(registry, session_id, 1, 40) == PinResponseResult::Pinned);
+    CHECK(acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+}
+
+void testReentrantAcknowledgementOfFinalUnregisterAllowsReplacement() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool acknowledged = false;
+    const auto registered = registry.registerEndpoint(request(41, "tcp", [&](const CoherenceFrame &frame) {
+        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 41);
+    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(41, session_id, unregister_request) == Status::Ok);
+
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+    CHECK(registry.registerEndpoint(request(41)).status == Status::Ok);
+}
+
+void testReentrantAcknowledgementWithFalseDeliveryRequiresReplay() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool acknowledged = false;
+    const auto registered = registry.registerEndpoint(request(42, "failing", [&](const CoherenceFrame &frame) {
+        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        return false;
+    }));
+    session_id = registered.session_id;
+
+    CHECK(pinHeartbeat(registry, session_id, 1, 42) == PinResponseResult::Pinned);
+    CHECK(acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 0);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
+
+    std::vector<std::uint64_t> replayed;
+    auto resume = request(42, "resumed", [&](const CoherenceFrame &frame) {
+        replayed.push_back(requestId(frame));
+        return true;
+    });
+    resume.requested_session_id = session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    CHECK(replayed == std::vector<std::uint64_t>{1});
+    CHECK(registry.responseWatermark(session_id) == 0);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
+    CHECK(registry.acknowledgeResponses(session_id, 1));
+}
+
+void testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool acknowledged = false;
+    const auto registered = registry.registerEndpoint(request(43, "throwing", [&](const CoherenceFrame &frame) {
+        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        throw std::runtime_error("delivery failed after ACK");
+        return true;
+    }));
+    session_id = registered.session_id;
+
+    bool propagated = false;
+    try {
+        (void)pinHeartbeat(registry, session_id, 1, 43);
+    } catch (const std::runtime_error &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    CHECK(acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 0);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
+
+    std::vector<std::uint64_t> replayed;
+    auto resume = request(43, "resumed", [&](const CoherenceFrame &frame) {
+        replayed.push_back(requestId(frame));
+        return true;
+    });
+    resume.requested_session_id = session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    CHECK(replayed == std::vector<std::uint64_t>{1});
+    CHECK(registry.responseWatermark(session_id) == 0);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
+    CHECK(registry.acknowledgeResponses(session_id, 1));
+}
+
+void testFuturePinnedResponseCannotBeAcknowledgedWhileEarlierResponseIsInFlight() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool future_acknowledged = true;
+    const auto registered = registry.registerEndpoint(request(44, "tcp", [&](const CoherenceFrame &frame) {
+        if (requestId(frame) == 1)
+            future_acknowledged = registry.acknowledgeResponses(session_id, 2);
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto first = protocolRequest(Opcode::Heartbeat, 1, session_id, 44);
+    const auto second = protocolRequest(Opcode::Heartbeat, 2, session_id, 44);
+    CHECK(registry.admitRequest(session_id, first) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, second) == RequestAdmissionResult::Accepted);
+    CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::Pinned);
+
+    CHECK(registry.pinResponse(session_id, first, response(first)) == PinResponseResult::Pinned);
+    CHECK(!future_acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 0);
+    CHECK(registry.pinnedResponseIds(session_id) == (std::vector<std::uint64_t>{1, 2}));
+}
+
+void testOverlappingDeliveryFailurePreservesAcknowledgementForSuccessfulAttempt() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool acknowledged = false;
+    bool disconnected = false;
+    Status nested_resume_status = Status::InvalidState;
+    std::size_t replacement_deliveries = 0;
+    const auto registered = registry.registerEndpoint(request(45, "old", [&](const CoherenceFrame &frame) {
+        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        disconnected = registry.disconnectAbruptly(45, session_id);
+        auto replacement = request(45, "replacement", [&](const CoherenceFrame &) {
+            ++replacement_deliveries;
+            return false;
+        });
+        replacement.requested_session_id = session_id;
+        nested_resume_status = registry.registerEndpoint(replacement).status;
+        return true;
+    }));
+    session_id = registered.session_id;
+
+    CHECK(pinHeartbeat(registry, session_id, 1, 45) == PinResponseResult::Pinned);
+    CHECK(acknowledged);
+    CHECK(disconnected);
+    CHECK(nested_resume_status == Status::IoError);
+    CHECK(replacement_deliveries == 1);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+}
+
+void testPublishedLowerAcknowledgementSurvivesHigherPendingFailure() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool higher_acknowledged = false;
+    bool lower_acknowledged = false;
+    std::vector<std::uint64_t> delivered;
+    const auto registered = registry.registerEndpoint(request(46, "tcp", [&](const CoherenceFrame &frame) {
+        const auto response_id = requestId(frame);
+        delivered.push_back(response_id);
+        if (response_id == 1)
+            return true;
+        higher_acknowledged = registry.acknowledgeResponses(session_id, 2);
+        lower_acknowledged = registry.acknowledgeResponses(session_id, 1);
+        return false;
+    }));
+    session_id = registered.session_id;
+    const auto first = protocolRequest(Opcode::Heartbeat, 1, session_id, 46);
+    const auto second = protocolRequest(Opcode::Heartbeat, 2, session_id, 46);
+    CHECK(registry.admitRequest(session_id, first) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, second) == RequestAdmissionResult::Accepted);
+
+    CHECK(registry.pinResponse(session_id, first, response(first)) == PinResponseResult::Pinned);
+    CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::Pinned);
+    CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
+    CHECK(higher_acknowledged);
+    CHECK(lower_acknowledged);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{2});
+
+    std::vector<std::uint64_t> replayed;
+    auto resume = request(46, "resumed", [&](const CoherenceFrame &frame) {
+        replayed.push_back(requestId(frame));
+        return true;
+    });
+    resume.requested_session_id = session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    CHECK(replayed == std::vector<std::uint64_t>{2});
+}
+
 void testPinResponseCorrelationAndConflict() {
     EndpointSessionRegistry registry;
     const auto first = registry.registerEndpoint(request(14));
@@ -1082,6 +1272,13 @@ int main() {
     testNestedThrowingReplayRestoresOuterDeliveryContext();
     testHeartbeatWatermark();
     testAcknowledgementRequiresSuccessfulPublication();
+    testReentrantAcknowledgementDuringSuccessfulPublication();
+    testReentrantAcknowledgementOfFinalUnregisterAllowsReplacement();
+    testReentrantAcknowledgementWithFalseDeliveryRequiresReplay();
+    testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay();
+    testFuturePinnedResponseCannotBeAcknowledgedWhileEarlierResponseIsInFlight();
+    testOverlappingDeliveryFailurePreservesAcknowledgementForSuccessfulAttempt();
+    testPublishedLowerAcknowledgementSurvivesHigherPendingFailure();
     testPinResponseCorrelationAndConflict();
     testHolderIndexesAndGracefulClose();
     testPinnedResponseBoundAndRecovery();
