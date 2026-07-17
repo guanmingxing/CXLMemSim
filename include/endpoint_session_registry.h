@@ -105,6 +105,8 @@ public:
     std::optional<SessionSnapshot> inspect(SessionId session_id) const;
 
 private:
+    using StoredResponseSender = std::shared_ptr<const ResponseSender>;
+
     struct PinnedResponse {
         protocol_v2::CoherenceFrame request;
         protocol_v2::CoherenceFrame response;
@@ -112,7 +114,7 @@ private:
 
     struct Session {
         Session(SessionId session_id, std::uint16_t host, std::uint64_t negotiated_capabilities, std::uint32_t capacity,
-                std::uint16_t ways, std::string transport, ResponseSender response_sender);
+                std::uint16_t ways, std::string transport, StoredResponseSender response_sender);
 
         SessionId id{};
         std::uint16_t host_id{};
@@ -121,7 +123,7 @@ private:
         std::uint32_t cache_capacity{};
         std::uint16_t cache_ways{};
         std::string transport_name;
-        ResponseSender sender;
+        StoredResponseSender sender;
         std::uint64_t response_watermark{};
         std::uint64_t published_response_watermark{};
         std::optional<std::uint64_t> pending_response_ack;
@@ -143,17 +145,18 @@ private:
 
     bool validHolderSession(const Session &session) const noexcept;
     bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
-    bool beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender,
-                          ResponseSender staged_sender = {});
+    bool beginDrainLocked(Session &session, std::uint64_t &generation, StoredResponseSender &sender,
+                          StoredResponseSender staged_sender);
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
-                        const ResponseSender &sender);
-    void finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered);
-    void reclaimResponsesLocked(Session &session, std::uint64_t consumed);
+                        const StoredResponseSender &sender);
+    StoredResponseSender finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered);
+    StoredResponseSender reclaimResponsesLocked(Session &session, std::uint64_t consumed);
     void retireFailedBinding(const std::shared_ptr<Session> &session, std::uint64_t generation);
     void waitForRetiredGeneration(std::unique_lock<std::mutex> &lock, const Session &session, std::uint64_t generation);
     static bool aligned(std::uint64_t line_address) noexcept;
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
     bool validRegistration(const RegistrationRequest &request) const noexcept;
+    static StoredResponseSender copySender(const ResponseSender &sender);
 
     const std::uint16_t max_hosts_;
     const std::size_t max_pinned_responses_per_session_;

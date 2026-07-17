@@ -8,10 +8,53 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace allocation_failure_test {
+thread_local bool failure_enabled = false;
+thread_local std::size_t allocations_before_failure = 0;
+
+void *allocate(std::size_t size) {
+    if (failure_enabled && allocations_before_failure-- == 0) {
+        failure_enabled = false;
+        throw std::bad_alloc();
+    }
+    if (void *allocation = std::malloc(size))
+        return allocation;
+    throw std::bad_alloc();
+}
+
+class ScopedAllocationFailure {
+public:
+    explicit ScopedAllocationFailure(std::size_t successful_allocations)
+        : previous_enabled_(failure_enabled), previous_count_(allocations_before_failure) {
+        failure_enabled = true;
+        allocations_before_failure = successful_allocations;
+    }
+
+    ~ScopedAllocationFailure() {
+        failure_enabled = previous_enabled_;
+        allocations_before_failure = previous_count_;
+    }
+
+private:
+    bool previous_enabled_;
+    std::size_t previous_count_;
+};
+
+void deallocate(void *allocation) noexcept { std::free(allocation); }
+} // namespace allocation_failure_test
+
+void *operator new(std::size_t size) { return allocation_failure_test::allocate(size); }
+void *operator new[](std::size_t size) { return allocation_failure_test::allocate(size); }
+void operator delete(void *allocation) noexcept { allocation_failure_test::deallocate(allocation); }
+void operator delete[](void *allocation) noexcept { allocation_failure_test::deallocate(allocation); }
+void operator delete(void *allocation, std::size_t) noexcept { allocation_failure_test::deallocate(allocation); }
+void operator delete[](void *allocation, std::size_t) noexcept { allocation_failure_test::deallocate(allocation); }
 
 using namespace cxlmemsim;
 using namespace cxlmemsim::protocol_v2;
@@ -69,6 +112,30 @@ struct ThrowOnNthCopySender {
         ++*deliveries;
         return true;
     }
+};
+
+struct InspectingCopySender {
+    EndpointSessionRegistry *registry;
+    SessionId inspected_session_id;
+    std::shared_ptr<std::atomic<bool>> inspect_on_copy;
+    std::shared_ptr<std::atomic<bool>> inspected;
+
+    InspectingCopySender(EndpointSessionRegistry *registry_to_inspect, SessionId session_id,
+                         std::shared_ptr<std::atomic<bool>> should_inspect,
+                         std::shared_ptr<std::atomic<bool>> did_inspect)
+        : registry(registry_to_inspect), inspected_session_id(session_id), inspect_on_copy(std::move(should_inspect)),
+          inspected(std::move(did_inspect)) {}
+    InspectingCopySender(const InspectingCopySender &other)
+        : registry(other.registry), inspected_session_id(other.inspected_session_id),
+          inspect_on_copy(other.inspect_on_copy), inspected(other.inspected) {
+        if (inspect_on_copy->load()) {
+            (void)registry->inspect(inspected_session_id);
+            inspected->store(true);
+        }
+    }
+    InspectingCopySender(InspectingCopySender &&) noexcept = default;
+
+    bool operator()(const CoherenceFrame &) const { return true; }
 };
 
 RegistrationRequest request(std::uint16_t host, std::string transport = "tcp", ResponseSender sender = {}) {
@@ -247,6 +314,104 @@ void testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId() {
     CHECK(retry.status == Status::Ok);
     CHECK(retry.session_id == 1);
     CHECK(*deliveries == 0);
+}
+
+void testFreshRegistrationRollsBackIfIndexInsertionThrows() {
+    bool observed_allocation_failure = false;
+    for (std::size_t successful_allocations = 0; successful_allocations < 32; ++successful_allocations) {
+        EndpointSessionRegistry registry;
+        bool propagated = false;
+        try {
+            allocation_failure_test::ScopedAllocationFailure failure(successful_allocations);
+            (void)registry.registerEndpoint(request(40));
+        } catch (const std::bad_alloc &) {
+            propagated = true;
+            observed_allocation_failure = true;
+        }
+        if (!propagated)
+            continue;
+
+        CHECK(!registry.inspect(1).has_value());
+        const auto retry = registry.registerEndpoint(request(40));
+        CHECK(retry.status == Status::Ok);
+        CHECK(retry.session_id == 1);
+        CHECK(registry.registerEndpoint(request(40)).status == Status::DuplicateHost);
+    }
+    CHECK(observed_allocation_failure);
+}
+
+void testSenderCopyCanInspectRegistryWithoutDeadlock() {
+    auto registry = std::make_shared<EndpointSessionRegistry>();
+    const auto existing = registry->registerEndpoint(request(41));
+    auto inspect_on_copy = std::make_shared<std::atomic<bool>>(false);
+    auto inspected = std::make_shared<std::atomic<bool>>(false);
+    ResponseSender sender{InspectingCopySender{registry.get(), existing.session_id, inspect_on_copy, inspected}};
+    auto registration = std::make_shared<RegistrationRequest>(request(42, "reentrant-copy", std::move(sender)));
+    inspect_on_copy->store(true);
+
+    auto completed = std::make_shared<std::promise<Status>>();
+    auto completion = completed->get_future();
+    std::thread worker([registry, registration, completed] {
+        try {
+            completed->set_value(registry->registerEndpoint(*registration).status);
+        } catch (...) {
+            completed->set_exception(std::current_exception());
+        }
+    });
+    if (completion.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
+        worker.detach();
+        CHECK(false && "sender copy deadlocked while re-entering inspect");
+        return;
+    }
+    worker.join();
+    CHECK(completion.get() == Status::Ok);
+    CHECK(inspected->load());
+}
+
+void testDisconnectRetainsSessionWhileClosedSessionIsReplaced() {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        EndpointSessionRegistry registry;
+        std::promise<void> old_delivery_entered;
+        std::promise<void> release_old_delivery;
+        const auto release = release_old_delivery.get_future().share();
+        const auto registered = registry.registerEndpoint(request(43, "old", [&](const CoherenceFrame &) {
+            old_delivery_entered.set_value();
+            release.wait();
+            return true;
+        }));
+        const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 43);
+        const auto unregister_request = protocolRequest(Opcode::Unregister, 2, registered.session_id, 43);
+        CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+        CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+
+        auto old_publish = std::async(std::launch::async, [&] {
+            return registry.pinResponse(registered.session_id, heartbeat, response(heartbeat));
+        });
+        CHECK(old_delivery_entered.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+        auto disconnect =
+            std::async(std::launch::async, [&] { return registry.disconnectAbruptly(43, registered.session_id); });
+
+        const auto offline_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (registry.inspect(registered.session_id)->state != SessionState::OfflineRetained &&
+               std::chrono::steady_clock::now() < offline_deadline)
+            std::this_thread::yield();
+        CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
+
+        auto resume = request(43, "resumed", [](const CoherenceFrame &) { return true; });
+        resume.requested_session_id = registered.session_id;
+        CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+        CHECK(registry.gracefulClose(43, registered.session_id, unregister_request) == Status::Ok);
+        CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
+              PinResponseResult::Pinned);
+        CHECK(registry.acknowledgeResponses(registered.session_id, 2));
+
+        const auto replacement = registry.registerEndpoint(request(43));
+        CHECK(replacement.status == Status::Ok);
+        CHECK(replacement.session_id == 2);
+        release_old_delivery.set_value();
+        CHECK(old_publish.get() == PinResponseResult::Pinned);
+        CHECK(disconnect.get());
+    }
 }
 
 void testReplacementSenderCopyFailurePreservesClosedSession() {
@@ -1261,6 +1426,9 @@ int main() {
     testFreshRegistrationAndValidation();
     testDisconnectResumeAndReplay();
     testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId();
+    testFreshRegistrationRollsBackIfIndexInsertionThrows();
+    testSenderCopyCanInspectRegistryWithoutDeadlock();
+    testDisconnectRetainsSessionWhileClosedSessionIsReplaced();
     testReplacementSenderCopyFailurePreservesClosedSession();
     testResumeSenderCopyFailurePreservesOfflineBinding();
     testResumeDrainCopyFailurePreservesOfflineBinding();

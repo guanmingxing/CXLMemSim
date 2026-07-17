@@ -22,7 +22,8 @@ bool sameFrame(const protocol_v2::CoherenceFrame &a, const protocol_v2::Coherenc
 
 EndpointSessionRegistry::Session::Session(SessionId session_id, std::uint16_t host,
                                           std::uint64_t negotiated_capabilities, std::uint32_t capacity,
-                                          std::uint16_t ways, std::string transport, ResponseSender response_sender)
+                                          std::uint16_t ways, std::string transport,
+                                          StoredResponseSender response_sender)
     : id(session_id), host_id(host), capabilities(negotiated_capabilities), cache_capacity(capacity), cache_ways(ways),
       transport_name(std::move(transport)), sender(std::move(response_sender)) {}
 
@@ -31,81 +32,160 @@ EndpointSessionRegistry::EndpointSessionRegistry(std::uint16_t max_hosts, std::s
       max_pinned_responses_per_session_(limit == 0 ? 1 : limit) {}
 
 RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationRequest &request) {
-    std::shared_ptr<Session> session;
-    RegistrationResult result;
-    std::uint64_t generation{};
-    ResponseSender sender;
-    {
-        std::lock_guard lock(mutex_);
-        if (request.host_id >= max_hosts_)
-            return {.status = protocol_v2::Status::InvalidState};
-        if ((request.capabilities & ~protocol_v2::kKnownCapabilities) != 0 || (request.capabilities & kModelSnoop) == 0)
-            return {.status = protocol_v2::Status::NoCapability};
-        if (!validRegistration(request))
-            return {.status = protocol_v2::Status::InvalidState};
+    if (request.host_id >= max_hosts_)
+        return {.status = protocol_v2::Status::InvalidState};
+    if ((request.capabilities & ~protocol_v2::kKnownCapabilities) != 0 || (request.capabilities & kModelSnoop) == 0)
+        return {.status = protocol_v2::Status::NoCapability};
+    if (!validRegistration(request))
+        return {.status = protocol_v2::Status::InvalidState};
 
-        if (request.requested_session_id == 0) {
-            const auto host = host_sessions_.find(request.host_id);
-            if (host != host_sessions_.end()) {
-                const auto old = sessions_.at(host->second);
-                if (old->state != SessionState::Closed || !old->closed_final_response_pinned ||
-                    !old->pinned_responses.empty())
-                    return {.status = protocol_v2::Status::DuplicateHost};
+    if (request.requested_session_id == 0) {
+        for (;;) {
+            std::shared_ptr<Session> expected_old;
+            SessionId id;
+            {
+                std::lock_guard lock(mutex_);
+                const auto host = host_sessions_.find(request.host_id);
+                if (host != host_sessions_.end()) {
+                    expected_old = sessions_.at(host->second);
+                    if (expected_old->state != SessionState::Closed || !expected_old->closed_final_response_pinned ||
+                        !expected_old->pinned_responses.empty())
+                        return {.status = protocol_v2::Status::DuplicateHost};
+                }
+                if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max())
+                    return {.status = protocol_v2::Status::InvalidState};
+                id = next_session_id_;
             }
-            if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max())
-                return {.status = protocol_v2::Status::InvalidState};
-            ResponseSender staged_sender = request.sender;
+
+            auto staged_sender = copySender(request.sender);
             std::string staged_transport = request.transport_name;
-            const auto id = next_session_id_;
-            session = std::make_shared<Session>(
+            auto session = std::make_shared<Session>(
                 id, request.host_id, request.capabilities & protocol_v2::kSupportedCapabilities, request.cache_capacity,
                 request.cache_ways, std::move(staged_transport), std::move(staged_sender));
-            if (host != host_sessions_.end()) {
-                sessions_.erase(host->second);
-                host_sessions_.erase(host);
+            std::shared_ptr<Session> retired_session;
+            RegistrationResult result;
+            bool retry = false;
+            {
+                std::lock_guard lock(mutex_);
+                const auto host = host_sessions_.find(request.host_id);
+                const bool host_changed =
+                    (!expected_old && host != host_sessions_.end()) ||
+                    (expected_old &&
+                     (host == host_sessions_.end() || sessions_.at(host->second) != expected_old ||
+                      expected_old->state != SessionState::Closed || !expected_old->closed_final_response_pinned ||
+                      !expected_old->pinned_responses.empty()));
+                if (host_changed || next_session_id_ != id) {
+                    retry = true;
+                } else {
+                    const auto [session_position, session_inserted] = sessions_.emplace(id, session);
+                    if (!session_inserted) {
+                        retry = true;
+                    } else {
+                        try {
+                            if (host == host_sessions_.end()) {
+                                const auto [unused, host_inserted] = host_sessions_.emplace(request.host_id, id);
+                                (void)unused;
+                                if (!host_inserted) {
+                                    sessions_.erase(session_position);
+                                    retry = true;
+                                }
+                            } else {
+                                host->second = id;
+                            }
+                        } catch (...) {
+                            sessions_.erase(session_position);
+                            throw;
+                        }
+                        if (!retry) {
+                            if (expected_old) {
+                                retired_session = expected_old;
+                                sessions_.erase(expected_old->id);
+                            }
+                            ++next_session_id_;
+                            result = resultFor(*session, protocol_v2::Status::Ok);
+                        }
+                    }
+                }
             }
-            ++next_session_id_;
-            sessions_.emplace(id, session);
-            host_sessions_.emplace(request.host_id, id);
-            return resultFor(*session, protocol_v2::Status::Ok);
+            if (!retry)
+                return result;
+        }
+    }
+
+    for (;;) {
+        std::shared_ptr<Session> session;
+        SessionState observed_state;
+        std::uint64_t observed_generation;
+        std::uint64_t staged_publication_cursor;
+        bool stage_drain;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = sessions_.find(request.requested_session_id);
+            if (found == sessions_.end())
+                return {.status = protocol_v2::Status::StaleSession};
+            session = found->second;
+            if ((session->state == SessionState::Active ||
+                 (session->state == SessionState::Closed && session->sender)) &&
+                session->host_id == request.host_id)
+                return resultFor(*session, protocol_v2::Status::DuplicateHost);
+            const bool closed_replay_pending =
+                session->state == SessionState::Closed && !session->sender &&
+                (!session->closed_final_response_pinned || !session->pinned_responses.empty());
+            if ((session->state != SessionState::OfflineRetained && !closed_replay_pending) ||
+                session->host_id != request.host_id || session->capabilities != request.capabilities ||
+                session->cache_capacity != request.cache_capacity || session->cache_ways != request.cache_ways)
+                return {.status = protocol_v2::Status::StaleSession};
+            if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
+                return {.status = protocol_v2::Status::InvalidState};
+            observed_state = session->state;
+            observed_generation = session->binding_generation;
+            staged_publication_cursor = session->response_watermark + 1;
+            stage_drain =
+                request.sender && !session->publishing && session->pinned_responses.contains(staged_publication_cursor);
         }
 
-        const auto found = sessions_.find(request.requested_session_id);
-        if (found == sessions_.end())
-            return {.status = protocol_v2::Status::StaleSession};
-        session = found->second;
-        if ((session->state == SessionState::Active || (session->state == SessionState::Closed && session->sender)) &&
-            session->host_id == request.host_id)
-            return resultFor(*session, protocol_v2::Status::DuplicateHost);
-        const bool closed_replay_pending =
-            session->state == SessionState::Closed && !session->sender &&
-            (!session->closed_final_response_pinned || !session->pinned_responses.empty());
-        if ((session->state != SessionState::OfflineRetained && !closed_replay_pending) ||
-            session->host_id != request.host_id || session->capabilities != request.capabilities ||
-            session->cache_capacity != request.cache_capacity || session->cache_ways != request.cache_ways)
-            return {.status = protocol_v2::Status::StaleSession};
-        if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
-            return {.status = protocol_v2::Status::InvalidState};
-        ResponseSender staged_sender = request.sender;
+        auto staged_sender = copySender(request.sender);
         std::string staged_transport = request.transport_name;
-        const auto staged_publication_cursor = session->response_watermark + 1;
-        ResponseSender staged_drain_sender;
-        if (staged_sender && !session->publishing && session->pinned_responses.contains(staged_publication_cursor))
-            staged_drain_sender = staged_sender;
-        ++session->binding_generation;
-        generation = session->binding_generation;
-        if (session->state == SessionState::OfflineRetained)
-            session->state = SessionState::Active;
-        session->transport_name = std::move(staged_transport);
-        session->sender = std::move(staged_sender);
-        session->publication_cursor = staged_publication_cursor;
-        result = resultFor(*session, protocol_v2::Status::Ok);
-        (void)beginDrainLocked(*session, generation, sender, std::move(staged_drain_sender));
+        StoredResponseSender staged_drain_sender;
+        if (stage_drain)
+            staged_drain_sender = copySender(*staged_sender);
+
+        StoredResponseSender sender;
+        StoredResponseSender retired_sender;
+        RegistrationResult result;
+        std::uint64_t generation{};
+        bool retry = false;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = sessions_.find(request.requested_session_id);
+            const bool state_changed = found == sessions_.end() || found->second != session ||
+                                       session->state != observed_state ||
+                                       session->binding_generation != observed_generation ||
+                                       staged_publication_cursor != session->response_watermark + 1 ||
+                                       stage_drain != (request.sender && !session->publishing &&
+                                                       session->pinned_responses.contains(staged_publication_cursor));
+            if (state_changed) {
+                retry = true;
+            } else {
+                ++session->binding_generation;
+                generation = session->binding_generation;
+                if (session->state == SessionState::OfflineRetained)
+                    session->state = SessionState::Active;
+                session->transport_name = std::move(staged_transport);
+                retired_sender = std::move(session->sender);
+                session->sender = std::move(staged_sender);
+                session->publication_cursor = staged_publication_cursor;
+                result = resultFor(*session, protocol_v2::Status::Ok);
+                if (stage_drain)
+                    (void)beginDrainLocked(*session, generation, sender, std::move(staged_drain_sender));
+            }
+        }
+        if (retry)
+            continue;
+        if (sender && !drainResponses(session, generation, sender))
+            result.status = protocol_v2::Status::IoError;
+        return result;
     }
-    if (sender && !drainResponses(session, generation, sender)) {
-        result.status = protocol_v2::Status::IoError;
-    }
-    return result;
 }
 
 std::size_t localDeliveryCount(const EndpointSessionRegistry *registry, SessionId session_id,
@@ -125,6 +205,8 @@ void EndpointSessionRegistry::waitForRetiredGeneration(std::unique_lock<std::mut
 }
 
 bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionId session_id) {
+    StoredResponseSender retired_sender;
+    std::shared_ptr<Session> session;
     std::unique_lock lock(mutex_);
     const auto found = sessions_.find(session_id);
     const bool closed_replay_pending =
@@ -133,47 +215,49 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
     if (found == sessions_.end() || found->second->host_id != host_id ||
         (found->second->state != SessionState::Active && !closed_replay_pending))
         return false;
-    auto &session = *found->second;
-    if (session.binding_generation == std::numeric_limits<std::uint64_t>::max())
+    session = found->second;
+    if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
         return false;
-    const auto retired = session.binding_generation;
-    if (session.state == SessionState::Active)
-        session.state = SessionState::OfflineRetained;
-    session.sender = {};
-    session.transport_name.clear();
-    session.publishing = false;
-    ++session.binding_generation;
-    waitForRetiredGeneration(lock, session, retired);
+    const auto retired = session->binding_generation;
+    if (session->state == SessionState::Active)
+        session->state = SessionState::OfflineRetained;
+    retired_sender = std::move(session->sender);
+    session->transport_name.clear();
+    session->publishing = false;
+    ++session->binding_generation;
+    waitForRetiredGeneration(lock, *session, retired);
     return true;
 }
 
 protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id, SessionId session_id,
                                                            const protocol_v2::CoherenceFrame &unregister_request) {
+    std::shared_ptr<Session> session;
     std::unique_lock lock(mutex_);
     const auto found = sessions_.find(session_id);
     if (found == sessions_.end() || found->second->host_id != host_id)
         return protocol_v2::Status::StaleSession;
-    auto &session = *found->second;
+    session = found->second;
     const auto id = protocol_v2::requestId(unregister_request);
-    const auto admitted = session.admitted_requests.find(id);
-    if (session.state != SessionState::Active || !session.clean_holders.empty() || !session.modified_holders.empty() ||
+    const auto admitted = session->admitted_requests.find(id);
+    if (session->state != SessionState::Active || !session->clean_holders.empty() ||
+        !session->modified_holders.empty() ||
         protocol_v2::opcode(unregister_request) != protocol_v2::Opcode::Unregister ||
-        admitted == session.admitted_requests.end() || !sameFrame(admitted->second, unregister_request) ||
-        session.unregister_request_id != id ||
-        session.admitted_requests.upper_bound(id) != session.admitted_requests.end() ||
-        session.binding_generation == std::numeric_limits<std::uint64_t>::max())
+        admitted == session->admitted_requests.end() || !sameFrame(admitted->second, unregister_request) ||
+        session->unregister_request_id != id ||
+        session->admitted_requests.upper_bound(id) != session->admitted_requests.end() ||
+        session->binding_generation == std::numeric_limits<std::uint64_t>::max())
         return protocol_v2::Status::InvalidState;
-    for (auto lower = session.admitted_requests.begin(); lower != admitted; ++lower) {
-        if (!session.pinned_responses.contains(lower->first))
+    for (auto lower = session->admitted_requests.begin(); lower != admitted; ++lower) {
+        if (!session->pinned_responses.contains(lower->first))
             return protocol_v2::Status::InvalidState;
     }
-    const auto retired = session.binding_generation;
-    ++session.binding_generation;
-    session.state = SessionState::Closed;
-    session.close_request = unregister_request;
-    session.closed_final_response_pinned = session.pinned_responses.contains(id);
-    session.publishing = false;
-    waitForRetiredGeneration(lock, session, retired);
+    const auto retired = session->binding_generation;
+    ++session->binding_generation;
+    session->state = SessionState::Closed;
+    session->close_request = unregister_request;
+    session->closed_final_response_pinned = session->pinned_responses.contains(id);
+    session->publishing = false;
+    waitForRetiredGeneration(lock, *session, retired);
     return protocol_v2::Status::Ok;
 }
 
@@ -220,14 +304,12 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     return RequestAdmissionResult::Accepted;
 }
 
-bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation, ResponseSender &sender,
-                                               ResponseSender staged_sender) {
+bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation,
+                                               StoredResponseSender &sender, StoredResponseSender staged_sender) {
     const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Closed;
-    if (!deliverable_state || !session.sender || session.publishing ||
+    if (!deliverable_state || !session.sender || !staged_sender || session.publishing ||
         !session.pinned_responses.contains(session.publication_cursor))
         return false;
-    if (!staged_sender)
-        staged_sender = session.sender;
     sender = std::move(staged_sender);
     generation = session.binding_generation;
     session.publishing = true;
@@ -236,30 +318,37 @@ bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &
 }
 
 void EndpointSessionRegistry::retireFailedBinding(const std::shared_ptr<Session> &session, std::uint64_t generation) {
-    std::lock_guard lock(mutex_);
-    if (session->binding_generation != generation)
-        return;
-    if (session->binding_generation != std::numeric_limits<std::uint64_t>::max())
-        ++session->binding_generation;
-    if (session->state != SessionState::Closed)
-        session->state = SessionState::OfflineRetained;
-    session->sender = {};
-    session->transport_name.clear();
-    session->publishing = false;
+    StoredResponseSender retired_sender;
+    {
+        std::lock_guard lock(mutex_);
+        if (session->binding_generation != generation)
+            return;
+        if (session->binding_generation != std::numeric_limits<std::uint64_t>::max())
+            ++session->binding_generation;
+        if (session->state != SessionState::Closed)
+            session->state = SessionState::OfflineRetained;
+        retired_sender = std::move(session->sender);
+        session->transport_name.clear();
+        session->publishing = false;
+    }
 }
 
-void EndpointSessionRegistry::reclaimResponsesLocked(Session &session, std::uint64_t consumed) {
+EndpointSessionRegistry::StoredResponseSender EndpointSessionRegistry::reclaimResponsesLocked(Session &session,
+                                                                                              std::uint64_t consumed) {
     session.response_watermark = consumed;
     session.pinned_responses.erase(session.pinned_responses.begin(), session.pinned_responses.upper_bound(consumed));
     session.admitted_requests.erase(session.admitted_requests.begin(), session.admitted_requests.upper_bound(consumed));
     if (session.state == SessionState::Closed && session.closed_final_response_pinned &&
         session.pinned_responses.empty()) {
-        session.sender = {};
+        auto retired_sender = std::move(session.sender);
         session.transport_name.clear();
+        return retired_sender;
     }
+    return {};
 }
 
-void EndpointSessionRegistry::finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered) {
+EndpointSessionRegistry::StoredResponseSender
+EndpointSessionRegistry::finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered) {
     const auto found = session.in_flight_response_deliveries.find(response_id);
     if (found != session.in_flight_response_deliveries.end() && --found->second == 0)
         session.in_flight_response_deliveries.erase(found);
@@ -267,17 +356,19 @@ void EndpointSessionRegistry::finishDeliveryAttemptLocked(Session &session, std:
     if (delivered) {
         session.published_response_watermark = std::max(session.published_response_watermark, response_id);
         if (session.pending_response_ack && *session.pending_response_ack <= session.published_response_watermark) {
-            reclaimResponsesLocked(session, *session.pending_response_ack);
+            auto retired_sender = reclaimResponsesLocked(session, *session.pending_response_ack);
             session.pending_response_ack.reset();
+            return retired_sender;
         }
     } else if (session.pending_response_ack && *session.pending_response_ack > session.published_response_watermark &&
                !session.in_flight_response_deliveries.contains(*session.pending_response_ack)) {
         session.pending_response_ack.reset();
     }
+    return {};
 }
 
 bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
-                                             const ResponseSender &sender) {
+                                             const StoredResponseSender &sender) {
     for (;;) {
         protocol_v2::CoherenceFrame frame;
         {
@@ -299,27 +390,29 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
         delivery_stack.push_back({this, session->id, generation});
         bool delivered;
         try {
-            delivered = sender(frame);
+            delivered = (*sender)(frame);
         } catch (...) {
             delivery_stack.pop_back();
+            StoredResponseSender retired_sender;
             {
                 std::lock_guard lock(mutex_);
                 auto found = session->in_flight_deliveries.find(generation);
                 if (found != session->in_flight_deliveries.end() && --found->second == 0)
                     session->in_flight_deliveries.erase(found);
-                finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), false);
+                retired_sender = finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), false);
                 delivery_finished_.notify_all();
             }
             retireFailedBinding(session, generation);
             throw;
         }
         delivery_stack.pop_back();
+        StoredResponseSender retired_sender;
         {
             std::lock_guard lock(mutex_);
             auto found = session->in_flight_deliveries.find(generation);
             if (found != session->in_flight_deliveries.end() && --found->second == 0)
                 session->in_flight_deliveries.erase(found);
-            finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), delivered);
+            retired_sender = finishDeliveryAttemptLocked(*session, protocol_v2::requestId(frame), delivered);
             delivery_finished_.notify_all();
             if (session->binding_generation != generation)
                 return true;
@@ -340,7 +433,8 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
                                                        const protocol_v2::CoherenceFrame &response_frame) {
     std::shared_ptr<Session> session;
     std::uint64_t generation{};
-    ResponseSender sender;
+    std::uint64_t observed_generation{};
+    StoredResponseSender sender_to_copy;
     PinResponseResult result = PinResponseResult::Pinned;
     {
         std::lock_guard lock(mutex_);
@@ -375,7 +469,21 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
             if (session->state == SessionState::Closed)
                 session->closed_final_response_pinned = true;
         }
-        (void)beginDrainLocked(*session, generation, sender);
+        const bool deliverable_state = session->state == SessionState::Active || session->state == SessionState::Closed;
+        if (deliverable_state && session->sender && !session->publishing &&
+            session->pinned_responses.contains(session->publication_cursor)) {
+            sender_to_copy = session->sender;
+            observed_generation = session->binding_generation;
+        }
+    }
+    StoredResponseSender staged_sender;
+    if (sender_to_copy)
+        staged_sender = copySender(*sender_to_copy);
+    StoredResponseSender sender;
+    if (staged_sender) {
+        std::lock_guard lock(mutex_);
+        if (session->binding_generation == observed_generation && session->sender == sender_to_copy)
+            (void)beginDrainLocked(*session, generation, sender, std::move(staged_sender));
     }
     if (sender)
         (void)drainResponses(session, generation, sender);
@@ -383,6 +491,7 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
 }
 
 bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::uint64_t consumed) {
+    StoredResponseSender retired_sender;
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(session_id);
     if (found == sessions_.end())
@@ -409,7 +518,7 @@ bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::ui
         session.pending_response_ack = consumed;
         return true;
     }
-    reclaimResponsesLocked(session, consumed);
+    retired_sender = reclaimResponsesLocked(session, consumed);
     return true;
 }
 
@@ -532,5 +641,8 @@ bool EndpointSessionRegistry::validRegistration(const RegistrationRequest &r) co
     return r.cache_capacity >= protocol_v2::kLineSize && r.cache_ways != 0 &&
            r.cache_capacity % protocol_v2::kLineSize == 0 &&
            (r.cache_capacity / protocol_v2::kLineSize) % r.cache_ways == 0;
+}
+EndpointSessionRegistry::StoredResponseSender EndpointSessionRegistry::copySender(const ResponseSender &sender) {
+    return sender ? std::make_shared<const ResponseSender>(sender) : nullptr;
 }
 } // namespace cxlmemsim
