@@ -123,6 +123,7 @@ private:
         std::string transport_name;
         ResponseSender sender;
         std::uint64_t response_watermark{};
+        std::uint64_t published_response_watermark{};
         bool closed_final_response_pinned{};
         std::optional<protocol_v2::CoherenceFrame> close_request;
         std::uint64_t binding_generation{};

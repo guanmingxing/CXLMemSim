@@ -70,17 +70,22 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         if (found == sessions_.end())
             return {.status = protocol_v2::Status::StaleSession};
         session = found->second;
-        if (session->state == SessionState::Active && session->host_id == request.host_id)
+        if ((session->state == SessionState::Active || (session->state == SessionState::Closed && session->sender)) &&
+            session->host_id == request.host_id)
             return resultFor(*session, protocol_v2::Status::DuplicateHost);
-        if (session->state != SessionState::OfflineRetained || session->host_id != request.host_id ||
-            session->capabilities != request.capabilities || session->cache_capacity != request.cache_capacity ||
-            session->cache_ways != request.cache_ways)
+        const bool closed_replay_pending =
+            session->state == SessionState::Closed && !session->sender &&
+            (!session->closed_final_response_pinned || !session->pinned_responses.empty());
+        if ((session->state != SessionState::OfflineRetained && !closed_replay_pending) ||
+            session->host_id != request.host_id || session->capabilities != request.capabilities ||
+            session->cache_capacity != request.cache_capacity || session->cache_ways != request.cache_ways)
             return {.status = protocol_v2::Status::StaleSession};
         if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
             return {.status = protocol_v2::Status::InvalidState};
         ++session->binding_generation;
         generation = session->binding_generation;
-        session->state = SessionState::Active;
+        if (session->state == SessionState::OfflineRetained)
+            session->state = SessionState::Active;
         session->transport_name = request.transport_name;
         session->sender = request.sender;
         session->publication_cursor = session->response_watermark + 1;
@@ -112,13 +117,18 @@ void EndpointSessionRegistry::waitForRetiredGeneration(std::unique_lock<std::mut
 bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionId session_id) {
     std::unique_lock lock(mutex_);
     const auto found = sessions_.find(session_id);
-    if (found == sessions_.end() || found->second->host_id != host_id || found->second->state != SessionState::Active)
+    const bool closed_replay_pending =
+        found != sessions_.end() && found->second->state == SessionState::Closed &&
+        (!found->second->closed_final_response_pinned || !found->second->pinned_responses.empty());
+    if (found == sessions_.end() || found->second->host_id != host_id ||
+        (found->second->state != SessionState::Active && !closed_replay_pending))
         return false;
     auto &session = *found->second;
     if (session.binding_generation == std::numeric_limits<std::uint64_t>::max())
         return false;
     const auto retired = session.binding_generation;
-    session.state = SessionState::OfflineRetained;
+    if (session.state == SessionState::Active)
+        session.state = SessionState::OfflineRetained;
     session.sender = {};
     session.transport_name.clear();
     session.publishing = false;
@@ -141,10 +151,15 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
         admitted == session.admitted_requests.end() || !sameFrame(admitted->second, unregister_request) ||
         session.binding_generation == std::numeric_limits<std::uint64_t>::max())
         return protocol_v2::Status::InvalidState;
+    for (auto lower = session.admitted_requests.begin(); lower != admitted; ++lower) {
+        if (!session.pinned_responses.contains(lower->first))
+            return protocol_v2::Status::InvalidState;
+    }
     const auto retired = session.binding_generation;
     ++session.binding_generation;
     session.state = SessionState::Closed;
     session.close_request = unregister_request;
+    session.closed_final_response_pinned = session.pinned_responses.contains(id);
     session.publishing = false;
     waitForRetiredGeneration(lock, session, retired);
     return protocol_v2::Status::Ok;
@@ -207,7 +222,8 @@ void EndpointSessionRegistry::retireFailedBinding(const std::shared_ptr<Session>
         return;
     if (session->binding_generation != std::numeric_limits<std::uint64_t>::max())
         ++session->binding_generation;
-    session->state = SessionState::OfflineRetained;
+    if (session->state != SessionState::Closed)
+        session->state = SessionState::OfflineRetained;
     session->sender = {};
     session->transport_name.clear();
     session->publishing = false;
@@ -255,6 +271,9 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
             if (found != session->in_flight_deliveries.end() && --found->second == 0)
                 session->in_flight_deliveries.erase(found);
             delivery_finished_.notify_all();
+            if (delivered)
+                session->published_response_watermark =
+                    std::max(session->published_response_watermark, protocol_v2::requestId(frame));
             if (session->binding_generation != generation)
                 return true;
             if (!delivered) {
@@ -291,6 +310,8 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
                                                      : PinResponseResult::InvalidResponse;
         if (!sameFrame(admitted->second, request))
             return PinResponseResult::Conflict;
+        if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister && session->state != SessionState::Closed)
+            return PinResponseResult::InvalidResponse;
         if (const auto existing = session->pinned_responses.find(id); existing != session->pinned_responses.end())
             return sameFrame(existing->second.request, request) && sameFrame(existing->second.response, response_frame)
                        ? PinResponseResult::Duplicate
@@ -321,6 +342,8 @@ bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::ui
     if (consumed <= session.response_watermark)
         return true;
     if (consumed == std::numeric_limits<std::uint64_t>::max())
+        return false;
+    if (consumed > session.published_response_watermark)
         return false;
     std::uint64_t expected = session.response_watermark + 1;
     while (expected <= consumed) {

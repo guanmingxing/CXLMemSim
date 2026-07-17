@@ -256,6 +256,8 @@ void testCallbackCanDisconnectItsOwnBinding() {
     CHECK(replay.get().status == Status::Ok);
     CHECK(replayed == std::vector<std::uint64_t>{1});
     CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{2});
 }
 
 void testThrowingReplayReleasesItsBinding() {
@@ -312,7 +314,7 @@ void testNestedThrowingReplayRestoresOuterDeliveryContext() {
 
 void testHeartbeatWatermark() {
     EndpointSessionRegistry registry;
-    const auto registered = registry.registerEndpoint(request(2));
+    const auto registered = registry.registerEndpoint(request(2, "tcp", [](const CoherenceFrame &) { return true; }));
     const auto one = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 2);
     const auto two = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 2);
     const auto three = protocolRequest(Opcode::Heartbeat, 3, registered.session_id, 2);
@@ -343,6 +345,29 @@ void testHeartbeatWatermark() {
     CHECK(!registry.acknowledgeResponses(registered.session_id, std::numeric_limits<std::uint64_t>::max()));
     CHECK(registry.responseWatermark(registered.session_id) == 4);
     CHECK(registry.replayFloor(registered.session_id) == 5);
+}
+
+void testAcknowledgementRequiresSuccessfulPublication() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(27));
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 27);
+    CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.pinResponse(registered.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Pinned);
+    CHECK(!registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.responseWatermark(registered.session_id) == 0);
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+
+    CHECK(registry.disconnectAbruptly(27, registered.session_id));
+    std::vector<std::uint64_t> replayed;
+    auto resume = request(27, "tcp-resumed", [&](const CoherenceFrame &frame) {
+        replayed.push_back(requestId(frame));
+        return true;
+    });
+    resume.requested_session_id = registered.session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    CHECK(replayed == std::vector<std::uint64_t>{1});
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.pinnedResponseIds(registered.session_id).empty());
 }
 
 void testPinResponseCorrelationAndConflict() {
@@ -440,7 +465,7 @@ void testHolderIndexesAndGracefulClose() {
 
 void testPinnedResponseBoundAndRecovery() {
     EndpointSessionRegistry registry(64, 2);
-    const auto registered = registry.registerEndpoint(request(11));
+    const auto registered = registry.registerEndpoint(request(11, "tcp", [](const CoherenceFrame &) { return true; }));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 11) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, registered.session_id, 2, 11) == PinResponseResult::Pinned);
     const auto full = registry.inspect(registered.session_id);
@@ -583,10 +608,9 @@ void testNestedRetirementSkipsOuterDeliveryFrames() {
         const auto inner = registry.registerEndpoint(request(24));
         CoherenceFrame outer_request;
         if (close_outer) {
-            outer_request = protocolRequest(Opcode::Unregister, 1, outer.session_id, 23);
+            CHECK(pinHeartbeat(registry, outer.session_id, 1, 23) == PinResponseResult::Pinned);
+            outer_request = protocolRequest(Opcode::Unregister, 2, outer.session_id, 23);
             CHECK(registry.admitRequest(outer.session_id, outer_request) == RequestAdmissionResult::Accepted);
-            CHECK(registry.pinResponse(outer.session_id, outer_request, response(outer_request)) ==
-                  PinResponseResult::Pinned);
         } else {
             CHECK(pinHeartbeat(registry, outer.session_id, 1, 23) == PinResponseResult::Pinned);
         }
@@ -667,6 +691,157 @@ void testRequestSpecificCloseAndHolderBound() {
           PinResponseResult::Pinned);
 }
 
+void testUnregisterResponseRequiresClosedIntent() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    std::vector<std::uint64_t> delivered;
+    bool delivered_while_closed = false;
+    const auto registered = registry.registerEndpoint(request(32, "tcp", [&](const CoherenceFrame &frame) {
+        delivered_while_closed = registry.inspect(session_id)->state == SessionState::Closed;
+        delivered.push_back(requestId(frame));
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 32);
+    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
+
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::InvalidResponse);
+    CHECK(delivered.empty());
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+    CHECK(registry.inspect(session_id)->state == SessionState::Active);
+
+    CHECK(registry.gracefulClose(32, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(delivered == std::vector<std::uint64_t>{1});
+    CHECK(delivered_while_closed);
+    CHECK(registry.inspect(session_id)->state == SessionState::Closed);
+}
+
+void testClosedFinalResponsePublishesAndRemainsPinnedUntilAck() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    bool delivered_while_closed = false;
+    const auto registered = registry.registerEndpoint(request(28, "tcp", [&](const CoherenceFrame &frame) {
+        delivered_while_closed = registry.inspect(session_id)->state == SessionState::Closed;
+        CHECK(requestId(frame) == 1);
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 28);
+    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(28, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(delivered_while_closed);
+    CHECK(registry.inspect(session_id)->state == SessionState::Closed);
+    CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
+    CHECK(registry.registerEndpoint(request(28)).status == Status::DuplicateHost);
+    CHECK(registry.acknowledgeResponses(session_id, 1));
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+    CHECK(registry.registerEndpoint(request(28)).status == Status::Ok);
+}
+
+void testClosedFinalSendFailureResumesWithoutReopeningAdmission() {
+    for (const bool throws : {false, true}) {
+        EndpointSessionRegistry registry;
+        const auto registered = registry.registerEndpoint(request(29, "failing", [=](const CoherenceFrame &) {
+            if (throws)
+                throw std::runtime_error("closed final delivery failed");
+            return false;
+        }));
+        const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 29);
+        CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+        CHECK(registry.gracefulClose(29, registered.session_id, unregister_request) == Status::Ok);
+        bool propagated = false;
+        try {
+            CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
+                  PinResponseResult::Pinned);
+        } catch (const std::runtime_error &) {
+            propagated = true;
+        }
+        CHECK(propagated == throws);
+        const auto failed = registry.inspect(registered.session_id);
+        CHECK(failed->state == SessionState::Closed);
+        CHECK(!failed->has_sender);
+        CHECK(failed->transport_name.empty());
+        CHECK(registry.admitRequest(registered.session_id,
+                                    protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 29)) ==
+              RequestAdmissionResult::InvalidRequest);
+        CHECK(registry.registerEndpoint(request(29)).status == Status::DuplicateHost);
+
+        std::vector<std::uint64_t> replayed;
+        auto resume = request(29, "resumed", [&](const CoherenceFrame &frame) {
+            CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
+            replayed.push_back(requestId(frame));
+            return true;
+        });
+        resume.requested_session_id = registered.session_id;
+        CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+        CHECK(replayed == std::vector<std::uint64_t>{1});
+        CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
+        CHECK(registry.admitRequest(registered.session_id,
+                                    protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 29)) ==
+              RequestAdmissionResult::InvalidRequest);
+        CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+        CHECK(registry.registerEndpoint(request(29)).status == Status::Ok);
+    }
+}
+
+void testClosedAbruptDisconnectBeforeFinalPinResumesClosed() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(30));
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 30);
+    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(30, registered.session_id, unregister_request) == Status::Ok);
+    CHECK(registry.disconnectAbruptly(30, registered.session_id));
+    CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
+    CHECK(!registry.inspect(registered.session_id)->has_sender);
+    CHECK(registry.admitRequest(registered.session_id, protocolRequest(Opcode::Heartbeat, 2, registered.session_id,
+                                                                       30)) == RequestAdmissionResult::InvalidRequest);
+
+    std::vector<std::uint64_t> delivered;
+    auto resume = request(30, "resumed", [&](const CoherenceFrame &frame) {
+        CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
+        delivered.push_back(requestId(frame));
+        return true;
+    });
+    resume.requested_session_id = registered.session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
+    CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(delivered == std::vector<std::uint64_t>{1});
+    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+}
+
+void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    std::vector<std::uint64_t> delivered;
+    const auto registered = registry.registerEndpoint(request(31, "tcp", [&](const CoherenceFrame &frame) {
+        if (requestId(frame) == 2)
+            CHECK(registry.inspect(session_id)->state == SessionState::Closed);
+        delivered.push_back(requestId(frame));
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto earlier = protocolRequest(Opcode::Heartbeat, 1, session_id, 31);
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 2, session_id, 31);
+    CHECK(registry.admitRequest(session_id, earlier) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(31, session_id, unregister_request) == Status::InvalidState);
+    CHECK(registry.inspect(session_id)->state == SessionState::Active);
+    CHECK(registry.pinResponse(session_id, earlier, response(earlier)) == PinResponseResult::Pinned);
+    CHECK(delivered == std::vector<std::uint64_t>{1});
+    CHECK(registry.gracefulClose(31, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
+    CHECK(registry.acknowledgeResponses(session_id, 2));
+}
+
 } // namespace
 
 int main() {
@@ -678,6 +853,7 @@ int main() {
     testThrowingReplayReleasesItsBinding();
     testNestedThrowingReplayRestoresOuterDeliveryContext();
     testHeartbeatWatermark();
+    testAcknowledgementRequiresSuccessfulPublication();
     testPinResponseCorrelationAndConflict();
     testHolderIndexesAndGracefulClose();
     testPinnedResponseBoundAndRecovery();
@@ -688,6 +864,11 @@ int main() {
     testNestedRetirementSkipsOuterDeliveryFrames();
     testConcurrentPinJoinsBlockedReplayDrain();
     testRequestSpecificCloseAndHolderBound();
+    testUnregisterResponseRequiresClosedIntent();
+    testClosedFinalResponsePublishesAndRemainsPinnedUntilAck();
+    testClosedFinalSendFailureResumesWithoutReopeningAdmission();
+    testClosedAbruptDisconnectBeforeFinalPinResumesClosed();
+    testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
         return EXIT_FAILURE;
