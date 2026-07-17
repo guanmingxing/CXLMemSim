@@ -177,10 +177,14 @@ target_compile_definitions(test_coherence_protocol_v2
                            PRIVATE "COHERENCE_PROTOCOL_V2_FIXTURE_PATH=\"${COHERENCE_PROTOCOL_V2_FIXTURE}\"")
 add_test(NAME test_coherence_protocol_v2 COMMAND test_coherence_protocol_v2)
 
-add_executable(test_endpoint_session_registry tests/test_endpoint_session_registry.cpp)
+add_executable(test_endpoint_session_registry
+               tests/test_endpoint_session_registry.cpp
+               src/coherence_protocol_v2.cpp
+               src/endpoint_session_registry.cpp)
 target_include_directories(test_endpoint_session_registry PRIVATE include)
-target_link_libraries(test_endpoint_session_registry cxlmemsim)
+target_compile_definitions(test_endpoint_session_registry PRIVATE CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING)
 add_test(NAME test_endpoint_session_registry COMMAND test_endpoint_session_registry)
+set_tests_properties(test_endpoint_session_registry PROPERTIES TIMEOUT 30)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.

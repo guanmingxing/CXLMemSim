@@ -20,6 +20,33 @@ namespace cxlmemsim {
 using SessionId = std::uint64_t;
 using ResponseSender = std::function<bool(const protocol_v2::CoherenceFrame &)>;
 
+class EndpointSessionRegistry;
+
+class BindingId {
+public:
+    constexpr BindingId() noexcept = default;
+    constexpr explicit operator bool() const noexcept { return value_ != 0; }
+    friend constexpr bool operator==(BindingId, BindingId) noexcept = default;
+
+private:
+    explicit constexpr BindingId(std::uint64_t value) noexcept : value_(value) {}
+
+    std::uint64_t value_{};
+    friend class EndpointSessionRegistry;
+};
+
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+namespace endpoint_session_registry_test {
+enum class FailurePoint {
+    SessionIndexInsertion,
+    HostIndexInsertion,
+    DrainDeliveryContextBookkeeping,
+    DrainResponseBookkeeping
+};
+void failNext(FailurePoint point) noexcept;
+} // namespace endpoint_session_registry_test
+#endif
+
 enum class SessionState { Active, OfflineRetained, Fenced, Closed };
 enum class PinResponseResult {
     Pinned,
@@ -53,6 +80,7 @@ struct RegistrationRequest {
 struct RegistrationResult {
     protocol_v2::Status status{protocol_v2::Status::InvalidState};
     SessionId session_id{};
+    BindingId binding_id{};
     std::uint64_t negotiated_capabilities{};
     std::uint32_t cache_capacity{};
     std::uint16_t cache_ways{};
@@ -62,6 +90,7 @@ struct RegistrationResult {
 
 struct SessionSnapshot {
     SessionId session_id;
+    BindingId binding_id;
     std::uint16_t host_id;
     SessionState state;
     std::uint64_t capabilities;
@@ -83,14 +112,15 @@ public:
                                      std::size_t max_pinned_responses_per_session = 1024);
 
     RegistrationResult registerEndpoint(const RegistrationRequest &request);
-    bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id);
-    protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id,
+    bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id, BindingId binding_id,
                                       const protocol_v2::CoherenceFrame &unregister_request);
 
-    RequestAdmissionResult admitRequest(SessionId session_id, const protocol_v2::CoherenceFrame &request);
+    RequestAdmissionResult admitRequest(SessionId session_id, BindingId binding_id,
+                                        const protocol_v2::CoherenceFrame &request);
     PinResponseResult pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                   const protocol_v2::CoherenceFrame &response);
-    bool acknowledgeResponses(SessionId session_id, std::uint64_t highest_contiguous_consumed);
+    bool acknowledgeResponses(SessionId session_id, BindingId binding_id, std::uint64_t highest_contiguous_consumed);
     std::uint64_t responseWatermark(SessionId session_id) const;
     std::uint64_t replayFloor(SessionId session_id) const;
     std::vector<std::uint64_t> pinnedResponseIds(SessionId session_id) const;
@@ -113,10 +143,12 @@ private:
     };
 
     struct Session {
-        Session(SessionId session_id, std::uint16_t host, std::uint64_t negotiated_capabilities, std::uint32_t capacity,
-                std::uint16_t ways, std::string transport, StoredResponseSender response_sender);
+        Session(SessionId session_id, BindingId binding_id, std::uint16_t host, std::uint64_t negotiated_capabilities,
+                std::uint32_t capacity, std::uint16_t ways, std::string transport,
+                StoredResponseSender response_sender);
 
         SessionId id{};
+        BindingId binding_id{};
         std::uint16_t host_id{};
         SessionState state{SessionState::Active};
         std::uint64_t capabilities{};
@@ -146,7 +178,7 @@ private:
     bool validHolderSession(const Session &session) const noexcept;
     bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
     bool beginDrainLocked(Session &session, std::uint64_t &generation, StoredResponseSender &sender,
-                          StoredResponseSender staged_sender);
+                          StoredResponseSender &&staged_sender);
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                         const StoredResponseSender &sender);
     StoredResponseSender finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered);
@@ -163,6 +195,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable delivery_finished_;
     SessionId next_session_id_{1};
+    std::uint64_t next_binding_id_{1};
     std::unordered_map<SessionId, std::shared_ptr<Session>> sessions_;
     std::unordered_map<std::uint16_t, SessionId> host_sessions_;
 };

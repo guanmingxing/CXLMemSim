@@ -2,11 +2,23 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <utility>
 
 namespace cxlmemsim {
 namespace {
 constexpr std::uint64_t kModelSnoop = static_cast<std::uint64_t>(protocol_v2::Capability::MODEL_SNOOP);
+
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+thread_local std::optional<endpoint_session_registry_test::FailurePoint> pending_failure;
+
+void failIfRequested(endpoint_session_registry_test::FailurePoint point) {
+    if (pending_failure == point) {
+        pending_failure.reset();
+        throw std::bad_alloc();
+    }
+}
+#endif
 
 struct DeliveryContext {
     const EndpointSessionRegistry *registry;
@@ -20,12 +32,19 @@ bool sameFrame(const protocol_v2::CoherenceFrame &a, const protocol_v2::Coherenc
 }
 } // namespace
 
-EndpointSessionRegistry::Session::Session(SessionId session_id, std::uint16_t host,
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+namespace endpoint_session_registry_test {
+void failNext(FailurePoint point) noexcept { pending_failure = point; }
+} // namespace endpoint_session_registry_test
+#endif
+
+EndpointSessionRegistry::Session::Session(SessionId session_id, BindingId binding, std::uint16_t host,
                                           std::uint64_t negotiated_capabilities, std::uint32_t capacity,
                                           std::uint16_t ways, std::string transport,
                                           StoredResponseSender response_sender)
-    : id(session_id), host_id(host), capabilities(negotiated_capabilities), cache_capacity(capacity), cache_ways(ways),
-      transport_name(std::move(transport)), sender(std::move(response_sender)) {}
+    : id(session_id), binding_id(binding), host_id(host), capabilities(negotiated_capabilities),
+      cache_capacity(capacity), cache_ways(ways), transport_name(std::move(transport)),
+      sender(std::move(response_sender)) {}
 
 EndpointSessionRegistry::EndpointSessionRegistry(std::uint16_t max_hosts, std::size_t limit)
     : max_hosts_(std::min(max_hosts, protocol_v2::kMaximumHosts)),
@@ -43,6 +62,7 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         for (;;) {
             std::shared_ptr<Session> expected_old;
             SessionId id;
+            BindingId binding_id;
             {
                 std::lock_guard lock(mutex_);
                 const auto host = host_sessions_.find(request.host_id);
@@ -52,16 +72,18 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                         !expected_old->pinned_responses.empty())
                         return {.status = protocol_v2::Status::DuplicateHost};
                 }
-                if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max())
+                if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max() ||
+                    next_binding_id_ == 0 || next_binding_id_ == std::numeric_limits<std::uint64_t>::max())
                     return {.status = protocol_v2::Status::InvalidState};
                 id = next_session_id_;
+                binding_id = BindingId{next_binding_id_};
             }
 
             auto staged_sender = copySender(request.sender);
             std::string staged_transport = request.transport_name;
             auto session = std::make_shared<Session>(
-                id, request.host_id, request.capabilities & protocol_v2::kSupportedCapabilities, request.cache_capacity,
-                request.cache_ways, std::move(staged_transport), std::move(staged_sender));
+                id, binding_id, request.host_id, request.capabilities & protocol_v2::kSupportedCapabilities,
+                request.cache_capacity, request.cache_ways, std::move(staged_transport), std::move(staged_sender));
             std::shared_ptr<Session> retired_session;
             RegistrationResult result;
             bool retry = false;
@@ -74,15 +96,21 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                      (host == host_sessions_.end() || sessions_.at(host->second) != expected_old ||
                       expected_old->state != SessionState::Closed || !expected_old->closed_final_response_pinned ||
                       !expected_old->pinned_responses.empty()));
-                if (host_changed || next_session_id_ != id) {
+                if (host_changed || next_session_id_ != id || next_binding_id_ != binding_id.value_) {
                     retry = true;
                 } else {
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+                    failIfRequested(endpoint_session_registry_test::FailurePoint::SessionIndexInsertion);
+#endif
                     const auto [session_position, session_inserted] = sessions_.emplace(id, session);
                     if (!session_inserted) {
                         retry = true;
                     } else {
                         try {
                             if (host == host_sessions_.end()) {
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+                                failIfRequested(endpoint_session_registry_test::FailurePoint::HostIndexInsertion);
+#endif
                                 const auto [unused, host_inserted] = host_sessions_.emplace(request.host_id, id);
                                 (void)unused;
                                 if (!host_inserted) {
@@ -102,6 +130,7 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                                 sessions_.erase(expected_old->id);
                             }
                             ++next_session_id_;
+                            ++next_binding_id_;
                             result = resultFor(*session, protocol_v2::Status::Ok);
                         }
                     }
@@ -116,6 +145,7 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         std::shared_ptr<Session> session;
         SessionState observed_state;
         std::uint64_t observed_generation;
+        std::uint64_t staged_binding_value;
         std::uint64_t staged_publication_cursor;
         bool stage_drain;
         {
@@ -135,10 +165,12 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                 session->host_id != request.host_id || session->capabilities != request.capabilities ||
                 session->cache_capacity != request.cache_capacity || session->cache_ways != request.cache_ways)
                 return {.status = protocol_v2::Status::StaleSession};
-            if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
+            if (session->binding_generation == std::numeric_limits<std::uint64_t>::max() || next_binding_id_ == 0 ||
+                next_binding_id_ == std::numeric_limits<std::uint64_t>::max())
                 return {.status = protocol_v2::Status::InvalidState};
             observed_state = session->state;
             observed_generation = session->binding_generation;
+            staged_binding_value = next_binding_id_;
             staged_publication_cursor = session->response_watermark + 1;
             stage_drain =
                 request.sender && !session->publishing && session->pinned_responses.contains(staged_publication_cursor);
@@ -158,17 +190,19 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         {
             std::lock_guard lock(mutex_);
             const auto found = sessions_.find(request.requested_session_id);
-            const bool state_changed = found == sessions_.end() || found->second != session ||
-                                       session->state != observed_state ||
-                                       session->binding_generation != observed_generation ||
-                                       staged_publication_cursor != session->response_watermark + 1 ||
-                                       stage_drain != (request.sender && !session->publishing &&
-                                                       session->pinned_responses.contains(staged_publication_cursor));
+            const bool state_changed =
+                found == sessions_.end() || found->second != session || session->state != observed_state ||
+                session->binding_generation != observed_generation || next_binding_id_ != staged_binding_value ||
+                staged_publication_cursor != session->response_watermark + 1 ||
+                stage_drain != (request.sender && !session->publishing &&
+                                session->pinned_responses.contains(staged_publication_cursor));
             if (state_changed) {
                 retry = true;
             } else {
                 ++session->binding_generation;
                 generation = session->binding_generation;
+                session->binding_id = BindingId{staged_binding_value};
+                ++next_binding_id_;
                 if (session->state == SessionState::OfflineRetained)
                     session->state = SessionState::Active;
                 session->transport_name = std::move(staged_transport);
@@ -182,8 +216,10 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         }
         if (retry)
             continue;
-        if (sender && !drainResponses(session, generation, sender))
+        if (sender && !drainResponses(session, generation, sender)) {
             result.status = protocol_v2::Status::IoError;
+            result.binding_id = {};
+        }
         return result;
     }
 }
@@ -204,7 +240,7 @@ void EndpointSessionRegistry::waitForRetiredGeneration(std::unique_lock<std::mut
     });
 }
 
-bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionId session_id) {
+bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionId session_id, BindingId binding_id) {
     StoredResponseSender retired_sender;
     std::shared_ptr<Session> session;
     std::unique_lock lock(mutex_);
@@ -212,7 +248,8 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
     const bool closed_replay_pending =
         found != sessions_.end() && found->second->state == SessionState::Closed &&
         (!found->second->closed_final_response_pinned || !found->second->pinned_responses.empty());
-    if (found == sessions_.end() || found->second->host_id != host_id ||
+    if (!binding_id || found == sessions_.end() || found->second->host_id != host_id ||
+        found->second->binding_id != binding_id ||
         (found->second->state != SessionState::Active && !closed_replay_pending))
         return false;
     session = found->second;
@@ -222,6 +259,7 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
     if (session->state == SessionState::Active)
         session->state = SessionState::OfflineRetained;
     retired_sender = std::move(session->sender);
+    session->binding_id = {};
     session->transport_name.clear();
     session->publishing = false;
     ++session->binding_generation;
@@ -230,11 +268,13 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
 }
 
 protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id, SessionId session_id,
+                                                           BindingId binding_id,
                                                            const protocol_v2::CoherenceFrame &unregister_request) {
     std::shared_ptr<Session> session;
     std::unique_lock lock(mutex_);
     const auto found = sessions_.find(session_id);
-    if (found == sessions_.end() || found->second->host_id != host_id)
+    if (!binding_id || found == sessions_.end() || found->second->host_id != host_id ||
+        found->second->binding_id != binding_id)
         return protocol_v2::Status::StaleSession;
     session = found->second;
     const auto id = protocol_v2::requestId(unregister_request);
@@ -274,11 +314,11 @@ bool EndpointSessionRegistry::validOrdinaryRequest(const Session &session,
            op != protocol_v2::Opcode::HostFence;
 }
 
-RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_id,
+RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_id, BindingId binding_id,
                                                              const protocol_v2::CoherenceFrame &request) {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(session_id);
-    if (found == sessions_.end())
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
         return RequestAdmissionResult::SessionUnavailable;
     auto &session = *found->second;
     if (session.state != SessionState::Active || !validOrdinaryRequest(session, request))
@@ -305,7 +345,7 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
 }
 
 bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation,
-                                               StoredResponseSender &sender, StoredResponseSender staged_sender) {
+                                               StoredResponseSender &sender, StoredResponseSender &&staged_sender) {
     const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Closed;
     if (!deliverable_state || !session.sender || !staged_sender || session.publishing ||
         !session.pinned_responses.contains(session.publication_cursor))
@@ -328,6 +368,7 @@ void EndpointSessionRegistry::retireFailedBinding(const std::shared_ptr<Session>
         if (session->state != SessionState::Closed)
             session->state = SessionState::OfflineRetained;
         retired_sender = std::move(session->sender);
+        session->binding_id = {};
         session->transport_name.clear();
         session->publishing = false;
     }
@@ -341,6 +382,7 @@ EndpointSessionRegistry::StoredResponseSender EndpointSessionRegistry::reclaimRe
     if (session.state == SessionState::Closed && session.closed_final_response_pinned &&
         session.pinned_responses.empty()) {
         auto retired_sender = std::move(session.sender);
+        session.binding_id = {};
         session.transport_name.clear();
         return retired_sender;
     }
@@ -384,10 +426,29 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
                 return true;
             }
             frame = found->second.response;
-            ++session->in_flight_deliveries[generation];
-            ++session->in_flight_response_deliveries[protocol_v2::requestId(frame)];
+            auto generation_delivery = session->in_flight_deliveries.end();
+            bool delivery_context_pushed = false;
+            try {
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+                failIfRequested(endpoint_session_registry_test::FailurePoint::DrainDeliveryContextBookkeeping);
+#endif
+                delivery_stack.push_back({this, session->id, generation});
+                delivery_context_pushed = true;
+                generation_delivery = session->in_flight_deliveries.try_emplace(generation, 0).first;
+                ++generation_delivery->second;
+#ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
+                failIfRequested(endpoint_session_registry_test::FailurePoint::DrainResponseBookkeeping);
+#endif
+                ++session->in_flight_response_deliveries.try_emplace(protocol_v2::requestId(frame), 0).first->second;
+            } catch (...) {
+                if (generation_delivery != session->in_flight_deliveries.end() && --generation_delivery->second == 0)
+                    session->in_flight_deliveries.erase(generation_delivery);
+                if (delivery_context_pushed)
+                    delivery_stack.pop_back();
+                session->publishing = false;
+                throw;
+            }
         }
-        delivery_stack.push_back({this, session->id, generation});
         bool delivered;
         try {
             delivered = (*sender)(frame);
@@ -490,11 +551,11 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
     return result;
 }
 
-bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, std::uint64_t consumed) {
+bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, BindingId binding_id, std::uint64_t consumed) {
     StoredResponseSender retired_sender;
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(session_id);
-    if (found == sessions_.end())
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
         return false;
     auto &session = *found->second;
     if (consumed <= session.response_watermark)
@@ -607,6 +668,7 @@ std::optional<SessionSnapshot> EndpointSessionRegistry::inspect(SessionId id) co
         return std::nullopt;
     const auto &s = *found->second;
     return SessionSnapshot{s.id,
+                           s.binding_id,
                            s.host_id,
                            s.state,
                            s.capabilities,
@@ -631,6 +693,7 @@ bool EndpointSessionRegistry::aligned(std::uint64_t line) noexcept { return line
 RegistrationResult EndpointSessionRegistry::resultFor(const Session &s, protocol_v2::Status status) const {
     return {status,
             s.id,
+            status == protocol_v2::Status::Ok ? s.binding_id : BindingId{},
             s.capabilities,
             s.cache_capacity,
             s.cache_ways,

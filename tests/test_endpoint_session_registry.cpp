@@ -12,49 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
-
-namespace allocation_failure_test {
-thread_local bool failure_enabled = false;
-thread_local std::size_t allocations_before_failure = 0;
-
-void *allocate(std::size_t size) {
-    if (failure_enabled && allocations_before_failure-- == 0) {
-        failure_enabled = false;
-        throw std::bad_alloc();
-    }
-    if (void *allocation = std::malloc(size))
-        return allocation;
-    throw std::bad_alloc();
-}
-
-class ScopedAllocationFailure {
-public:
-    explicit ScopedAllocationFailure(std::size_t successful_allocations)
-        : previous_enabled_(failure_enabled), previous_count_(allocations_before_failure) {
-        failure_enabled = true;
-        allocations_before_failure = successful_allocations;
-    }
-
-    ~ScopedAllocationFailure() {
-        failure_enabled = previous_enabled_;
-        allocations_before_failure = previous_count_;
-    }
-
-private:
-    bool previous_enabled_;
-    std::size_t previous_count_;
-};
-
-void deallocate(void *allocation) noexcept { std::free(allocation); }
-} // namespace allocation_failure_test
-
-void *operator new(std::size_t size) { return allocation_failure_test::allocate(size); }
-void *operator new[](std::size_t size) { return allocation_failure_test::allocate(size); }
-void operator delete(void *allocation) noexcept { allocation_failure_test::deallocate(allocation); }
-void operator delete[](void *allocation) noexcept { allocation_failure_test::deallocate(allocation); }
-void operator delete(void *allocation, std::size_t) noexcept { allocation_failure_test::deallocate(allocation); }
-void operator delete[](void *allocation, std::size_t) noexcept { allocation_failure_test::deallocate(allocation); }
 
 using namespace cxlmemsim;
 using namespace cxlmemsim::protocol_v2;
@@ -73,6 +32,30 @@ int failures = 0;
 
 constexpr std::uint64_t kModelSnoop = static_cast<std::uint64_t>(Capability::MODEL_SNOOP);
 constexpr std::uint64_t kNativeFlush = static_cast<std::uint64_t>(Capability::NATIVE_FLUSH);
+constexpr auto kCompletionTimeout = std::chrono::seconds(2);
+
+template <typename Future> void waitReadyOrExit(Future &future, const char *context) {
+    if (future.wait_for(kCompletionTimeout) != std::future_status::ready) {
+        std::cerr << context << " timed out\n";
+        std::_Exit(EXIT_FAILURE);
+    }
+}
+
+template <typename Future> auto getReadyOrExit(Future &future, const char *context) {
+    waitReadyOrExit(future, context);
+    return future.get();
+}
+
+template <typename Predicate> void waitUntilOrExit(Predicate predicate, const char *context) {
+    const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::cerr << context << " timed out\n";
+            std::_Exit(EXIT_FAILURE);
+        }
+        std::this_thread::yield();
+    }
+}
 
 struct ThrowingCopySender {
     std::shared_ptr<bool> throw_on_copy;
@@ -138,8 +121,59 @@ struct InspectingCopySender {
     bool operator()(const CoherenceFrame &) const { return true; }
 };
 
+struct SenderDestructionRaceState {
+    explicit SenderDestructionRaceState(EndpointSessionRegistry *registry_to_inspect)
+        : registry(registry_to_inspect), allow_copy(allow_copy_promise.get_future().share()),
+          allow_delivery(allow_delivery_promise.get_future().share()) {}
+
+    EndpointSessionRegistry *registry;
+    SessionId session_id{};
+    std::atomic<bool> inspect_next_copy_on_destruction{false};
+    std::promise<void> staged_copy_waiting;
+    std::promise<void> allow_copy_promise;
+    std::shared_future<void> allow_copy;
+    std::promise<void> delivery_entered;
+    std::promise<void> allow_delivery_promise;
+    std::shared_future<void> allow_delivery;
+    std::promise<void> destruction_entered;
+};
+
+struct InspectingDestructionSender {
+    std::shared_ptr<SenderDestructionRaceState> state;
+    bool inspect_on_destruction{};
+
+    explicit InspectingDestructionSender(std::shared_ptr<SenderDestructionRaceState> shared_state)
+        : state(std::move(shared_state)) {}
+    InspectingDestructionSender(const InspectingDestructionSender &other) : state(other.state) {
+        inspect_on_destruction = state->inspect_next_copy_on_destruction.exchange(false);
+        if (inspect_on_destruction) {
+            state->staged_copy_waiting.set_value();
+            waitReadyOrExit(state->allow_copy, "staged sender copy release");
+        }
+    }
+    InspectingDestructionSender(InspectingDestructionSender &&other) noexcept
+        : state(std::move(other.state)), inspect_on_destruction(std::exchange(other.inspect_on_destruction, false)) {}
+    ~InspectingDestructionSender() {
+        if (inspect_on_destruction) {
+            state->destruction_entered.set_value();
+            (void)state->registry->inspect(state->session_id);
+        }
+    }
+
+    bool operator()(const CoherenceFrame &) const {
+        state->delivery_entered.set_value();
+        waitReadyOrExit(state->allow_delivery, "winning delivery release");
+        return true;
+    }
+};
+
 RegistrationRequest request(std::uint16_t host, std::string transport = "tcp", ResponseSender sender = {}) {
     return {host, 0, kModelSnoop, 256 * 1024, 4, std::move(transport), std::move(sender)};
+}
+
+BindingId activeBinding(EndpointSessionRegistry &registry, SessionId session_id) {
+    const auto snapshot = registry.inspect(session_id);
+    return snapshot ? snapshot->binding_id : BindingId{};
 }
 
 CoherenceFrame protocolRequest(Opcode opcode, std::uint64_t request_id, SessionId session_id, std::uint16_t host) {
@@ -163,16 +197,17 @@ CoherenceFrame response(const CoherenceFrame &request) {
 PinResponseResult pinHeartbeat(EndpointSessionRegistry &registry, SessionId session_id, std::uint64_t request_id,
                                std::uint16_t host) {
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, request_id, session_id, host);
-    (void)registry.admitRequest(session_id, heartbeat);
+    (void)registry.admitRequest(session_id, activeBinding(registry, session_id), heartbeat);
     return registry.pinResponse(session_id, heartbeat, response(heartbeat));
 }
 
 Status closeSession(EndpointSessionRegistry &registry, std::uint16_t host, SessionId session_id,
                     std::uint64_t request_id) {
     const auto unregister_request = protocolRequest(Opcode::Unregister, request_id, session_id, host);
-    if (registry.admitRequest(session_id, unregister_request) != RequestAdmissionResult::Accepted)
+    if (registry.admitRequest(session_id, activeBinding(registry, session_id), unregister_request) !=
+        RequestAdmissionResult::Accepted)
         return Status::InvalidState;
-    return registry.gracefulClose(host, session_id, unregister_request);
+    return registry.gracefulClose(host, session_id, activeBinding(registry, session_id), unregister_request);
 }
 
 void testFreshRegistrationAndValidation() {
@@ -210,11 +245,11 @@ void testFreshRegistrationAndValidation() {
     CHECK(negotiated.status == Status::Ok);
     CHECK(negotiated.negotiated_capabilities == kModelSnoop);
     CHECK(registry.inspect(negotiated.session_id)->capabilities == kModelSnoop);
-    CHECK(registry.disconnectAbruptly(5, negotiated.session_id));
+    CHECK(registry.disconnectAbruptly(5, negotiated.session_id, activeBinding(registry, negotiated.session_id)));
     auto negotiated_resume = request(5);
     negotiated_resume.requested_session_id = negotiated.session_id;
     CHECK(registry.registerEndpoint(negotiated_resume).status == Status::Ok);
-    CHECK(registry.disconnectAbruptly(5, negotiated.session_id));
+    CHECK(registry.disconnectAbruptly(5, negotiated.session_id, activeBinding(registry, negotiated.session_id)));
     auto expanded_resume = negotiated_resume;
     expanded_resume.capabilities = kModelSnoop | kNativeFlush;
     CHECK(registry.registerEndpoint(expanded_resume).status == Status::StaleSession);
@@ -245,7 +280,7 @@ void testDisconnectResumeAndReplay() {
     CHECK(registry.addModifiedHolder(original.session_id, 0x2000));
     CHECK(pinHeartbeat(registry, original.session_id, 1, 7) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, original.session_id, 2, 7) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(7, original.session_id));
+    CHECK(registry.disconnectAbruptly(7, original.session_id, activeBinding(registry, original.session_id)));
     CHECK(registry.inspect(original.session_id)->state == SessionState::OfflineRetained);
     CHECK(registry.cleanHolders(original.session_id) == std::vector<std::uint64_t>{0x1000});
     CHECK(registry.modifiedHolders(original.session_id) == std::vector<std::uint64_t>{0x2000});
@@ -288,10 +323,36 @@ void testDisconnectResumeAndReplay() {
     CHECK(registry.pinnedResponseIds(original.session_id) == (std::vector<std::uint64_t>{1, 2}));
     CHECK(registry.registerEndpoint(resume).status == Status::DuplicateHost);
 
-    CHECK(registry.disconnectAbruptly(7, original.session_id));
+    CHECK(registry.disconnectAbruptly(7, original.session_id, activeBinding(registry, original.session_id)));
     auto exact_negotiated_resume = request(7);
     exact_negotiated_resume.requested_session_id = original.session_id;
     CHECK(registry.registerEndpoint(exact_negotiated_resume).status == Status::Ok);
+}
+
+void testRetiredBindingCannotOperateAfterResume() {
+    EndpointSessionRegistry registry;
+    const auto original = registry.registerEndpoint(request(48));
+    const auto retired_binding = original.binding_id;
+    const auto first = protocolRequest(Opcode::Heartbeat, 1, original.session_id, 48);
+    CHECK(registry.admitRequest(original.session_id, retired_binding, first) == RequestAdmissionResult::Accepted);
+    CHECK(registry.pinResponse(original.session_id, first, response(first)) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(48, original.session_id, retired_binding));
+
+    auto resume = request(48, "resumed", [](const CoherenceFrame &) { return true; });
+    resume.requested_session_id = original.session_id;
+    const auto resumed = registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
+    CHECK(resumed.binding_id != retired_binding);
+
+    const auto second = protocolRequest(Opcode::Heartbeat, 2, original.session_id, 48);
+    CHECK(registry.admitRequest(original.session_id, retired_binding, second) ==
+          RequestAdmissionResult::SessionUnavailable);
+    CHECK(!registry.acknowledgeResponses(original.session_id, retired_binding, 1));
+    CHECK(!registry.disconnectAbruptly(48, original.session_id, retired_binding));
+    CHECK(registry.gracefulClose(48, original.session_id, retired_binding, second) == Status::StaleSession);
+
+    CHECK(registry.acknowledgeResponses(original.session_id, resumed.binding_id, 1));
+    CHECK(registry.admitRequest(original.session_id, resumed.binding_id, second) == RequestAdmissionResult::Accepted);
 }
 
 void testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId() {
@@ -316,28 +377,33 @@ void testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId() {
     CHECK(*deliveries == 0);
 }
 
-void testFreshRegistrationRollsBackIfIndexInsertionThrows() {
-    bool observed_allocation_failure = false;
-    for (std::size_t successful_allocations = 0; successful_allocations < 32; ++successful_allocations) {
-        EndpointSessionRegistry registry;
-        bool propagated = false;
-        try {
-            allocation_failure_test::ScopedAllocationFailure failure(successful_allocations);
-            (void)registry.registerEndpoint(request(40));
-        } catch (const std::bad_alloc &) {
-            propagated = true;
-            observed_allocation_failure = true;
-        }
-        if (!propagated)
-            continue;
-
-        CHECK(!registry.inspect(1).has_value());
-        const auto retry = registry.registerEndpoint(request(40));
-        CHECK(retry.status == Status::Ok);
-        CHECK(retry.session_id == 1);
-        CHECK(registry.registerEndpoint(request(40)).status == Status::DuplicateHost);
+void expectRegistrationInsertionFailureDoesNotConsumeSessionId(
+    endpoint_session_registry_test::FailurePoint failure_point) {
+    EndpointSessionRegistry registry;
+    endpoint_session_registry_test::failNext(failure_point);
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(request(40));
+    } catch (const std::bad_alloc &) {
+        propagated = true;
     }
-    CHECK(observed_allocation_failure);
+    CHECK(propagated);
+    CHECK(!registry.inspect(1).has_value());
+
+    const auto retry = registry.registerEndpoint(request(40));
+    CHECK(retry.status == Status::Ok);
+    CHECK(retry.session_id == 1);
+    CHECK(registry.registerEndpoint(request(40)).status == Status::DuplicateHost);
+}
+
+void testFreshRegistrationRollsBackIfSessionIndexInsertionThrows() {
+    expectRegistrationInsertionFailureDoesNotConsumeSessionId(
+        endpoint_session_registry_test::FailurePoint::SessionIndexInsertion);
+}
+
+void testFreshRegistrationRollsBackIfHostIndexInsertionThrows() {
+    expectRegistrationInsertionFailureDoesNotConsumeSessionId(
+        endpoint_session_registry_test::FailurePoint::HostIndexInsertion);
 }
 
 void testSenderCopyCanInspectRegistryWithoutDeadlock() {
@@ -358,14 +424,48 @@ void testSenderCopyCanInspectRegistryWithoutDeadlock() {
             completed->set_exception(std::current_exception());
         }
     });
-    if (completion.wait_for(std::chrono::seconds(1)) != std::future_status::ready) {
-        worker.detach();
-        CHECK(false && "sender copy deadlocked while re-entering inspect");
-        return;
-    }
+    waitReadyOrExit(completion, "sender copy re-entry");
     worker.join();
-    CHECK(completion.get() == Status::Ok);
+    CHECK(getReadyOrExit(completion, "sender copy result") == Status::Ok);
     CHECK(inspected->load());
+}
+
+void testLosingDrainSenderIsDestroyedAfterRegistryUnlock() {
+    EndpointSessionRegistry registry;
+    auto state = std::make_shared<SenderDestructionRaceState>(&registry);
+    ResponseSender sender{InspectingDestructionSender{state}};
+    const auto registered = registry.registerEndpoint(request(47, "destruction-reentrant", std::move(sender)));
+    state->session_id = registered.session_id;
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 47);
+    const auto heartbeat_response = response(heartbeat);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), heartbeat) ==
+          RequestAdmissionResult::Accepted);
+
+    state->inspect_next_copy_on_destruction.store(true);
+    auto staged_copy_waiting = state->staged_copy_waiting.get_future();
+    auto destruction_entered = state->destruction_entered.get_future();
+    std::promise<PinResponseResult> losing_result;
+    auto losing_completion = losing_result.get_future();
+    std::thread losing_publisher(
+        [&] { losing_result.set_value(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response)); });
+    waitReadyOrExit(staged_copy_waiting, "losing staged sender copy");
+
+    auto delivery_entered = state->delivery_entered.get_future();
+    std::promise<PinResponseResult> winning_result;
+    auto winning_completion = winning_result.get_future();
+    std::thread winning_publisher(
+        [&] { winning_result.set_value(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response)); });
+    waitReadyOrExit(delivery_entered, "winning sender delivery");
+    state->allow_copy_promise.set_value();
+    waitReadyOrExit(destruction_entered, "losing sender destruction");
+    state->allow_delivery_promise.set_value();
+
+    waitReadyOrExit(losing_completion, "losing publisher completion");
+    waitReadyOrExit(winning_completion, "winning publisher completion");
+    losing_publisher.join();
+    winning_publisher.join();
+    CHECK(getReadyOrExit(losing_completion, "losing publisher result") == PinResponseResult::Pinned);
+    CHECK(getReadyOrExit(winning_completion, "winning publisher result") == PinResponseResult::Duplicate);
 }
 
 void testDisconnectRetainsSessionWhileClosedSessionIsReplaced() {
@@ -376,41 +476,44 @@ void testDisconnectRetainsSessionWhileClosedSessionIsReplaced() {
         const auto release = release_old_delivery.get_future().share();
         const auto registered = registry.registerEndpoint(request(43, "old", [&](const CoherenceFrame &) {
             old_delivery_entered.set_value();
-            release.wait();
+            waitReadyOrExit(release, "old delivery release");
             return true;
         }));
         const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 43);
         const auto unregister_request = protocolRequest(Opcode::Unregister, 2, registered.session_id, 43);
-        CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
-        CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), heartbeat) ==
+              RequestAdmissionResult::Accepted);
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                    unregister_request) == RequestAdmissionResult::Accepted);
 
         auto old_publish = std::async(std::launch::async, [&] {
             return registry.pinResponse(registered.session_id, heartbeat, response(heartbeat));
         });
-        CHECK(old_delivery_entered.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-        auto disconnect =
-            std::async(std::launch::async, [&] { return registry.disconnectAbruptly(43, registered.session_id); });
+        auto old_delivery = old_delivery_entered.get_future();
+        waitReadyOrExit(old_delivery, "old delivery entry");
+        auto disconnect = std::async(std::launch::async, [&] {
+            return registry.disconnectAbruptly(43, registered.session_id,
+                                               activeBinding(registry, registered.session_id));
+        });
 
-        const auto offline_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        while (registry.inspect(registered.session_id)->state != SessionState::OfflineRetained &&
-               std::chrono::steady_clock::now() < offline_deadline)
-            std::this_thread::yield();
-        CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
+        waitUntilOrExit([&] { return registry.inspect(registered.session_id)->state == SessionState::OfflineRetained; },
+                        "offline retained transition");
 
         auto resume = request(43, "resumed", [](const CoherenceFrame &) { return true; });
         resume.requested_session_id = registered.session_id;
         CHECK(registry.registerEndpoint(resume).status == Status::Ok);
-        CHECK(registry.gracefulClose(43, registered.session_id, unregister_request) == Status::Ok);
+        CHECK(registry.gracefulClose(43, registered.session_id, activeBinding(registry, registered.session_id),
+                                     unregister_request) == Status::Ok);
         CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
               PinResponseResult::Pinned);
-        CHECK(registry.acknowledgeResponses(registered.session_id, 2));
+        CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 2));
 
         const auto replacement = registry.registerEndpoint(request(43));
         CHECK(replacement.status == Status::Ok);
         CHECK(replacement.session_id == 2);
         release_old_delivery.set_value();
-        CHECK(old_publish.get() == PinResponseResult::Pinned);
-        CHECK(disconnect.get());
+        CHECK(getReadyOrExit(old_publish, "old publication completion") == PinResponseResult::Pinned);
+        CHECK(getReadyOrExit(disconnect, "old disconnect completion"));
     }
 }
 
@@ -419,11 +522,13 @@ void testReplacementSenderCopyFailurePreservesClosedSession() {
     const auto registered =
         registry.registerEndpoint(request(36, "original", [](const CoherenceFrame &) { return true; }));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 36);
-    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.gracefulClose(36, registered.session_id, unregister_request) == Status::Ok);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(36, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::Ok);
     CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
 
     auto throw_on_copy = std::make_shared<bool>(false);
     auto deliveries = std::make_shared<std::size_t>(0);
@@ -450,7 +555,7 @@ void testReplacementSenderCopyFailurePreservesClosedSession() {
 void testResumeSenderCopyFailurePreservesOfflineBinding() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(34));
-    CHECK(registry.disconnectAbruptly(34, registered.session_id));
+    CHECK(registry.disconnectAbruptly(34, registered.session_id, activeBinding(registry, registered.session_id)));
 
     auto throw_on_copy = std::make_shared<bool>(false);
     auto deliveries = std::make_shared<std::size_t>(0);
@@ -481,7 +586,7 @@ void testResumeDrainCopyFailurePreservesOfflineBinding() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(37));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 37) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(37, registered.session_id));
+    CHECK(registry.disconnectAbruptly(37, registered.session_id, activeBinding(registry, registered.session_id)));
 
     auto copies = std::make_shared<std::size_t>(0);
     auto deliveries = std::make_shared<std::size_t>(0);
@@ -520,7 +625,8 @@ void testDuplicatePinRestartsDrainAfterSenderCopyFailure() {
     const auto registered = registry.registerEndpoint(request(35, "throwing-copy", std::move(sender)));
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 35);
     const auto heartbeat_response = response(heartbeat);
-    CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), heartbeat) ==
+          RequestAdmissionResult::Accepted);
     *throw_on_copy = true;
 
     bool propagated = false;
@@ -537,58 +643,106 @@ void testDuplicatePinRestartsDrainAfterSenderCopyFailure() {
     *throw_on_copy = false;
     CHECK(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response) == PinResponseResult::Duplicate);
     CHECK(*deliveries == 1);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
+}
+
+void expectDrainBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable(
+    endpoint_session_registry_test::FailurePoint failure_point) {
+    EndpointSessionRegistry registry;
+    std::size_t deliveries = 0;
+    const auto registered = registry.registerEndpoint(request(49, "tcp", [&](const CoherenceFrame &) {
+        ++deliveries;
+        return true;
+    }));
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 49);
+    const auto heartbeat_response = response(heartbeat);
+    CHECK(registry.admitRequest(registered.session_id, registered.binding_id, heartbeat) ==
+          RequestAdmissionResult::Accepted);
+
+    endpoint_session_registry_test::failNext(failure_point);
+    bool propagated = false;
+    try {
+        (void)registry.pinResponse(registered.session_id, heartbeat, heartbeat_response);
+    } catch (const std::bad_alloc &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    CHECK(deliveries == 0);
+    CHECK(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response) == PinResponseResult::Duplicate);
+    CHECK(deliveries == 1);
+
+    std::promise<bool> disconnected;
+    auto disconnect_completion = disconnected.get_future();
+    std::thread disconnect(
+        [&] { disconnected.set_value(registry.disconnectAbruptly(49, registered.session_id, registered.binding_id)); });
+    waitReadyOrExit(disconnect_completion, "disconnect after drain bookkeeping failure");
+    disconnect.join();
+    CHECK(getReadyOrExit(disconnect_completion, "disconnect result after drain bookkeeping failure"));
+}
+
+void testDeliveryContextBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable() {
+    expectDrainBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable(
+        endpoint_session_registry_test::FailurePoint::DrainDeliveryContextBookkeeping);
+}
+
+void testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable() {
+    expectDrainBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable(
+        endpoint_session_registry_test::FailurePoint::DrainResponseBookkeeping);
 }
 
 void testReplayDoesNotBlockRegistry() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(1));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 1) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(1, registered.session_id));
+    CHECK(registry.disconnectAbruptly(1, registered.session_id, activeBinding(registry, registered.session_id)));
 
     std::promise<void> callback_entered;
     std::promise<void> allow_callback_exit;
     auto exit_future = allow_callback_exit.get_future().share();
     auto resume = request(1, "shm", [&](const CoherenceFrame &) {
         callback_entered.set_value();
-        exit_future.wait();
+        waitReadyOrExit(exit_future, "replay callback release");
         return true;
     });
     resume.requested_session_id = registered.session_id;
     auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(resume); });
-    callback_entered.get_future().wait();
+    auto entered = callback_entered.get_future();
+    waitReadyOrExit(entered, "replay callback entry");
     auto concurrent = std::async(std::launch::async, [&] { return registry.registerEndpoint(request(2)); });
-    CHECK(concurrent.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-    CHECK(concurrent.get().status == Status::Ok);
+    CHECK(getReadyOrExit(concurrent, "concurrent registration").status == Status::Ok);
     allow_callback_exit.set_value();
-    CHECK(replay.get().status == Status::Ok);
+    CHECK(getReadyOrExit(replay, "replay completion").status == Status::Ok);
 }
 
 void testDisconnectWaitsForCurrentBindingReplay() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(13));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 13) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(13, registered.session_id));
+    CHECK(registry.disconnectAbruptly(13, registered.session_id, activeBinding(registry, registered.session_id)));
 
     std::promise<void> replay_entered;
     std::promise<void> release_replay;
     const auto release = release_replay.get_future().share();
     auto resume = request(13, "tcp-new", [&](const CoherenceFrame &) {
         replay_entered.set_value();
-        release.wait();
+        waitReadyOrExit(release, "current binding replay release");
         return true;
     });
     resume.requested_session_id = registered.session_id;
     auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(resume); });
-    replay_entered.get_future().wait();
+    auto entered = replay_entered.get_future();
+    waitReadyOrExit(entered, "current binding replay entry");
 
-    auto disconnect =
-        std::async(std::launch::async, [&] { return registry.disconnectAbruptly(13, registered.session_id); });
-    CHECK(disconnect.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
+    auto disconnect = std::async(std::launch::async, [&] {
+        return registry.disconnectAbruptly(13, registered.session_id, activeBinding(registry, registered.session_id));
+    });
+    waitUntilOrExit([&] { return registry.inspect(registered.session_id)->state == SessionState::OfflineRetained; },
+                    "current binding disconnect retirement");
+    CHECK(disconnect.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
     release_replay.set_value();
-    CHECK(replay.get().status == Status::Ok);
-    CHECK(disconnect.get());
+    CHECK(getReadyOrExit(replay, "current binding replay completion").status == Status::Ok);
+    CHECK(getReadyOrExit(disconnect, "current binding disconnect completion"));
     CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
 }
 
@@ -597,21 +751,26 @@ void testCallbackCanDisconnectItsOwnBinding() {
     const auto registered = registry.registerEndpoint(request(3));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 3) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, registered.session_id, 2, 3) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(3, registered.session_id));
+    CHECK(registry.disconnectAbruptly(3, registered.session_id, activeBinding(registry, registered.session_id)));
 
     std::vector<std::uint64_t> replayed;
     auto resume = request(3, "tcp-reentrant", [&](const CoherenceFrame &frame) {
         replayed.push_back(requestId(frame));
-        CHECK(registry.disconnectAbruptly(3, registered.session_id));
+        CHECK(registry.disconnectAbruptly(3, registered.session_id, activeBinding(registry, registered.session_id)));
         return true;
     });
     resume.requested_session_id = registered.session_id;
     auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(resume); });
-    CHECK(replay.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-    CHECK(replay.get().status == Status::Ok);
+    const auto disconnected_binding = getReadyOrExit(replay, "self-disconnecting replay completion");
+    CHECK(disconnected_binding.status == Status::Ok);
     CHECK(replayed == std::vector<std::uint64_t>{1});
     CHECK(registry.inspect(registered.session_id)->state == SessionState::OfflineRetained);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, disconnected_binding.binding_id, 1));
+    auto second_resume = request(3, "tcp-second", [](const CoherenceFrame &) { return true; });
+    second_resume.requested_session_id = registered.session_id;
+    const auto second_binding = registry.registerEndpoint(second_resume);
+    CHECK(second_binding.status == Status::Ok);
+    CHECK(registry.acknowledgeResponses(registered.session_id, second_binding.binding_id, 1));
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{2});
 }
 
@@ -619,7 +778,7 @@ void testThrowingReplayReleasesItsBinding() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(4));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 4) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(4, registered.session_id));
+    CHECK(registry.disconnectAbruptly(4, registered.session_id, activeBinding(registry, registered.session_id)));
 
     auto resume = request(4, "tcp-throwing",
                           [](const CoherenceFrame &) -> bool { throw std::runtime_error("replay delivery failed"); });
@@ -644,8 +803,8 @@ void testNestedThrowingReplayRestoresOuterDeliveryContext() {
     const auto inner = registry.registerEndpoint(request(6));
     CHECK(pinHeartbeat(registry, outer.session_id, 1, 5) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, inner.session_id, 1, 6) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(5, outer.session_id));
-    CHECK(registry.disconnectAbruptly(6, inner.session_id));
+    CHECK(registry.disconnectAbruptly(5, outer.session_id, activeBinding(registry, outer.session_id)));
+    CHECK(registry.disconnectAbruptly(6, inner.session_id, activeBinding(registry, inner.session_id)));
 
     auto inner_resume = request(6, "tcp-inner", [](const CoherenceFrame &) -> bool {
         throw std::runtime_error("nested replay delivery failed");
@@ -656,14 +815,13 @@ void testNestedThrowingReplayRestoresOuterDeliveryContext() {
             (void)registry.registerEndpoint(inner_resume);
         } catch (const std::runtime_error &) {
         }
-        CHECK(registry.disconnectAbruptly(5, outer.session_id));
+        CHECK(registry.disconnectAbruptly(5, outer.session_id, activeBinding(registry, outer.session_id)));
         return true;
     });
     outer_resume.requested_session_id = outer.session_id;
 
     auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(outer_resume); });
-    CHECK(replay.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-    CHECK(replay.get().status == Status::Ok);
+    CHECK(getReadyOrExit(replay, "nested throwing replay completion").status == Status::Ok);
     CHECK(registry.inspect(outer.session_id)->state == SessionState::OfflineRetained);
 }
 
@@ -674,30 +832,35 @@ void testHeartbeatWatermark() {
     const auto two = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 2);
     const auto three = protocolRequest(Opcode::Heartbeat, 3, registered.session_id, 2);
     const auto four = protocolRequest(Opcode::Heartbeat, 4, registered.session_id, 2);
-    CHECK(registry.admitRequest(registered.session_id, one) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(registered.session_id, two) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(registered.session_id, three) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(registered.session_id, four) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), one) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), two) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), three) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), four) ==
+          RequestAdmissionResult::Accepted);
     CHECK(registry.pinResponse(registered.session_id, one, response(one)) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(registered.session_id, two, response(two)) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(registered.session_id, four, response(four)) == PinResponseResult::Pinned);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 2));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 2));
     CHECK(registry.responseWatermark(registered.session_id) == 2);
     CHECK(registry.replayFloor(registered.session_id) == 3);
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{4});
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(registry.responseWatermark(registered.session_id) == 2);
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{4});
-    CHECK(!registry.acknowledgeResponses(registered.session_id, 3));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 3));
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{4});
     CHECK(registry.pinResponse(registered.session_id, three, response(three)) == PinResponseResult::Pinned);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 3));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 3));
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{4});
-    CHECK(registry.acknowledgeResponses(registered.session_id, 4));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 4));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
     CHECK(registry.replayFloor(registered.session_id) == 5);
-    CHECK(!registry.acknowledgeResponses(registered.session_id, 5));
-    CHECK(!registry.acknowledgeResponses(registered.session_id, std::numeric_limits<std::uint64_t>::max()));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 5));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id),
+                                         std::numeric_limits<std::uint64_t>::max()));
     CHECK(registry.responseWatermark(registered.session_id) == 4);
     CHECK(registry.replayFloor(registered.session_id) == 5);
 }
@@ -706,13 +869,14 @@ void testAcknowledgementRequiresSuccessfulPublication() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(27));
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 27);
-    CHECK(registry.admitRequest(registered.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), heartbeat) ==
+          RequestAdmissionResult::Accepted);
     CHECK(registry.pinResponse(registered.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Pinned);
-    CHECK(!registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(registry.responseWatermark(registered.session_id) == 0);
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
 
-    CHECK(registry.disconnectAbruptly(27, registered.session_id));
+    CHECK(registry.disconnectAbruptly(27, registered.session_id, activeBinding(registry, registered.session_id)));
     std::vector<std::uint64_t> replayed;
     auto resume = request(27, "tcp-resumed", [&](const CoherenceFrame &frame) {
         replayed.push_back(requestId(frame));
@@ -721,7 +885,7 @@ void testAcknowledgementRequiresSuccessfulPublication() {
     resume.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(resume).status == Status::Ok);
     CHECK(replayed == std::vector<std::uint64_t>{1});
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
 }
 
@@ -730,7 +894,7 @@ void testReentrantAcknowledgementDuringSuccessfulPublication() {
     SessionId session_id{};
     bool acknowledged = false;
     const auto registered = registry.registerEndpoint(request(40, "tcp", [&](const CoherenceFrame &frame) {
-        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), requestId(frame));
         return true;
     }));
     session_id = registered.session_id;
@@ -746,13 +910,15 @@ void testReentrantAcknowledgementOfFinalUnregisterAllowsReplacement() {
     SessionId session_id{};
     bool acknowledged = false;
     const auto registered = registry.registerEndpoint(request(41, "tcp", [&](const CoherenceFrame &frame) {
-        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), requestId(frame));
         return true;
     }));
     session_id = registered.session_id;
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 41);
-    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.gracefulClose(41, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), unregister_request) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(41, session_id, activeBinding(registry, session_id), unregister_request) ==
+          Status::Ok);
 
     CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
@@ -767,7 +933,7 @@ void testReentrantAcknowledgementWithFalseDeliveryRequiresReplay() {
     SessionId session_id{};
     bool acknowledged = false;
     const auto registered = registry.registerEndpoint(request(42, "failing", [&](const CoherenceFrame &frame) {
-        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), requestId(frame));
         return false;
     }));
     session_id = registered.session_id;
@@ -787,7 +953,7 @@ void testReentrantAcknowledgementWithFalseDeliveryRequiresReplay() {
     CHECK(replayed == std::vector<std::uint64_t>{1});
     CHECK(registry.responseWatermark(session_id) == 0);
     CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
-    CHECK(registry.acknowledgeResponses(session_id, 1));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1));
 }
 
 void testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay() {
@@ -795,7 +961,7 @@ void testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay() {
     SessionId session_id{};
     bool acknowledged = false;
     const auto registered = registry.registerEndpoint(request(43, "throwing", [&](const CoherenceFrame &frame) {
-        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
+        acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), requestId(frame));
         throw std::runtime_error("delivery failed after ACK");
         return true;
     }));
@@ -822,7 +988,7 @@ void testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay() {
     CHECK(replayed == std::vector<std::uint64_t>{1});
     CHECK(registry.responseWatermark(session_id) == 0);
     CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
-    CHECK(registry.acknowledgeResponses(session_id, 1));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1));
 }
 
 void testFuturePinnedResponseCannotBeAcknowledgedWhileEarlierResponseIsInFlight() {
@@ -831,14 +997,16 @@ void testFuturePinnedResponseCannotBeAcknowledgedWhileEarlierResponseIsInFlight(
     bool future_acknowledged = true;
     const auto registered = registry.registerEndpoint(request(44, "tcp", [&](const CoherenceFrame &frame) {
         if (requestId(frame) == 1)
-            future_acknowledged = registry.acknowledgeResponses(session_id, 2);
+            future_acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2);
         return true;
     }));
     session_id = registered.session_id;
     const auto first = protocolRequest(Opcode::Heartbeat, 1, session_id, 44);
     const auto second = protocolRequest(Opcode::Heartbeat, 2, session_id, 44);
-    CHECK(registry.admitRequest(session_id, first) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(session_id, second) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), first) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), second) ==
+          RequestAdmissionResult::Accepted);
     CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::Pinned);
 
     CHECK(registry.pinResponse(session_id, first, response(first)) == PinResponseResult::Pinned);
@@ -855,8 +1023,8 @@ void testOverlappingDeliveryFailurePreservesAcknowledgementForSuccessfulAttempt(
     Status nested_resume_status = Status::InvalidState;
     std::size_t replacement_deliveries = 0;
     const auto registered = registry.registerEndpoint(request(45, "old", [&](const CoherenceFrame &frame) {
-        acknowledged = registry.acknowledgeResponses(session_id, requestId(frame));
-        disconnected = registry.disconnectAbruptly(45, session_id);
+        acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), requestId(frame));
+        disconnected = registry.disconnectAbruptly(45, session_id, activeBinding(registry, session_id));
         auto replacement = request(45, "replacement", [&](const CoherenceFrame &) {
             ++replacement_deliveries;
             return false;
@@ -887,15 +1055,17 @@ void testPublishedLowerAcknowledgementSurvivesHigherPendingFailure() {
         delivered.push_back(response_id);
         if (response_id == 1)
             return true;
-        higher_acknowledged = registry.acknowledgeResponses(session_id, 2);
-        lower_acknowledged = registry.acknowledgeResponses(session_id, 1);
+        higher_acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2);
+        lower_acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1);
         return false;
     }));
     session_id = registered.session_id;
     const auto first = protocolRequest(Opcode::Heartbeat, 1, session_id, 46);
     const auto second = protocolRequest(Opcode::Heartbeat, 2, session_id, 46);
-    CHECK(registry.admitRequest(session_id, first) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(session_id, second) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), first) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), second) ==
+          RequestAdmissionResult::Accepted);
 
     CHECK(registry.pinResponse(session_id, first, response(first)) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::Pinned);
@@ -920,7 +1090,8 @@ void testPinResponseCorrelationAndConflict() {
     const auto first = registry.registerEndpoint(request(14));
     const auto second = registry.registerEndpoint(request(15));
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, first.session_id, 14);
-    CHECK(registry.admitRequest(first.session_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(first.session_id, activeBinding(registry, first.session_id), heartbeat) ==
+          RequestAdmissionResult::Accepted);
     CHECK(registry.pinResponse(first.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(first.session_id, heartbeat, response(heartbeat)) == PinResponseResult::Duplicate);
 
@@ -965,10 +1136,10 @@ void testHolderIndexesAndGracefulClose() {
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 6) == PinResponseResult::Pinned);
     CHECK(closeSession(registry, 6, registered.session_id, 2) == Status::InvalidState);
     CHECK(registry.removeModifiedHolder(registered.session_id, 0x1000));
-    CHECK(registry.gracefulClose(7, registered.session_id,
+    CHECK(registry.gracefulClose(7, registered.session_id, activeBinding(registry, registered.session_id),
                                  protocolRequest(Opcode::Unregister, 2, registered.session_id, 6)) ==
           Status::StaleSession);
-    CHECK(registry.gracefulClose(6, registered.session_id,
+    CHECK(registry.gracefulClose(6, registered.session_id, activeBinding(registry, registered.session_id),
                                  protocolRequest(Opcode::Unregister, 2, registered.session_id, 6)) ==
           Status::InvalidState);
     CHECK(registry.cleanHolders(registered.session_id) == std::vector<std::uint64_t>{0x2000});
@@ -976,7 +1147,8 @@ void testHolderIndexesAndGracefulClose() {
     for (const auto line : clean_snapshot)
         CHECK(registry.removeCleanHolder(registered.session_id, line));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 2, registered.session_id, 6);
-    CHECK(registry.gracefulClose(6, registered.session_id, unregister_request) == Status::Ok);
+    CHECK(registry.gracefulClose(6, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::Ok);
     CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
     CHECK(!registry.inspect(registered.session_id)->closed_final_response_pinned);
     CHECK(registry.registerEndpoint(request(6)).status == Status::DuplicateHost);
@@ -988,9 +1160,9 @@ void testHolderIndexesAndGracefulClose() {
           PinResponseResult::Pinned);
     CHECK(registry.inspect(registered.session_id)->closed_final_response_pinned);
     CHECK(pinHeartbeat(registry, registered.session_id, 3, 6) == PinResponseResult::InvalidResponse);
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{2});
-    CHECK(registry.acknowledgeResponses(registered.session_id, 2));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 2));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
     CHECK(!registry.inspect(registered.session_id)->has_sender);
     CHECK(registry.inspect(registered.session_id)->transport_name.empty());
@@ -999,8 +1171,9 @@ void testHolderIndexesAndGracefulClose() {
     auto closed_resume = request(6);
     closed_resume.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(closed_resume).status == Status::StaleSession);
-    CHECK(registry.gracefulClose(6, registered.session_id, unregister_request) == Status::InvalidState);
-    CHECK(!registry.disconnectAbruptly(6, registered.session_id));
+    CHECK(registry.gracefulClose(6, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::StaleSession);
+    CHECK(!registry.disconnectAbruptly(6, registered.session_id, activeBinding(registry, registered.session_id)));
 
     const auto replacement = registry.registerEndpoint(request(6));
     CHECK(replacement.status == Status::Ok);
@@ -1019,9 +1192,10 @@ void testPinnedResponseBoundAndRecovery() {
     CHECK(full->response_backpressured);
     CHECK(pinHeartbeat(registry, registered.session_id, 2, 11) == PinResponseResult::Duplicate);
     const auto third = protocolRequest(Opcode::Heartbeat, 3, registered.session_id, 11);
-    CHECK(registry.admitRequest(registered.session_id, third) == RequestAdmissionResult::Backpressure);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), third) ==
+          RequestAdmissionResult::Backpressure);
     CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{1, 2}));
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
     CHECK(!registry.inspect(registered.session_id)->response_backpressured);
     CHECK(pinHeartbeat(registry, registered.session_id, 3, 11) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 11) == PinResponseResult::StaleRequest);
@@ -1034,7 +1208,7 @@ void testPinnedResponseBoundAndRecovery() {
           PinResponseResult::SessionUnavailable);
     CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{2, 3}));
 
-    CHECK(registry.disconnectAbruptly(11, registered.session_id));
+    CHECK(registry.disconnectAbruptly(11, registered.session_id, activeBinding(registry, registered.session_id)));
     CHECK(registry.pinnedResponseIds(registered.session_id) == (std::vector<std::uint64_t>{2, 3}));
 
     EndpointSessionRegistry zero_limit(64, 0);
@@ -1042,7 +1216,8 @@ void testPinnedResponseBoundAndRecovery() {
     CHECK(zero_limit.inspect(zero_registered.session_id)->pinned_response_limit == 1);
     CHECK(pinHeartbeat(zero_limit, zero_registered.session_id, 1, 12) == PinResponseResult::Pinned);
     const auto zero_second = protocolRequest(Opcode::Heartbeat, 2, zero_registered.session_id, 12);
-    CHECK(zero_limit.admitRequest(zero_registered.session_id, zero_second) == RequestAdmissionResult::Backpressure);
+    CHECK(zero_limit.admitRequest(zero_registered.session_id, zero_registered.binding_id, zero_second) ==
+          RequestAdmissionResult::Backpressure);
 }
 
 void testDefaultHostBoundaryAndClamp() {
@@ -1067,14 +1242,18 @@ void testOrderedAdmissionAndPublication() {
     std::vector<CoherenceFrame> requests;
     for (std::uint64_t id = 1; id <= 4; ++id) {
         requests.push_back(protocolRequest(Opcode::Heartbeat, id, registered.session_id, 20));
-        CHECK(registry.admitRequest(registered.session_id, requests.back()) == RequestAdmissionResult::Accepted);
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                    requests.back()) == RequestAdmissionResult::Accepted);
     }
-    CHECK(registry.admitRequest(registered.session_id, requests[1]) == RequestAdmissionResult::Duplicate);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), requests[1]) ==
+          RequestAdmissionResult::Duplicate);
     auto conflicting = requests[1];
     setOpcode(conflicting, Opcode::Fence);
-    CHECK(registry.admitRequest(registered.session_id, conflicting) == RequestAdmissionResult::Conflict);
-    CHECK(registry.admitRequest(registered.session_id, protocolRequest(Opcode::Heartbeat, 6, registered.session_id,
-                                                                       20)) == RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), conflicting) ==
+          RequestAdmissionResult::Conflict);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                protocolRequest(Opcode::Heartbeat, 6, registered.session_id, 20)) ==
+          RequestAdmissionResult::InvalidRequest);
 
     CHECK(registry.pinResponse(registered.session_id, requests[3], response(requests[3])) == PinResponseResult::Pinned);
     CHECK(registry.pinResponse(registered.session_id, requests[1], response(requests[1])) == PinResponseResult::Pinned);
@@ -1083,7 +1262,7 @@ void testOrderedAdmissionAndPublication() {
     CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
     CHECK(registry.pinResponse(registered.session_id, requests[2], response(requests[2])) == PinResponseResult::Pinned);
     CHECK(delivered == (std::vector<std::uint64_t>{1, 2, 3, 4}));
-    CHECK(!registry.acknowledgeResponses(registered.session_id, 5));
+    CHECK(!registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 5));
 }
 
 void testReplayBindingCannotMigrateToReplacement() {
@@ -1091,7 +1270,7 @@ void testReplayBindingCannotMigrateToReplacement() {
     const auto registered = registry.registerEndpoint(request(21));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 21) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, registered.session_id, 2, 21) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(21, registered.session_id));
+    CHECK(registry.disconnectAbruptly(21, registered.session_id, activeBinding(registry, registered.session_id)));
 
     std::promise<void> old_entered;
     std::promise<void> release_old;
@@ -1101,16 +1280,18 @@ void testReplayBindingCannotMigrateToReplacement() {
     auto old_resume = request(21, "old", [&](const CoherenceFrame &frame) {
         old_deliveries.push_back(requestId(frame));
         old_entered.set_value();
-        release.wait();
+        waitReadyOrExit(release, "old replay release");
         return false;
     });
     old_resume.requested_session_id = registered.session_id;
     auto old_replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(old_resume); });
-    old_entered.get_future().wait();
-    auto disconnect =
-        std::async(std::launch::async, [&] { return registry.disconnectAbruptly(21, registered.session_id); });
-    while (registry.inspect(registered.session_id)->state != SessionState::OfflineRetained)
-        std::this_thread::yield();
+    auto entered = old_entered.get_future();
+    waitReadyOrExit(entered, "old replay entry");
+    auto disconnect = std::async(std::launch::async, [&] {
+        return registry.disconnectAbruptly(21, registered.session_id, activeBinding(registry, registered.session_id));
+    });
+    waitUntilOrExit([&] { return registry.inspect(registered.session_id)->state == SessionState::OfflineRetained; },
+                    "replacement replay offline transition");
     auto replacement = request(21, "replacement", [&](const CoherenceFrame &frame) {
         replacement_deliveries.push_back(requestId(frame));
         return true;
@@ -1118,8 +1299,8 @@ void testReplayBindingCannotMigrateToReplacement() {
     replacement.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(replacement).status == Status::Ok);
     release_old.set_value();
-    CHECK(old_replay.get().status == Status::Ok);
-    CHECK(disconnect.get());
+    CHECK(getReadyOrExit(old_replay, "old replay completion").status == Status::Ok);
+    CHECK(getReadyOrExit(disconnect, "old binding disconnect completion"));
     CHECK(old_deliveries == std::vector<std::uint64_t>{1});
     CHECK(replacement_deliveries == (std::vector<std::uint64_t>{1, 2}));
 }
@@ -1128,10 +1309,12 @@ void testFalseDeliveryRetiresOnlyFailedBinding() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(22));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 22) == PinResponseResult::Pinned);
-    CHECK(registry.disconnectAbruptly(22, registered.session_id));
+    CHECK(registry.disconnectAbruptly(22, registered.session_id, activeBinding(registry, registered.session_id)));
     auto failing = request(22, "failing", [](const CoherenceFrame &) { return false; });
     failing.requested_session_id = registered.session_id;
-    CHECK(registry.registerEndpoint(failing).status == Status::IoError);
+    const auto failed_registration = registry.registerEndpoint(failing);
+    CHECK(failed_registration.status == Status::IoError);
+    CHECK(!failed_registration.binding_id);
     const auto failed = registry.inspect(registered.session_id);
     CHECK(failed->state == SessionState::OfflineRetained);
     CHECK(!failed->has_sender);
@@ -1155,18 +1338,20 @@ void testNestedRetirementSkipsOuterDeliveryFrames() {
         if (close_outer) {
             CHECK(pinHeartbeat(registry, outer.session_id, 1, 23) == PinResponseResult::Pinned);
             outer_request = protocolRequest(Opcode::Unregister, 2, outer.session_id, 23);
-            CHECK(registry.admitRequest(outer.session_id, outer_request) == RequestAdmissionResult::Accepted);
+            CHECK(registry.admitRequest(outer.session_id, activeBinding(registry, outer.session_id), outer_request) ==
+                  RequestAdmissionResult::Accepted);
         } else {
             CHECK(pinHeartbeat(registry, outer.session_id, 1, 23) == PinResponseResult::Pinned);
         }
         CHECK(pinHeartbeat(registry, inner.session_id, 1, 24) == PinResponseResult::Pinned);
-        CHECK(registry.disconnectAbruptly(23, outer.session_id));
-        CHECK(registry.disconnectAbruptly(24, inner.session_id));
+        CHECK(registry.disconnectAbruptly(23, outer.session_id, activeBinding(registry, outer.session_id)));
+        CHECK(registry.disconnectAbruptly(24, inner.session_id, activeBinding(registry, inner.session_id)));
         auto inner_resume = request(24, "inner", [&](const CoherenceFrame &) {
             if (close_outer)
-                CHECK(registry.gracefulClose(23, outer.session_id, outer_request) == Status::Ok);
+                CHECK(registry.gracefulClose(23, outer.session_id, activeBinding(registry, outer.session_id),
+                                             outer_request) == Status::Ok);
             else
-                CHECK(registry.disconnectAbruptly(23, outer.session_id));
+                CHECK(registry.disconnectAbruptly(23, outer.session_id, activeBinding(registry, outer.session_id)));
             return true;
         });
         inner_resume.requested_session_id = inner.session_id;
@@ -1176,8 +1361,7 @@ void testNestedRetirementSkipsOuterDeliveryFrames() {
         });
         outer_resume.requested_session_id = outer.session_id;
         auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(outer_resume); });
-        CHECK(replay.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
-        CHECK(replay.get().status == Status::Ok);
+        CHECK(getReadyOrExit(replay, "nested retirement replay completion").status == Status::Ok);
     }
 }
 
@@ -1186,8 +1370,9 @@ void testConcurrentPinJoinsBlockedReplayDrain() {
     const auto registered = registry.registerEndpoint(request(25));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 25) == PinResponseResult::Pinned);
     const auto second = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 25);
-    CHECK(registry.admitRequest(registered.session_id, second) == RequestAdmissionResult::Accepted);
-    CHECK(registry.disconnectAbruptly(25, registered.session_id));
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), second) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.disconnectAbruptly(25, registered.session_id, activeBinding(registry, registered.session_id)));
     std::promise<void> entered;
     std::promise<void> release_callback;
     const auto release = release_callback.get_future().share();
@@ -1196,16 +1381,17 @@ void testConcurrentPinJoinsBlockedReplayDrain() {
         delivered.push_back(requestId(frame));
         if (requestId(frame) == 1) {
             entered.set_value();
-            release.wait();
+            waitReadyOrExit(release, "concurrent pin replay release");
         }
         return true;
     });
     resume.requested_session_id = registered.session_id;
     auto replay = std::async(std::launch::async, [&] { return registry.registerEndpoint(resume); });
-    entered.get_future().wait();
+    auto replay_entered = entered.get_future();
+    waitReadyOrExit(replay_entered, "concurrent pin replay entry");
     CHECK(registry.pinResponse(registered.session_id, second, response(second)) == PinResponseResult::Pinned);
     release_callback.set_value();
-    CHECK(replay.get().status == Status::Ok);
+    CHECK(getReadyOrExit(replay, "concurrent pin replay completion").status == Status::Ok);
     CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
 }
 
@@ -1220,17 +1406,20 @@ void testRequestSpecificCloseAndHolderBound() {
     CHECK(!registry.addModifiedHolder(registered.session_id, 0x2000));
     CHECK(registry.removeCleanHolder(registered.session_id, 0x1000));
     CHECK(registry.addModifiedHolder(registered.session_id, 0x2000));
-    CHECK(registry.disconnectAbruptly(26, registered.session_id));
+    CHECK(registry.disconnectAbruptly(26, registered.session_id, activeBinding(registry, registered.session_id)));
     CHECK(!registry.addCleanHolder(registered.session_id, 0x3000));
     CHECK(registry.removeModifiedHolder(registered.session_id, 0x2000));
     auto resume = one_line;
     resume.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(resume).status == Status::Ok);
     const auto close_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 26);
-    CHECK(registry.admitRequest(registered.session_id, close_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), close_request) ==
+          RequestAdmissionResult::Accepted);
     const auto wrong = protocolRequest(Opcode::Unregister, 2, registered.session_id, 26);
-    CHECK(registry.gracefulClose(26, registered.session_id, wrong) == Status::InvalidState);
-    CHECK(registry.gracefulClose(26, registered.session_id, close_request) == Status::Ok);
+    CHECK(registry.gracefulClose(26, registered.session_id, activeBinding(registry, registered.session_id), wrong) ==
+          Status::InvalidState);
+    CHECK(registry.gracefulClose(26, registered.session_id, activeBinding(registry, registered.session_id),
+                                 close_request) == Status::Ok);
     CHECK(registry.pinResponse(registered.session_id, wrong, response(wrong)) == PinResponseResult::InvalidResponse);
     CHECK(registry.pinResponse(registered.session_id, close_request, response(close_request)) ==
           PinResponseResult::Pinned);
@@ -1248,7 +1437,8 @@ void testUnregisterResponseRequiresClosedIntent() {
     }));
     session_id = registered.session_id;
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 32);
-    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), unregister_request) ==
+          RequestAdmissionResult::Accepted);
 
     CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::InvalidResponse);
@@ -1256,7 +1446,8 @@ void testUnregisterResponseRequiresClosedIntent() {
     CHECK(registry.pinnedResponseIds(session_id).empty());
     CHECK(registry.inspect(session_id)->state == SessionState::Active);
 
-    CHECK(registry.gracefulClose(32, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.gracefulClose(32, session_id, activeBinding(registry, session_id), unregister_request) ==
+          Status::Ok);
     CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
     CHECK(delivered == std::vector<std::uint64_t>{1});
@@ -1275,15 +1466,17 @@ void testClosedFinalResponsePublishesAndRemainsPinnedUntilAck() {
     }));
     session_id = registered.session_id;
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, session_id, 28);
-    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.gracefulClose(28, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), unregister_request) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(28, session_id, activeBinding(registry, session_id), unregister_request) ==
+          Status::Ok);
     CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
     CHECK(delivered_while_closed);
     CHECK(registry.inspect(session_id)->state == SessionState::Closed);
     CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
     CHECK(registry.registerEndpoint(request(28)).status == Status::DuplicateHost);
-    CHECK(registry.acknowledgeResponses(session_id, 1));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1));
     CHECK(registry.pinnedResponseIds(session_id).empty());
     CHECK(registry.registerEndpoint(request(28)).status == Status::Ok);
 }
@@ -1297,8 +1490,10 @@ void testClosedFinalSendFailureResumesWithoutReopeningAdmission() {
             return false;
         }));
         const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 29);
-        CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
-        CHECK(registry.gracefulClose(29, registered.session_id, unregister_request) == Status::Ok);
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                    unregister_request) == RequestAdmissionResult::Accepted);
+        CHECK(registry.gracefulClose(29, registered.session_id, activeBinding(registry, registered.session_id),
+                                     unregister_request) == Status::Ok);
         bool propagated = false;
         try {
             CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
@@ -1311,9 +1506,9 @@ void testClosedFinalSendFailureResumesWithoutReopeningAdmission() {
         CHECK(failed->state == SessionState::Closed);
         CHECK(!failed->has_sender);
         CHECK(failed->transport_name.empty());
-        CHECK(registry.admitRequest(registered.session_id,
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
                                     protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 29)) ==
-              RequestAdmissionResult::InvalidRequest);
+              RequestAdmissionResult::SessionUnavailable);
         CHECK(registry.registerEndpoint(request(29)).status == Status::DuplicateHost);
 
         std::vector<std::uint64_t> replayed;
@@ -1326,10 +1521,10 @@ void testClosedFinalSendFailureResumesWithoutReopeningAdmission() {
         CHECK(registry.registerEndpoint(resume).status == Status::Ok);
         CHECK(replayed == std::vector<std::uint64_t>{1});
         CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
-        CHECK(registry.admitRequest(registered.session_id,
+        CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
                                     protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 29)) ==
               RequestAdmissionResult::InvalidRequest);
-        CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+        CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
         CHECK(registry.registerEndpoint(request(29)).status == Status::Ok);
     }
 }
@@ -1338,13 +1533,16 @@ void testClosedAbruptDisconnectBeforeFinalPinResumesClosed() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(30));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 30);
-    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.gracefulClose(30, registered.session_id, unregister_request) == Status::Ok);
-    CHECK(registry.disconnectAbruptly(30, registered.session_id));
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(30, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::Ok);
+    CHECK(registry.disconnectAbruptly(30, registered.session_id, activeBinding(registry, registered.session_id)));
     CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
     CHECK(!registry.inspect(registered.session_id)->has_sender);
-    CHECK(registry.admitRequest(registered.session_id, protocolRequest(Opcode::Heartbeat, 2, registered.session_id,
-                                                                       30)) == RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 30)) ==
+          RequestAdmissionResult::SessionUnavailable);
 
     std::vector<std::uint64_t> delivered;
     auto resume = request(30, "resumed", [&](const CoherenceFrame &frame) {
@@ -1358,40 +1556,50 @@ void testClosedAbruptDisconnectBeforeFinalPinResumesClosed() {
     CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
     CHECK(delivered == std::vector<std::uint64_t>{1});
-    CHECK(registry.acknowledgeResponses(registered.session_id, 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
 }
 
 void testUnregisterAdmissionIsTerminal() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(38));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 38);
-    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Duplicate);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                unregister_request) == RequestAdmissionResult::Duplicate);
 
     auto conflicting_duplicate = unregister_request;
     setOpcode(conflicting_duplicate, Opcode::Heartbeat);
-    CHECK(registry.admitRequest(registered.session_id, conflicting_duplicate) == RequestAdmissionResult::Conflict);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                conflicting_duplicate) == RequestAdmissionResult::Conflict);
 
     const auto next_heartbeat = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 38);
-    CHECK(registry.admitRequest(registered.session_id, next_heartbeat) == RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                next_heartbeat) == RequestAdmissionResult::InvalidRequest);
     const auto same_next_id = protocolRequest(Opcode::Fence, 2, registered.session_id, 38);
-    CHECK(registry.admitRequest(registered.session_id, same_next_id) == RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), same_next_id) ==
+          RequestAdmissionResult::InvalidRequest);
     const auto later_unregister = protocolRequest(Opcode::Unregister, 3, registered.session_id, 38);
-    CHECK(registry.admitRequest(registered.session_id, later_unregister) == RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                later_unregister) == RequestAdmissionResult::InvalidRequest);
 
-    CHECK(registry.gracefulClose(38, registered.session_id, unregister_request) == Status::Ok);
+    CHECK(registry.gracefulClose(38, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::Ok);
 }
 
 void testUnregisterNeverClosesOverLaterAdmittedWork() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(39));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 39);
-    CHECK(registry.admitRequest(registered.session_id, unregister_request) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id),
+                                unregister_request) == RequestAdmissionResult::Accepted);
     const auto later_request = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 39);
-    const auto later_admission = registry.admitRequest(registered.session_id, later_request);
+    const auto later_admission =
+        registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), later_request);
 
     CHECK(later_admission != RequestAdmissionResult::Accepted ||
-          registry.gracefulClose(39, registered.session_id, unregister_request) == Status::InvalidState);
+          registry.gracefulClose(39, registered.session_id, activeBinding(registry, registered.session_id),
+                                 unregister_request) == Status::InvalidState);
 }
 
 void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
@@ -1407,17 +1615,21 @@ void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
     session_id = registered.session_id;
     const auto earlier = protocolRequest(Opcode::Heartbeat, 1, session_id, 31);
     const auto unregister_request = protocolRequest(Opcode::Unregister, 2, session_id, 31);
-    CHECK(registry.admitRequest(session_id, earlier) == RequestAdmissionResult::Accepted);
-    CHECK(registry.admitRequest(session_id, unregister_request) == RequestAdmissionResult::Accepted);
-    CHECK(registry.gracefulClose(31, session_id, unregister_request) == Status::InvalidState);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), earlier) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, activeBinding(registry, session_id), unregister_request) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.gracefulClose(31, session_id, activeBinding(registry, session_id), unregister_request) ==
+          Status::InvalidState);
     CHECK(registry.inspect(session_id)->state == SessionState::Active);
     CHECK(registry.pinResponse(session_id, earlier, response(earlier)) == PinResponseResult::Pinned);
     CHECK(delivered == std::vector<std::uint64_t>{1});
-    CHECK(registry.gracefulClose(31, session_id, unregister_request) == Status::Ok);
+    CHECK(registry.gracefulClose(31, session_id, activeBinding(registry, session_id), unregister_request) ==
+          Status::Ok);
     CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
           PinResponseResult::Pinned);
     CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
-    CHECK(registry.acknowledgeResponses(session_id, 2));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2));
 }
 
 } // namespace
@@ -1425,14 +1637,19 @@ void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
 int main() {
     testFreshRegistrationAndValidation();
     testDisconnectResumeAndReplay();
+    testRetiredBindingCannotOperateAfterResume();
     testFreshRegistrationSenderCopyFailureDoesNotConsumeSessionId();
-    testFreshRegistrationRollsBackIfIndexInsertionThrows();
+    testFreshRegistrationRollsBackIfSessionIndexInsertionThrows();
+    testFreshRegistrationRollsBackIfHostIndexInsertionThrows();
     testSenderCopyCanInspectRegistryWithoutDeadlock();
+    testLosingDrainSenderIsDestroyedAfterRegistryUnlock();
     testDisconnectRetainsSessionWhileClosedSessionIsReplaced();
     testReplacementSenderCopyFailurePreservesClosedSession();
     testResumeSenderCopyFailurePreservesOfflineBinding();
     testResumeDrainCopyFailurePreservesOfflineBinding();
     testDuplicatePinRestartsDrainAfterSenderCopyFailure();
+    testDeliveryContextBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
+    testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
     testReplayDoesNotBlockRegistry();
     testDisconnectWaitsForCurrentBindingReplay();
     testCallbackCanDisconnectItsOwnBinding();
