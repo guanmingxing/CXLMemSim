@@ -216,9 +216,14 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         }
         if (retry)
             continue;
-        if (sender && !drainResponses(session, generation, sender)) {
-            result.status = protocol_v2::Status::IoError;
-            result.binding_id = {};
+        try {
+            if (sender && !drainResponses(session, generation, sender)) {
+                result.status = protocol_v2::Status::IoError;
+                result.binding_id = {};
+            }
+        } catch (...) {
+            retireFailedBinding(session, generation);
+            throw;
         }
         return result;
     }

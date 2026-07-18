@@ -691,6 +691,57 @@ void testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable() {
         endpoint_session_registry_test::FailurePoint::DrainResponseBookkeeping);
 }
 
+void expectResumeBookkeepingFailureRetiresBindingAndAllowsReplay(
+    endpoint_session_registry_test::FailurePoint failure_point) {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(50));
+    CHECK(pinHeartbeat(registry, registered.session_id, 1, 50) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(50, registered.session_id, registered.binding_id));
+
+    std::size_t deliveries = 0;
+    auto failing_resume = request(50, "failing-resume", [&](const CoherenceFrame &) {
+        ++deliveries;
+        return true;
+    });
+    failing_resume.requested_session_id = registered.session_id;
+    endpoint_session_registry_test::failNext(failure_point);
+    bool propagated = false;
+    try {
+        (void)registry.registerEndpoint(failing_resume);
+    } catch (const std::bad_alloc &) {
+        propagated = true;
+    }
+    CHECK(propagated);
+    CHECK(deliveries == 0);
+    const auto failed = registry.inspect(registered.session_id);
+    CHECK(failed->state == SessionState::OfflineRetained);
+    CHECK(!failed->binding_id);
+    CHECK(!failed->has_sender);
+    CHECK(failed->transport_name.empty());
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+
+    auto retry = request(50, "retry", [&](const CoherenceFrame &) {
+        ++deliveries;
+        return true;
+    });
+    retry.requested_session_id = registered.session_id;
+    const auto resumed = registry.registerEndpoint(retry);
+    CHECK(resumed.status == Status::Ok);
+    CHECK(resumed.binding_id);
+    CHECK(deliveries == 1);
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+}
+
+void testResumeDeliveryContextBookkeepingFailureRetiresBindingAndAllowsReplay() {
+    expectResumeBookkeepingFailureRetiresBindingAndAllowsReplay(
+        endpoint_session_registry_test::FailurePoint::DrainDeliveryContextBookkeeping);
+}
+
+void testResumeResponseBookkeepingFailureRetiresBindingAndAllowsReplay() {
+    expectResumeBookkeepingFailureRetiresBindingAndAllowsReplay(
+        endpoint_session_registry_test::FailurePoint::DrainResponseBookkeeping);
+}
+
 void testReplayDoesNotBlockRegistry() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(1));
@@ -1650,6 +1701,8 @@ int main() {
     testDuplicatePinRestartsDrainAfterSenderCopyFailure();
     testDeliveryContextBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
     testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
+    testResumeDeliveryContextBookkeepingFailureRetiresBindingAndAllowsReplay();
+    testResumeResponseBookkeepingFailureRetiresBindingAndAllowsReplay();
     testReplayDoesNotBlockRegistry();
     testDisconnectWaitsForCurrentBindingReplay();
     testCallbackCanDisconnectItsOwnBinding();
