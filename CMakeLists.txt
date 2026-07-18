@@ -78,7 +78,6 @@ endif()
 add_library(cxlmemsim STATIC ${SOURCE_FILES})
 target_include_directories(cxlmemsim PUBLIC include ${spdlog_INCLUDE_DIR})
 target_link_libraries(cxlmemsim spdlog::spdlog_header_only)
-set_property(SOURCE src/mesi_directory.cpp APPEND PROPERTY COMPILE_DEFINITIONS CXLMEMSIM_MESI_DIRECTORY_TESTING)
 
 enable_testing()
 
@@ -188,11 +187,18 @@ target_compile_definitions(test_endpoint_session_registry PRIVATE CXLMEMSIM_ENDP
 add_test(NAME test_endpoint_session_registry COMMAND test_endpoint_session_registry)
 set_tests_properties(test_endpoint_session_registry PROPERTIES TIMEOUT 30)
 
-add_executable(test_mesi_directory tests/test_mesi_directory.cpp)
+add_executable(test_mesi_directory tests/test_mesi_directory.cpp src/mesi_directory.cpp)
 target_include_directories(test_mesi_directory PRIVATE include)
-target_link_libraries(test_mesi_directory cxlmemsim)
+target_compile_definitions(
+    test_mesi_directory PRIVATE CXLMEMSIM_MESI_DIRECTORY_TESTING CXLMEMSIM_MESI_DIRECTORY_STANDALONE)
 add_test(NAME test_mesi_directory COMMAND test_mesi_directory)
 set_tests_properties(test_mesi_directory PROPERTIES TIMEOUT 30)
+
+add_executable(test_mesi_directory_engine tests/test_mesi_directory.cpp)
+target_include_directories(test_mesi_directory_engine PRIVATE include)
+target_link_libraries(test_mesi_directory_engine cxlmemsim)
+add_test(NAME test_mesi_directory_engine COMMAND test_mesi_directory_engine)
+set_tests_properties(test_mesi_directory_engine PROPERTIES TIMEOUT 30)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
