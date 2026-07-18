@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -956,6 +957,97 @@ void testReentrantAcknowledgementDuringSuccessfulPublication() {
     CHECK(registry.pinnedResponseIds(session_id).empty());
 }
 
+void testReentrantAcknowledgementAndClosePublishesTerminalResponse() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    CoherenceFrame unregister_request;
+    bool first_acknowledged = false;
+    Status close_status = Status::InvalidState;
+    std::vector<std::uint64_t> delivered;
+    const auto registered = registry.registerEndpoint(request(51, "tcp", [&](const CoherenceFrame &frame) {
+        delivered.push_back(requestId(frame));
+        if (requestId(frame) == 1) {
+            first_acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1);
+            close_status =
+                registry.gracefulClose(51, session_id, activeBinding(registry, session_id), unregister_request);
+        }
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, session_id, 51);
+    unregister_request = protocolRequest(Opcode::Unregister, 2, session_id, 51);
+    CHECK(registry.admitRequest(session_id, registered.binding_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, registered.binding_id, unregister_request) ==
+          RequestAdmissionResult::Accepted);
+
+    CHECK(registry.pinResponse(session_id, heartbeat, response(heartbeat)) == PinResponseResult::Pinned);
+    CHECK(first_acknowledged);
+    CHECK(close_status == Status::Ok);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2));
+    CHECK(registry.responseWatermark(session_id) == 2);
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+}
+
+void testFinalResponsePinnedDuringPreviousCallbackUsesSinglePublisher() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    CoherenceFrame unregister_request;
+    std::atomic<std::size_t> first_response_deliveries{0};
+    bool first_acknowledged = false;
+    Status close_status = Status::InvalidState;
+    std::mutex delivered_mutex;
+    std::vector<std::uint64_t> delivered;
+    std::promise<void> first_closed;
+    auto first_closed_completion = first_closed.get_future();
+    std::promise<void> release_first;
+    const auto release = release_first.get_future().share();
+    const auto registered = registry.registerEndpoint(request(52, "tcp", [&](const CoherenceFrame &frame) {
+        const auto id = requestId(frame);
+        {
+            std::lock_guard lock(delivered_mutex);
+            delivered.push_back(id);
+        }
+        if (id == 1 && first_response_deliveries.fetch_add(1) == 0) {
+            first_acknowledged = registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 1);
+            close_status =
+                registry.gracefulClose(52, session_id, activeBinding(registry, session_id), unregister_request);
+            first_closed.set_value();
+            waitReadyOrExit(release, "release first response after concurrent final pin");
+        }
+        return true;
+    }));
+    session_id = registered.session_id;
+    const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, session_id, 52);
+    unregister_request = protocolRequest(Opcode::Unregister, 2, session_id, 52);
+    CHECK(registry.admitRequest(session_id, registered.binding_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(session_id, registered.binding_id, unregister_request) ==
+          RequestAdmissionResult::Accepted);
+
+    auto first_publish = std::async(std::launch::async,
+                                    [&] { return registry.pinResponse(session_id, heartbeat, response(heartbeat)); });
+    waitReadyOrExit(first_closed_completion, "reentrant close before concurrent final pin");
+    CHECK(first_acknowledged);
+    CHECK(close_status == Status::Ok);
+    CHECK(registry.pinResponse(session_id, unregister_request, response(unregister_request)) ==
+          PinResponseResult::Pinned);
+    release_first.set_value();
+    CHECK(getReadyOrExit(first_publish, "first publication after concurrent final pin") == PinResponseResult::Pinned);
+
+    std::vector<std::uint64_t> observed;
+    {
+        std::lock_guard lock(delivered_mutex);
+        observed = delivered;
+    }
+    CHECK(observed == (std::vector<std::uint64_t>{1, 2}));
+    CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2));
+    CHECK(registry.responseWatermark(session_id) == 2);
+    CHECK(registry.pinnedResponseIds(session_id).empty());
+}
+
 void testReentrantAcknowledgementOfFinalUnregisterAllowsReplacement() {
     EndpointSessionRegistry registry;
     SessionId session_id{};
@@ -1711,6 +1803,8 @@ int main() {
     testHeartbeatWatermark();
     testAcknowledgementRequiresSuccessfulPublication();
     testReentrantAcknowledgementDuringSuccessfulPublication();
+    testReentrantAcknowledgementAndClosePublishesTerminalResponse();
+    testFinalResponsePinnedDuringPreviousCallbackUsesSinglePublisher();
     testReentrantAcknowledgementOfFinalUnregisterAllowsReplacement();
     testReentrantAcknowledgementWithFalseDeliveryRequiresReplay();
     testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay();

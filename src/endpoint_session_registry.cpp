@@ -276,7 +276,7 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
                                                            BindingId binding_id,
                                                            const protocol_v2::CoherenceFrame &unregister_request) {
     std::shared_ptr<Session> session;
-    std::unique_lock lock(mutex_);
+    std::lock_guard lock(mutex_);
     const auto found = sessions_.find(session_id);
     if (!binding_id || found == sessions_.end() || found->second->host_id != host_id ||
         found->second->binding_id != binding_id)
@@ -296,13 +296,9 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
         if (!session->pinned_responses.contains(lower->first))
             return protocol_v2::Status::InvalidState;
     }
-    const auto retired = session->binding_generation;
-    ++session->binding_generation;
     session->state = SessionState::Closed;
     session->close_request = unregister_request;
     session->closed_final_response_pinned = session->pinned_responses.contains(id);
-    session->publishing = false;
-    waitForRetiredGeneration(lock, *session, retired);
     return protocol_v2::Status::Ok;
 }
 
