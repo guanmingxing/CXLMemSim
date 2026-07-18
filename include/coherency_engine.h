@@ -13,6 +13,8 @@
 #ifndef CXLMEMSIM_COHERENCY_ENGINE_H
 #define CXLMEMSIM_COHERENCY_ENGINE_H
 
+#include "mesi_directory.h"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -75,7 +77,7 @@ public:
 
     CoherencyEngine(uint32_t local_node, HDMDecoder *decoder, LogPModel *logp, uint32_t max_heads = 16,
                     double bandwidth_gbps = 25.0);
-    ~CoherencyEngine() = default;
+    ~CoherencyEngine();
 
     // Main interface (called for every memory access)
     CoherencyResponse process_read(const CoherencyRequest &req);
@@ -109,6 +111,17 @@ public:
     };
     Stats get_stats() const;
 
+    // Strict protocol-v2 MESI path. This directory and its counters are
+    // independent from the legacy MOESI latency model above.
+    cxlmemsim::mesi_v2::MesiDirectory &strictV2Directory() noexcept { return strict_v2_directory_; }
+    const cxlmemsim::mesi_v2::MesiDirectory &strictV2Directory() const noexcept { return strict_v2_directory_; }
+    cxlmemsim::mesi_v2::TransitionResult strictV2Gets(uint64_t line_address, std::uint16_t requester);
+    cxlmemsim::mesi_v2::TransitionResult strictV2Getm(uint64_t line_address, std::uint16_t requester);
+    cxlmemsim::mesi_v2::TransitionResult strictV2Upgrade(uint64_t line_address, std::uint16_t requester);
+    cxlmemsim::mesi_v2::TransitionResult strictV2Puts(uint64_t line_address, std::uint16_t requester);
+    cxlmemsim::mesi_v2::TransitionResult strictV2Putm(uint64_t line_address, std::uint16_t requester);
+    cxlmemsim::mesi_v2::TransitionCounters strictV2TransitionCounters() const noexcept;
+
     uint32_t get_local_node_id() const { return local_node_id_; }
 
 private:
@@ -121,6 +134,7 @@ private:
 
     std::unordered_map<uint64_t, std::unique_ptr<DirectoryEntry>> directory_;
     mutable std::shared_mutex directory_mutex_;
+    cxlmemsim::mesi_v2::MesiDirectory strict_v2_directory_;
     std::unordered_map<uint32_t, FabricLink *> fabric_links_;
     std::vector<MHSLDHeadState> heads_;
 

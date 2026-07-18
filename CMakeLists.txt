@@ -53,6 +53,7 @@ set(SOURCE_FILES
     src/dcd_gfam.cpp
     src/hdm_decoder.cpp
     src/coherency_engine.cpp
+    src/mesi_directory.cpp
     src/coherence_protocol_v2.cpp
     src/endpoint_session_registry.cpp
     src/policy.cpp
@@ -77,6 +78,7 @@ endif()
 add_library(cxlmemsim STATIC ${SOURCE_FILES})
 target_include_directories(cxlmemsim PUBLIC include ${spdlog_INCLUDE_DIR})
 target_link_libraries(cxlmemsim spdlog::spdlog_header_only)
+set_property(SOURCE src/mesi_directory.cpp APPEND PROPERTY COMPILE_DEFINITIONS CXLMEMSIM_MESI_DIRECTORY_TESTING)
 
 enable_testing()
 
@@ -185,6 +187,12 @@ target_include_directories(test_endpoint_session_registry PRIVATE include)
 target_compile_definitions(test_endpoint_session_registry PRIVATE CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING)
 add_test(NAME test_endpoint_session_registry COMMAND test_endpoint_session_registry)
 set_tests_properties(test_endpoint_session_registry PROPERTIES TIMEOUT 30)
+
+add_executable(test_mesi_directory tests/test_mesi_directory.cpp)
+target_include_directories(test_mesi_directory PRIVATE include)
+target_link_libraries(test_mesi_directory cxlmemsim)
+add_test(NAME test_mesi_directory COMMAND test_mesi_directory)
+set_tests_properties(test_mesi_directory PROPERTIES TIMEOUT 30)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.

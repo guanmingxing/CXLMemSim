@@ -27,6 +27,8 @@ CoherencyEngine::CoherencyEngine(uint32_t local_node, HDMDecoder *decoder, LogPM
     }
 }
 
+CoherencyEngine::~CoherencyEngine() = default;
+
 DirectoryEntry *CoherencyEngine::get_or_create_entry(uint64_t addr) {
     uint64_t cl_addr = addr & ~(CACHELINE_SIZE - 1);
 
@@ -518,6 +520,30 @@ CoherencyEngine::Stats CoherencyEngine::get_stats() const {
     stats.avg_coherency_latency = ops > 0 ? static_cast<double>(lat) / ops : 0.0;
 
     return stats;
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Gets(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_directory_.gets(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Getm(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_directory_.getm(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Upgrade(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_directory_.upgrade(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Puts(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_directory_.puts(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Putm(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_directory_.putm(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionCounters CoherencyEngine::strictV2TransitionCounters() const noexcept {
+    return strict_v2_directory_.transitionCounters();
 }
 
 double CoherencyEngine::send_remote_invalidate(uint32_t target, uint64_t addr, uint64_t ts) {
