@@ -58,6 +58,36 @@ static size_t cxl_direct_max_bytes(void) {
     return (size_t)parsed;
 }
 
+// Dual-buffer ablation gates (overhead quantification; default 1 = current behavior).
+// CXL_DUAL_WRITE=0 skips the redundant orig MPI op after a CXL fast-path
+// Put/Accumulate. Only valid when every reader of the window goes through
+// intercepted MPI calls (the mirror): a rank dereferencing its own window
+// buffer directly reads the stale local_base.
+// CXL_MIRROR_SYNC=0 skips cxl_sync_mirror at sync points (fence/lock/unlock/flush).
+static int cxl_dual_write_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("CXL_DUAL_WRITE");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static int cxl_mirror_sync_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("CXL_MIRROR_SYNC");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static inline uint64_t shim_rdtsc(void) {
+    unsigned int lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 // ============================================================================
 // CC RMA-based Point-to-Point: per-sender slot in an MPI_Win backed by CXL
 // ============================================================================
@@ -277,6 +307,10 @@ typedef struct __attribute__((aligned(CACHELINE_SIZE))) {
     _Atomic uint32_t coll_phase;          // Current collective phase (4)
     _Atomic uint32_t coll_max_ranks;      // Max ranks for collectives (4)
     cxl_rptr_t coll_data_rptr[CXL_MAX_RANKS];  // Per-rank data pointers for collectives
+    // Allreduce staged schedules (binomial tree): per-rank rptr of the
+    // persistent workspace each rank allocates once per run. Published once
+    // (one-time setup barrier), then all subsequent calls are barrier-free.
+    cxl_rptr_t allreduce_ws_rptr[CXL_MAX_RANKS];
     // Total: 40 + 16 + 64*8 = 568 bytes
 } cxl_shm_header_t;
 
@@ -488,6 +522,8 @@ static struct {
     _Atomic uint64_t reduce_total;
     _Atomic uint64_t allreduce_total;
     _Atomic uint64_t allreduce_cxl;
+    _Atomic uint64_t allreduce_tree;
+    _Atomic uint64_t allreduce_rab;
     _Atomic uint64_t allreduce_bytes;
     _Atomic uint64_t allgather_total;
     _Atomic uint64_t allgather_cxl;
@@ -506,6 +542,11 @@ static struct {
     _Atomic uint64_t get_bytes;
     _Atomic uint64_t accumulate_total;
     _Atomic uint64_t fence_total;
+    // Dual-buffer overhead instrumentation
+    _Atomic uint64_t put_dualwrite_cycles;
+    _Atomic uint64_t sync_mirror_calls;
+    _Atomic uint64_t sync_mirror_bytes;
+    _Atomic uint64_t sync_mirror_cycles;
     // Memory
     _Atomic uint64_t cxl_alloc_count;
     _Atomic uint64_t cxl_alloc_bytes;
@@ -967,6 +1008,8 @@ use_shm:
         // Use cxl_safe_memset to avoid SIMD SIGILL on CXL device memory
         cxl_safe_memset(g_cxl.header->coll_data_rptr, 0xFF,
                         CXL_MAX_RANKS * sizeof(cxl_rptr_t));
+        cxl_safe_memset(g_cxl.header->allreduce_ws_rptr, 0xFF,
+                        CXL_MAX_RANKS * sizeof(cxl_rptr_t));
 
         // Set magic BEFORE marking init as done, so other processes
         // that arrive after init_state=2 also see valid magic
@@ -1021,6 +1064,8 @@ static void cxl_register_rank(int rank, int world_size) {
     atomic_store(&g_cxl.header->coll_max_ranks, (uint32_t)world_size);
     // Use cxl_safe_memset to avoid SIMD SIGILL on CXL device memory
     cxl_safe_memset(g_cxl.header->coll_data_rptr, 0xFF,
+                    CXL_MAX_RANKS * sizeof(cxl_rptr_t));
+    cxl_safe_memset(g_cxl.header->allreduce_ws_rptr, 0xFF,
                     CXL_MAX_RANKS * sizeof(cxl_rptr_t));
     atomic_store(&g_cxl.header->num_ranks, 0);
     if (rank == 0) {
@@ -1722,7 +1767,7 @@ int MPI_Finalize(void) {
             "    Barrier:    %6lu\n"
             "    Bcast:      %6lu (CXL: %lu, %lu bytes)\n"
             "    Reduce:     %6lu\n"
-            "    Allreduce:  %6lu (CXL: %lu, %lu bytes)\n"
+            "    Allreduce:  %6lu (CXL: %lu, tree: %lu, rab: %lu, %lu bytes)\n"
             "    Allgather:  %6lu (CXL: %lu)\n"
             "    Alltoall:   %6lu (CXL: %lu)\n"
             "    Gather:     %6lu (CXL: %lu)\n"
@@ -1732,6 +1777,8 @@ int MPI_Finalize(void) {
                 atomic_load(&g_stats.bcast_bytes),
             atomic_load(&g_stats.reduce_total),
             atomic_load(&g_stats.allreduce_total), atomic_load(&g_stats.allreduce_cxl),
+                atomic_load(&g_stats.allreduce_tree),
+                atomic_load(&g_stats.allreduce_rab),
                 atomic_load(&g_stats.allreduce_bytes),
             atomic_load(&g_stats.allgather_total), atomic_load(&g_stats.allgather_cxl),
             atomic_load(&g_stats.alltoall_total), atomic_load(&g_stats.alltoall_cxl),
@@ -1751,6 +1798,16 @@ int MPI_Finalize(void) {
                 atomic_load(&g_stats.get_bytes),
             atomic_load(&g_stats.accumulate_total),
             atomic_load(&g_stats.fence_total));
+        fprintf(stderr,
+            GREEN "  Dual-Buffer Overhead:\n" RESET
+            "    Dual-write:  %s (put_dualwrite_cycles: %lu)\n"
+            "    Mirror-sync: %s (calls: %lu, bytes: %lu, cycles: %lu)\n",
+            cxl_dual_write_enabled() ? "ON" : "OFF",
+            atomic_load(&g_stats.put_dualwrite_cycles),
+            cxl_mirror_sync_enabled() ? "ON" : "OFF",
+            atomic_load(&g_stats.sync_mirror_calls),
+            atomic_load(&g_stats.sync_mirror_bytes),
+            atomic_load(&g_stats.sync_mirror_cycles));
         fprintf(stderr,
             GREEN "  CXL Memory:\n" RESET
             "    Allocations: %lu (%lu bytes)\n"
@@ -2123,8 +2180,14 @@ static void unregister_cxl_window(MPI_Win win) {
 // after potential remote Puts or local pointer writes to the MPI buffer.
 static inline void cxl_sync_mirror(cxl_window_t *cxl_win) {
     if (cxl_win && cxl_win->cxl_base && cxl_win->local_base && cxl_win->local_size > 0) {
+        if (!cxl_mirror_sync_enabled())
+            return;
+        uint64_t t0 = shim_rdtsc();
         cxl_safe_memcpy(cxl_win->cxl_base, cxl_win->local_base, cxl_win->local_size);
         __atomic_thread_fence(__ATOMIC_RELEASE);
+        atomic_fetch_add(&g_stats.sync_mirror_cycles, shim_rdtsc() - t0);
+        atomic_fetch_add(&g_stats.sync_mirror_calls, 1);
+        atomic_fetch_add(&g_stats.sync_mirror_bytes, cxl_win->local_size);
     }
 }
 
@@ -2282,10 +2345,16 @@ int MPI_Put(const void *origin_addr, int origin_count, MPI_Datatype origin_datat
                           call_num, cxl_num, origin_bytes, target_rank, (long)target_disp);
 
                 // Also issue MPI Put to keep MPI buffer in sync for cross-VM readers
+                // (skippable via CXL_DUAL_WRITE=0 when all readers use the CXL path)
+                if (!cxl_dual_write_enabled())
+                    return MPI_SUCCESS;
                 atomic_fetch_add(&cxl_win->pending_mpi_rma, 1);
-                return orig_MPI_Put(origin_addr, origin_count, origin_datatype,
-                                    target_rank, target_disp, target_count,
-                                    target_datatype, win);
+                uint64_t t0 = shim_rdtsc();
+                int rc = orig_MPI_Put(origin_addr, origin_count, origin_datatype,
+                                      target_rank, target_disp, target_count,
+                                      target_datatype, win);
+                atomic_fetch_add(&g_stats.put_dualwrite_cycles, shim_rdtsc() - t0);
+                return rc;
             }
         }
     }
@@ -2398,6 +2467,8 @@ int MPI_Accumulate(const void *origin_addr, int origin_count, MPI_Datatype origi
                     }
                     LOG_DEBUG("MPI_Accumulate[%d]: CXL direct accumulate (MPI_SUM, double)\n", call_num);
                     // Also issue MPI Accumulate for cross-VM consistency
+                    if (!cxl_dual_write_enabled())
+                        return MPI_SUCCESS;
                     atomic_fetch_add(&cxl_win->pending_mpi_rma, 1);
                     return orig_MPI_Accumulate(origin_addr, origin_count, origin_datatype,
                                                 target_rank, target_disp, target_count,
@@ -2409,6 +2480,8 @@ int MPI_Accumulate(const void *origin_addr, int origin_count, MPI_Datatype origi
                         atomic_fetch_add(&dst[i], src[i]);
                     }
                     LOG_DEBUG("MPI_Accumulate[%d]: CXL direct accumulate (MPI_SUM, int)\n", call_num);
+                    if (!cxl_dual_write_enabled())
+                        return MPI_SUCCESS;
                     atomic_fetch_add(&cxl_win->pending_mpi_rma, 1);
                     return orig_MPI_Accumulate(origin_addr, origin_count, origin_datatype,
                                                 target_rank, target_disp, target_count,
@@ -2685,6 +2758,370 @@ bcast_fallback:
     return orig_MPI_Bcast(buffer, count, datatype, root, comm);
 }
 
+// ============================================================================
+// CXL Allreduce schedules
+// ============================================================================
+// The default CXL-native allreduce schedule is *flat*: every rank publishes
+// its contribution, one barrier, every rank reads and reduces all N slots,
+// one closing barrier. The shim additionally implements a *binomial tree*
+// (reduce to rank 0, then all ranks read the root's slot) and *Rabenseifner's*
+// algorithm (recursive-halving reduce-scatter followed by recursive-doubling
+// allgather), selected per run via CXL_ALLREDUCE_ALGO=tree|rabenseifner. Both
+// replace the two global MPI barriers with sequence-tagged flags in a
+// persistent per-rank workspace on the device, double-buffered on the call
+// parity so consecutive calls need no barrier between them.
+
+typedef enum {
+    CXL_ALLREDUCE_FLAT = 0,
+    CXL_ALLREDUCE_TREE = 1,
+    CXL_ALLREDUCE_RABENSEIFNER = 2,
+} cxl_allreduce_algo_t;
+
+static cxl_allreduce_algo_t cxl_allreduce_algo(void) {
+    static _Atomic int cached = -1;
+    int v = atomic_load(&cached);
+    if (v < 0) {
+        const char *env = getenv("CXL_ALLREDUCE_ALGO");
+        if (env && (strcmp(env, "tree") == 0 || strcmp(env, "binomial") == 0 ||
+                    strcmp(env, "binomial_tree") == 0)) {
+            v = CXL_ALLREDUCE_TREE;
+        } else if (env && (strcmp(env, "rabenseifner") == 0 || strcmp(env, "rab") == 0)) {
+            v = CXL_ALLREDUCE_RABENSEIFNER;
+        } else {
+            if (env && *env && strcmp(env, "flat") != 0) {
+                LOG_WARN("CXL_ALLREDUCE_ALGO=%s not supported, using flat\n", env);
+            }
+            v = CXL_ALLREDUCE_FLAT;
+        }
+        atomic_store(&cached, v);
+    }
+    return (cxl_allreduce_algo_t)v;
+}
+
+// Element-wise SUM of src into dst for the allowlisted datatypes.
+// Callers must gate on cxl_allreduce_type_supported() first.
+static void cxl_reduce_sum(void *dst, const void *src, int count, MPI_Datatype datatype) {
+    if (datatype == MPI_DOUBLE) {
+        double *d = (double *)dst; const double *s = (const double *)src;
+        for (int i = 0; i < count; i++) d[i] += s[i];
+    } else if (datatype == MPI_FLOAT) {
+        float *d = (float *)dst; const float *s = (const float *)src;
+        for (int i = 0; i < count; i++) d[i] += s[i];
+    } else if (datatype == MPI_INT) {
+        int *d = (int *)dst; const int *s = (const int *)src;
+        for (int i = 0; i < count; i++) d[i] += s[i];
+    } else if (datatype == MPI_LONG) {
+        long *d = (long *)dst; const long *s = (const long *)src;
+        for (int i = 0; i < count; i++) d[i] += s[i];
+    } else if (datatype == MPI_LONG_LONG) {
+        long long *d = (long long *)dst; const long long *s = (const long long *)src;
+        for (int i = 0; i < count; i++) d[i] += s[i];
+    }
+}
+
+static bool cxl_allreduce_type_supported(MPI_Datatype datatype, MPI_Op op) {
+    return op == MPI_SUM &&
+           (datatype == MPI_DOUBLE || datatype == MPI_FLOAT || datatype == MPI_INT ||
+            datatype == MPI_LONG || datatype == MPI_LONG_LONG);
+}
+
+// Persistent per-rank workspace for the tree schedule. flag carries a
+// monotonically increasing sequence tag (never reset), so the workspace is
+// reusable across calls without any barrier; data[] holds two parity-indexed
+// slots of g_allreduce_ws.slot_bytes each.
+typedef struct __attribute__((aligned(CACHELINE_SIZE))) {
+    _Atomic uint64_t flag;
+    uint8_t _pad[CACHELINE_SIZE - sizeof(_Atomic uint64_t)];
+    uint8_t data[];
+} cxl_allreduce_ws_t;
+
+// Tag layout: [seq:56][k:8], strictly increasing across a rank's publishes.
+// Tree: k = round index the rank sends its partial at (awaited by the
+// parent), or 0xFF for the root's "result ready" publish.
+// Rabenseifner: k = K_INPUT for an excluded even rank's raw-input publish;
+// K_RS_BASE + r after the initial copy (+fold) and r reduce-scatter rounds;
+// K_RS_BASE + R + j after j allgather steps (K_RS_BASE + 2R = final result).
+#define CXL_ALLREDUCE_TAG(seq, k) ((uint64_t)(seq) << 8 | (uint64_t)(k))
+#define CXL_ALLREDUCE_K_DONE 0xFFu
+#define CXL_ALLREDUCE_K_INPUT 0u
+#define CXL_ALLREDUCE_K_RS_BASE 1u
+
+static struct {
+    int state;      // 0 = uninitialized, 1 = ready, -1 = disabled
+    size_t slot_bytes;
+    uint64_t seq;   // per-process call counter; consistent across ranks
+                    // because every rank takes the tree path deterministically
+    cxl_allreduce_ws_t *ws[CXL_MAX_RANKS];
+} g_allreduce_ws = {0};
+
+// Publish this rank's progress flag with release semantics and write it back
+// to the device (cc builds; fence-only in nocc builds).
+static inline void cxl_allreduce_publish(cxl_allreduce_ws_t *ws, uint64_t tag) {
+    atomic_store_explicit(&ws->flag, tag, memory_order_release);
+    cxl_flush_range((void *)&ws->flag, sizeof(ws->flag));
+}
+
+// Spin until a peer's flag reaches (>=) the wanted tag, re-reading from the
+// device each iteration. Tags increase monotonically and Rabenseifner ranks
+// publish several tags per call, so a fast peer may already be past the
+// awaited value. All ranks enter the staged path deterministically (the gate
+// conditions are identical across ranks), so this cannot deadlock; warn
+// periodically in case a peer died.
+static inline void cxl_allreduce_wait(cxl_allreduce_ws_t *ws, uint64_t want, int peer) {
+    uint64_t spins = 0;
+    for (;;) {
+        cxl_invalidate_range((void *)&ws->flag, sizeof(ws->flag));
+        if (atomic_load_explicit(&ws->flag, memory_order_acquire) >= want) return;
+        __asm__ volatile("pause" ::: "memory");
+        if (++spins == (1ULL << 30)) {
+            spins = 0;
+            LOG_WARN("Allreduce: rank %d still waiting on rank %d (flag=0x%lx want=0x%lx)\n",
+                     g_cxl.my_rank, peer,
+                     (unsigned long)atomic_load(&ws->flag), (unsigned long)want);
+        }
+    }
+}
+
+// One-time setup: allocate this rank's workspace, publish its rptr in the
+// shared header, and (single setup barrier) resolve every peer's workspace.
+static bool cxl_allreduce_ws_setup(void) {
+    if (g_allreduce_ws.state == 1) return true;
+    if (g_allreduce_ws.state == -1) return false;
+
+    LOAD_ORIGINAL(MPI_Barrier);
+    if (!orig_MPI_Barrier || !g_cxl.header) {
+        g_allreduce_ws.state = -1;
+        return false;
+    }
+
+    size_t slot = (cxl_direct_max_bytes() + CXL_ALIGNMENT - 1) & ~(size_t)(CXL_ALIGNMENT - 1);
+    cxl_allreduce_ws_t *my_ws =
+        allocate_cxl_memory(sizeof(cxl_allreduce_ws_t) + 2 * slot);
+    if (my_ws) {
+        atomic_store(&my_ws->flag, 0);
+        cxl_flush_range((void *)&my_ws->flag, sizeof(my_ws->flag));
+    }
+
+    g_cxl.header->allreduce_ws_rptr[g_cxl.my_rank] = ptr_to_rptr(my_ws);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    cxl_flush_range(&g_cxl.header->allreduce_ws_rptr[g_cxl.my_rank], sizeof(cxl_rptr_t));
+
+    // Single setup barrier; every call after this is barrier-free.
+    orig_MPI_Barrier(MPI_COMM_WORLD);
+
+    cxl_invalidate_range(g_cxl.header->allreduce_ws_rptr,
+                         g_cxl.world_size * sizeof(cxl_rptr_t));
+    bool ok = true;
+    for (int r = 0; r < g_cxl.world_size; r++) {
+        g_allreduce_ws.ws[r] = rptr_to_ptr(g_cxl.header->allreduce_ws_rptr[r]);
+        if (!g_allreduce_ws.ws[r]) ok = false;
+    }
+
+    // All ranks read the same shared array, so they agree on ok/failure and
+    // no rank is left waiting inside the tree protocol.
+    if (!ok) {
+        LOG_WARN("Allreduce tree: workspace setup failed, disabling tree schedule\n");
+        g_allreduce_ws.state = -1;
+        return false;
+    }
+
+    g_allreduce_ws.slot_bytes = slot;
+    g_allreduce_ws.state = 1;
+    LOG_INFO("Allreduce tree: workspace ready (%zu bytes/slot, %d ranks)\n",
+             slot, g_cxl.world_size);
+    return true;
+}
+
+// Binomial-tree allreduce on the shared CXL region: reduce to rank 0 along a
+// binomial tree, then every rank reads the root's slot. Returns MPI_SUCCESS,
+// or -1 if the tree schedule is unavailable (caller falls back).
+static int cxl_allreduce_tree_run(const void *sendbuf, void *recvbuf, int count,
+                                  MPI_Datatype datatype, size_t total_size) {
+    if (!cxl_allreduce_ws_setup()) return -1;
+    if (total_size > g_allreduce_ws.slot_bytes) return -1;
+
+    const int rank = g_cxl.my_rank;
+    const int size = g_cxl.world_size;
+    const uint64_t seq = ++g_allreduce_ws.seq;
+    const size_t slot = g_allreduce_ws.slot_bytes;
+    const int parity = (int)(seq & 1);
+
+    cxl_allreduce_ws_t *my_ws = g_allreduce_ws.ws[rank];
+    uint8_t *my_data = my_ws->data + (size_t)parity * slot;
+
+    // Stage my contribution in my parity slot.
+    cxl_safe_memcpy(my_data, sendbuf, total_size);
+
+    // Reduce toward rank 0: at round r, ranks with the r-th bit set publish
+    // their partial and are done sending; their parent (rank without that
+    // bit) waits for the child's round-r tag and folds the child's slot in.
+    int round = 0;
+    for (int mask = 1; mask < size; mask <<= 1, round++) {
+        if (rank & mask) {
+            cxl_flush_range(my_data, total_size);
+            cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, round));
+            break;
+        }
+        int child = rank | mask;
+        if (child >= size) continue;
+        cxl_allreduce_ws_t *child_ws = g_allreduce_ws.ws[child];
+        cxl_allreduce_wait(child_ws, CXL_ALLREDUCE_TAG(seq, round), child);
+        uint8_t *child_data = child_ws->data + (size_t)parity * slot;
+        cxl_invalidate_range(child_data, total_size);
+        cxl_reduce_sum(my_data, child_data, count, datatype);
+    }
+
+    if (rank == 0) {
+        // Root's slot now holds the full result: publish, then take it home.
+        cxl_flush_range(my_data, total_size);
+        cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_DONE));
+        cxl_safe_memcpy(recvbuf, my_data, total_size);
+    } else {
+        // Everyone else reads the root's slot once it is tagged done.
+        cxl_allreduce_ws_t *root_ws = g_allreduce_ws.ws[0];
+        cxl_allreduce_wait(root_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_DONE), 0);
+        uint8_t *root_data = root_ws->data + (size_t)parity * slot;
+        cxl_invalidate_range(root_data, total_size);
+        cxl_safe_memcpy(recvbuf, root_data, total_size);
+    }
+    // No closing barrier: the parity double-buffer protects the previous
+    // call's slots, and the sequence tags protect this call's flags.
+
+    return MPI_SUCCESS;
+}
+
+// Rabenseifner's allreduce on the shared CXL region: recursive-halving
+// reduce-scatter (each round a rank folds its pair-peer's copy of the half
+// it keeps, so segments halve while partial sums double), then
+// recursive-doubling allgather (each step reads back the peer's owned
+// segment, doubling ownership until every rank holds the full vector).
+// Non-power-of-two sizes use the MPICH scheme: the first 2*rem ranks fold
+// pairwise (even rank drops out, odd rank continues), and excluded ranks
+// read the final vector from their partner. Synchronization is the same
+// sequence-tagged flag / parity double-buffer protocol as the tree; a rank
+// publishes one tag per completed stage and waiters use >= so nobody ever
+// blocks a faster peer. A peer's already-read regions are never rewritten
+// within a call (halving only shrinks inward, doubling only writes the
+// complement), so late readers are safe.
+// Returns MPI_SUCCESS, or -1 if the schedule is unavailable (caller falls
+// back).
+static int cxl_allreduce_rabenseifner_run(const void *sendbuf, void *recvbuf, int count,
+                                          MPI_Datatype datatype, int type_size) {
+    const size_t total_size = (size_t)count * type_size;
+    if (!cxl_allreduce_ws_setup()) return -1;
+    if (total_size > g_allreduce_ws.slot_bytes) return -1;
+
+    const int rank = g_cxl.my_rank;
+    const int size = g_cxl.world_size;
+    const uint64_t seq = ++g_allreduce_ws.seq;
+    const size_t slot = g_allreduce_ws.slot_bytes;
+    const int parity = (int)(seq & 1);
+    const size_t ts = (size_t)type_size;
+
+    // Largest power of two <= size, and R = log2(pof2).
+    int pof2 = 1, R = 0;
+    while (pof2 * 2 <= size) { pof2 *= 2; R++; }
+    const int rem = size - pof2;
+    if (R > 8) return -1;  // cannot happen under the world_size <= 64 gate
+
+    cxl_allreduce_ws_t *my_ws = g_allreduce_ws.ws[rank];
+    uint8_t *my_data = my_ws->data + (size_t)parity * slot;
+
+    cxl_safe_memcpy(my_data, sendbuf, total_size);
+
+    int newrank;
+    if (rank < 2 * rem) {
+        if ((rank & 1) == 0) {
+            // Excluded even rank: publish raw input for the odd partner,
+            // then wait for the partner's final vector and take it home.
+            cxl_flush_range(my_data, total_size);
+            cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_INPUT));
+
+            cxl_allreduce_ws_t *pw = g_allreduce_ws.ws[rank + 1];
+            cxl_allreduce_wait(pw, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE + 2 * R),
+                               rank + 1);
+            uint8_t *pd = pw->data + (size_t)parity * slot;
+            cxl_invalidate_range(pd, total_size);
+            cxl_safe_memcpy(recvbuf, pd, total_size);
+            return MPI_SUCCESS;
+        }
+        // Odd rank: fold the even partner's input, then join the
+        // power-of-two group as newrank = rank/2.
+        cxl_allreduce_ws_t *pw = g_allreduce_ws.ws[rank - 1];
+        cxl_allreduce_wait(pw, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_INPUT), rank - 1);
+        uint8_t *pd = pw->data + (size_t)parity * slot;
+        cxl_invalidate_range(pd, total_size);
+        cxl_reduce_sum(my_data, pd, count, datatype);
+        newrank = rank / 2;
+    } else {
+        newrank = rank - rem;
+    }
+
+    // Initial copy (+ fold) visible before any peer reads a segment.
+    cxl_flush_range(my_data, total_size);
+    cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE));
+
+    // Reduce-scatter by recursive halving. Both members of a round-k pair
+    // hold identical [lo, hi) (their kept halves so far agree on bits < k),
+    // so mid is computed consistently; the lower newrank keeps the lower
+    // half. Element-based halving handles counts that do not divide evenly
+    // (degenerating to empty segments when count < pof2, which stays
+    // correct: reads become zero-length, tags still advance).
+    int lo = 0, hi = count;
+    int lo_hist[8], hi_hist[8], mid_hist[8], kept_lower[8];
+    for (int k = 0; k < R; k++) {
+        int newpeer = newrank ^ (1 << k);
+        int peer = newpeer < rem ? newpeer * 2 + 1 : newpeer + rem;
+        cxl_allreduce_ws_t *pw = g_allreduce_ws.ws[peer];
+        cxl_allreduce_wait(pw, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE + k), peer);
+
+        int mid = lo + (hi - lo) / 2;
+        lo_hist[k] = lo; hi_hist[k] = hi; mid_hist[k] = mid;
+        kept_lower[k] = (newrank < newpeer);
+        int klo = kept_lower[k] ? lo : mid;
+        int khi = kept_lower[k] ? mid : hi;
+
+        if (khi > klo) {
+            uint8_t *pd = pw->data + (size_t)parity * slot;
+            cxl_invalidate_range(pd + (size_t)klo * ts, (size_t)(khi - klo) * ts);
+            cxl_reduce_sum(my_data + (size_t)klo * ts, pd + (size_t)klo * ts,
+                           khi - klo, datatype);
+            cxl_flush_range(my_data + (size_t)klo * ts, (size_t)(khi - klo) * ts);
+        }
+        lo = klo; hi = khi;
+        cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE + k + 1));
+    }
+
+    // Allgather by recursive doubling, replaying the halving in reverse:
+    // at step k the peer owns exactly the half of [lo_hist[k], hi_hist[k])
+    // this rank gave up; copy it back and double the owned region.
+    for (int k = R - 1; k >= 0; k--) {
+        int newpeer = newrank ^ (1 << k);
+        int peer = newpeer < rem ? newpeer * 2 + 1 : newpeer + rem;
+        cxl_allreduce_ws_t *pw = g_allreduce_ws.ws[peer];
+        cxl_allreduce_wait(pw,
+                           CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE + R + (R - 1 - k)),
+                           peer);
+
+        int glo = kept_lower[k] ? mid_hist[k] : lo_hist[k];
+        int ghi = kept_lower[k] ? hi_hist[k] : mid_hist[k];
+        if (ghi > glo) {
+            uint8_t *pd = pw->data + (size_t)parity * slot;
+            cxl_invalidate_range(pd + (size_t)glo * ts, (size_t)(ghi - glo) * ts);
+            cxl_safe_memcpy(my_data + (size_t)glo * ts, pd + (size_t)glo * ts,
+                            (size_t)(ghi - glo) * ts);
+            cxl_flush_range(my_data + (size_t)glo * ts, (size_t)(ghi - glo) * ts);
+        }
+        cxl_allreduce_publish(my_ws, CXL_ALLREDUCE_TAG(seq, CXL_ALLREDUCE_K_RS_BASE + R + (R - k)));
+    }
+
+    cxl_safe_memcpy(recvbuf, my_data, total_size);
+    // No closing barrier, as in the tree: parity double-buffering plus the
+    // K_RS_BASE + 2R done tag (awaited by excluded ranks) carry the ordering.
+
+    return MPI_SUCCESS;
+}
+
 int MPI_Reduce(const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype,
                MPI_Op op, int root, MPI_Comm comm) {
     static _Atomic int reduce_count = 0;
@@ -2719,9 +3156,30 @@ int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count, MPI_Datatype da
     // Note: Skip if sendbuf is MPI_IN_PLACE to avoid complexity
     if (g_cxl.cxl_comm_enabled && g_cxl.all_ranks_local &&
         comm == MPI_COMM_WORLD && sendbuf != MPI_IN_PLACE &&
-        op == MPI_SUM && total_size <= cxl_direct_max_bytes() && g_cxl.world_size <= 64 &&
-        (datatype == MPI_DOUBLE || datatype == MPI_FLOAT || datatype == MPI_INT ||
-         datatype == MPI_LONG || datatype == MPI_LONG_LONG)) {
+        total_size <= cxl_direct_max_bytes() && g_cxl.world_size <= 64 &&
+        cxl_allreduce_type_supported(datatype, op)) {
+
+        // Staged schedules (CXL_ALLREDUCE_ALGO=tree|rabenseifner): binomial
+        // tree reduces to rank 0 and all ranks read the root's slot;
+        // Rabenseifner runs reduce-scatter + recursive-doubling allgather.
+        // Either falls through to the flat schedule if its workspace is
+        // unavailable.
+        cxl_allreduce_algo_t algo = cxl_allreduce_algo();
+        if (algo == CXL_ALLREDUCE_TREE &&
+            cxl_allreduce_tree_run(sendbuf, recvbuf, count, datatype, total_size) == MPI_SUCCESS) {
+            atomic_fetch_add(&g_stats.allreduce_cxl, 1);
+            atomic_fetch_add(&g_stats.allreduce_tree, 1);
+            LOG_DEBUG("MPI_Allreduce[%d]: CXL tree SUM (%zu bytes)\n", call_num, total_size);
+            return MPI_SUCCESS;
+        }
+        if (algo == CXL_ALLREDUCE_RABENSEIFNER &&
+            cxl_allreduce_rabenseifner_run(sendbuf, recvbuf, count, datatype,
+                                           type_size) == MPI_SUCCESS) {
+            atomic_fetch_add(&g_stats.allreduce_cxl, 1);
+            atomic_fetch_add(&g_stats.allreduce_rab, 1);
+            LOG_DEBUG("MPI_Allreduce[%d]: CXL rabenseifner SUM (%zu bytes)\n", call_num, total_size);
+            return MPI_SUCCESS;
+        }
 
         LOAD_ORIGINAL(MPI_Barrier);
 
@@ -2750,37 +3208,7 @@ int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count, MPI_Datatype da
                         cxl_invalidate_range(their_buf, total_size);
 #endif
                         // Perform reduction based on datatype
-                        if (datatype == MPI_DOUBLE) {
-                            double *dst = (double *)recvbuf;
-                            double *src = (double *)their_buf;
-                            for (int i = 0; i < count; i++) {
-                                dst[i] += src[i];
-                            }
-                        } else if (datatype == MPI_FLOAT) {
-                            float *dst = (float *)recvbuf;
-                            float *src = (float *)their_buf;
-                            for (int i = 0; i < count; i++) {
-                                dst[i] += src[i];
-                            }
-                        } else if (datatype == MPI_INT) {
-                            int *dst = (int *)recvbuf;
-                            int *src = (int *)their_buf;
-                            for (int i = 0; i < count; i++) {
-                                dst[i] += src[i];
-                            }
-                        } else if (datatype == MPI_LONG) {
-                            long *dst = (long *)recvbuf;
-                            long *src = (long *)their_buf;
-                            for (int i = 0; i < count; i++) {
-                                dst[i] += src[i];
-                            }
-                        } else if (datatype == MPI_LONG_LONG) {
-                            long long *dst = (long long *)recvbuf;
-                            long long *src = (long long *)their_buf;
-                            for (int i = 0; i < count; i++) {
-                                dst[i] += src[i];
-                            }
-                        }
+                        cxl_reduce_sum(recvbuf, their_buf, count, datatype);
                     } else {
                         // Rank's buffer not available - fall back to original
                         LOG_WARN("MPI_Allreduce[%d]: Rank %d buffer unavailable, fallback\n",
