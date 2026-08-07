@@ -65,8 +65,11 @@ std::uint64_t loadScalar(const std::array<std::byte, 64> &line, std::size_t offs
 class TestMemory final : public CoherenceMemoryBackend {
 public:
     std::array<std::byte, 64> readLine(std::uint64_t address) override {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         ++reads_;
+        read_entered_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return !block_reads_; });
         return lines_[address];
     }
 
@@ -97,6 +100,26 @@ public:
         std::lock_guard lock(mutex_);
         block_writes_ = true;
         write_entered_ = false;
+    }
+
+    void blockReads() {
+        std::lock_guard lock(mutex_);
+        block_reads_ = true;
+        read_entered_ = false;
+    }
+
+    void waitForRead() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, kWait, [&] { return read_entered_; })) {
+            std::cerr << "backend read wait timed out\n";
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+
+    void releaseReads() {
+        std::lock_guard lock(mutex_);
+        block_reads_ = false;
+        changed_.notify_all();
     }
 
     void waitForWrite() {
@@ -138,6 +161,8 @@ private:
     bool block_writes_{};
     bool throw_writes_{};
     bool write_entered_{};
+    bool block_reads_{};
+    bool read_entered_{};
 };
 
 class TestTransport final : public CoherenceTransport {
@@ -229,6 +254,26 @@ CoherenceFrame requestFrame(Opcode opcode_value, std::uint64_t request_id, Sessi
     setSrcHost(frame, host_id);
     setDstHost(frame, kServerHost);
     return frame;
+}
+
+CoherenceFrame responseFrame(const CoherenceFrame &request) {
+    auto response = initializeFrame(Opcode::Response);
+    setRequestId(response, requestId(request));
+    setSessionId(response, sessionId(request));
+    setSrcHost(response, kServerHost);
+    setDstHost(response, srcHost(request));
+    setStatus(response, Status::Ok);
+    setAddress(response, address(request));
+    const auto request_opcode = opcode(request);
+    if (request_opcode == Opcode::Getm || request_opcode == Opcode::AtomicFaa || request_opcode == Opcode::AtomicCas) {
+        setLineState(response, LineState::M);
+        setEpoch(response, epoch(request) + 1);
+        setPayloadLength(response, kLineSize);
+    } else if (request_opcode == Opcode::Putm) {
+        setLineState(response, LineState::I);
+        setEpoch(response, epoch(request) + 1);
+    }
+    return response;
 }
 
 RegistrationRequest registration(std::uint16_t host) {
@@ -430,6 +475,13 @@ std::vector<std::uint64_t> task5CleanHolders(Registry &registry, SessionId sessi
         return registry.cleanHolders(session, binding);
     else
         return registry.cleanHolders(session);
+}
+
+template <typename Registry, typename Token>
+bool task5IdentityCanRemoveClean(Registry &registry, const Token &token, std::uint64_t address) {
+    if constexpr (requires { registry.removeCleanHolder(token, address); })
+        return registry.removeCleanHolder(token, address);
+    return false;
 }
 
 struct AuditObservation {
@@ -968,7 +1020,7 @@ void testFencedOrdinaryAdmissionIsBoundedAndControlUsesContext() {
     setLineState(putm, LineState::M);
     setPayloadLength(putm, kLineSize);
     putm.data.fill(0x5a);
-    CHECK(registry.admitRequest(live.session_id, live.binding_id, putm) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitOperation(live.session_id, live.binding_id, putm).result == RequestAdmissionResult::Accepted);
     CHECK(
         registry.admitRequest(live.session_id, live.binding_id, requestFrame(Opcode::Fence, 2, live.session_id, 25)) ==
         RequestAdmissionResult::Accepted);
@@ -1012,7 +1064,7 @@ void testFencedOrdinaryAdmissionIsBoundedAndControlUsesContext() {
     CHECK(prebarrier_generation.has_value());
     CHECK(prebarrier_registry.sealFencedSession(*prebarrier_generation).has_value());
     CHECK(prebarrier_registry.disconnectAbruptly(37, prebarrier.session_id, prebarrier.binding_id));
-    CHECK(!prebarrier_registry.removeCleanHolder(*prebarrier_generation, kLineB));
+    CHECK(!task5IdentityCanRemoveClean(prebarrier_registry, *prebarrier_generation, kLineB));
 
     MesiDirectory directory;
     CHECK(directory.gets(kLineA, 33).committed());
@@ -1048,7 +1100,9 @@ void testEvictionWaitsForAdmittedAtomicHolderPublicationAndFencesNewWork() {
     setAddress(admitted, kLineA);
     setSize(admitted, 8);
     setValue(admitted, 3);
-    CHECK(registry.admitRequest(live.session_id, live.binding_id, admitted) == RequestAdmissionResult::Accepted);
+    auto registry_admission = registry.admitOperation(live.session_id, live.binding_id, admitted);
+    CHECK(registry_admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(registry_admission.authority);
 
     auto atomic = std::async(std::launch::async,
                              [&] { return engine.fetchAdd(kLineA, {26, live.session_id, 1}, std::uint64_t{3}); });
@@ -1070,8 +1124,8 @@ void testEvictionWaitsForAdmittedAtomicHolderPublicationAndFencesNewWork() {
     memory.releaseWrites();
     const auto completed = ready(atomic, "admitted atomic");
     CHECK(completed.status == Status::Ok);
-    CHECK(task5AddModified(registry, live.session_id, live.binding_id, kLineA));
-    CHECK(task5Complete(registry, live.session_id, live.binding_id, 1));
+    CHECK(registry.addModifiedHolder(authority, kLineA));
+    CHECK(registry.completeOperation(authority));
     const auto result = ready(eviction, "eviction lifecycle barrier");
     CHECK(result.status == TestAdministrativeStatus::DirtyDataPresent);
     checkState(directory, kLineA, MesiState::M, 26, 0, 1, false);
@@ -1129,7 +1183,7 @@ void testHolderIndexRejectsRetiredBindingAfterResume() {
     CHECK(second.status == Status::Ok);
     CHECK(!task5AddClean(registry, first.session_id, first.binding_id, kLineB));
     CHECK(!task5RemoveClean(registry, first.session_id, first.binding_id, kLineA));
-    CHECK(!registry.removeCleanHolder(*retired_generation, kLineA));
+    CHECK(!task5IdentityCanRemoveClean(registry, *retired_generation, kLineA));
     CHECK(task5AddClean(registry, second.session_id, second.binding_id, kLineB));
     CHECK(task5CleanHolders(registry, second.session_id, second.binding_id) ==
           (std::vector<std::uint64_t>{kLineA, kLineB}));
@@ -1171,9 +1225,12 @@ void testUnregisterPreflightsAllCandidatesBeforeFirstRemoval() {
     CHECK(race_registry.disconnectAbruptly(35, race.session_id, race.binding_id));
     CHECK(ready(closing, "UNREGISTER binding loss") != Status::Ok);
     checkState(race_directory, kLineC, MesiState::E, 35, 0, 1, true);
-    const auto offline = race_registry.captureGeneration(35, race.session_id, BindingId{});
-    CHECK(offline.has_value());
-    CHECK(race_registry.holderSnapshot(*offline).clean == std::vector<std::uint64_t>{kLineC});
+    auto resume = registration(35);
+    resume.requested_session_id = race.session_id;
+    const auto resumed = race_registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
+    CHECK(task5CleanHolders(race_registry, resumed.session_id, resumed.binding_id) ==
+          std::vector<std::uint64_t>{kLineC});
 }
 
 template <typename Engine> bool exerciseDurableBoundedAuditContract() {
@@ -1233,7 +1290,7 @@ void testForcedLossKeepsSealedGenerationAcrossReentrantDisconnect() {
     class DisconnectingSink final : public MesiTransactionEngine::AuditSink {
     public:
         bool accept(const CoherenceAuditRecord &) override {
-            disconnected = registry->disconnectAbruptly(host_id, session_id, binding_id);
+            disconnected = registry->disconnectAbruptly(host_id, session_id, binding_id) || disconnected;
             return true;
         }
 
@@ -1267,6 +1324,378 @@ void testForcedLossKeepsSealedGenerationAcrossReentrantDisconnect() {
     CHECK(!registry.inspect(live.session_id).has_value());
 }
 
+template <typename Registry>
+constexpr bool hasRound2OperationAuthority =
+    requires(Registry &registry) { registry.admitOperation(SessionId{}, BindingId{}, CoherenceFrame{}); };
+
+template <typename Engine>
+constexpr bool hasRound2EvictionFaultInjection = requires { typename Engine::AdministrativeFaultInjector; };
+
+void testUnregisterRejectsMissingEarlierPinnedResponseBeforeMutation() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 38).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(38));
+    CHECK(task5AddClean(registry, live.session_id, live.binding_id, kLineA));
+    const auto heartbeat = requestFrame(Opcode::Heartbeat, 1, live.session_id, 38);
+    const auto unregister = requestFrame(Opcode::Unregister, 2, live.session_id, 38);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, unregister) == RequestAdmissionResult::Accepted);
+    CHECK(task5Complete(registry, live.session_id, live.binding_id, 1));
+    const auto before = directory.lockLine(kLineA)->snapshot();
+
+    CHECK(engine.unregisterSession(registry, 38, live.session_id, live.binding_id, unregister) == Status::InvalidState);
+    const auto after = directory.lockLine(kLineA)->snapshot();
+    CHECK(after.state == before.state);
+    CHECK(after.epoch == before.epoch);
+    CHECK(task5CleanHolders(registry, live.session_id, live.binding_id) == std::vector<std::uint64_t>{kLineA});
+}
+
+void testUnregisterRejectsInFlightResponseRetirementBeforeMutation() {
+    std::mutex sender_mutex;
+    std::condition_variable sender_changed;
+    bool sender_entered = false;
+    bool release_sender = false;
+
+    auto registration_request = registration(49);
+    registration_request.sender = [&](const CoherenceFrame &) {
+        std::unique_lock lock(sender_mutex);
+        sender_entered = true;
+        sender_changed.notify_all();
+        sender_changed.wait(lock, [&] { return release_sender; });
+        return false;
+    };
+
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 49).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration_request);
+    CHECK(registry.addCleanHolder(live.session_id, live.binding_id, kLineA));
+    const auto heartbeat = requestFrame(Opcode::Heartbeat, 1, live.session_id, 49);
+    const auto unregister = requestFrame(Opcode::Unregister, 2, live.session_id, 49);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, heartbeat) == RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, unregister) == RequestAdmissionResult::Accepted);
+
+    auto publishing = std::async(
+        std::launch::async, [&] { return registry.pinResponse(live.session_id, heartbeat, responseFrame(heartbeat)); });
+    {
+        std::unique_lock lock(sender_mutex);
+        sender_changed.wait(lock, [&] { return sender_entered; });
+    }
+    const auto before = directory.lockLine(kLineA)->snapshot();
+    CHECK(engine.unregisterSession(registry, 49, live.session_id, live.binding_id, unregister) == Status::InvalidState);
+    const auto after = directory.lockLine(kLineA)->snapshot();
+    CHECK(after.state == before.state);
+    CHECK(after.epoch == before.epoch);
+    CHECK(registry.cleanHolders(live.session_id, live.binding_id) == std::vector<std::uint64_t>{kLineA});
+
+    {
+        std::lock_guard lock(sender_mutex);
+        release_sender = true;
+    }
+    sender_changed.notify_all();
+    CHECK(ready(publishing, "in-flight response retirement") == PinResponseResult::Pinned);
+}
+
+void testRound2AuthorityAndStickyLossSurfacesArePresent() {
+    CHECK(hasRound2OperationAuthority<EndpointSessionRegistry>);
+    CHECK(hasRound2EvictionFaultInjection<MesiTransactionEngine>);
+}
+
+void testAdmittedAtomicPublishesAfterDisconnectBeforeOfflineCleanup() {
+    MesiDirectory directory;
+    TestMemory memory;
+    auto initial = bytes(0x20);
+    storeScalar(initial, 0, 9);
+    memory.seed(kLineA, initial);
+    memory.blockWrites();
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(43));
+    CHECK(engine.bindSession(43, live.session_id));
+    auto request = requestFrame(Opcode::AtomicFaa, 1, live.session_id, 43);
+    setAddress(request, kLineA);
+    setSize(request, sizeof(std::uint64_t));
+    setValue(request, 4);
+    auto admission = registry.admitOperation(live.session_id, live.binding_id, request);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(admission.authority);
+    CHECK(static_cast<bool>(authority));
+
+    auto operation =
+        std::async(std::launch::async, [&] { return engine.fetchAdd(kLineA, {43, live.session_id, 1}, 4); });
+    memory.waitForWrite();
+    CHECK(registry.disconnectAbruptly(43, live.session_id, live.binding_id));
+    (void)engine.notifyDisconnect(43, live.session_id);
+    auto resume = registration(43);
+    resume.requested_session_id = live.session_id;
+    CHECK(registry.registerEndpoint(resume).status == Status::StaleSession);
+    auto eviction = std::async(std::launch::async, [&] {
+        return engine.evictHost(registry, 43, live.session_id, BindingId{}, HostFailurePolicy::AssertProcessStopped);
+    });
+    CHECK(eviction.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+
+    memory.releaseWrites();
+    CHECK(ready(operation, "post-disconnect admitted atomic").status == Status::Ok);
+    CHECK(registry.addModifiedHolder(authority, kLineA));
+    CHECK(registry.completeOperation(authority));
+    CHECK(!registry.addModifiedHolder(authority, kLineB));
+    CHECK(!registry.completeOperation(authority));
+    const auto result = ready(eviction, "offline atomic cleanup barrier");
+    CHECK(result.status == AdministrativeStatus::DirtyDataPresent);
+    checkState(directory, kLineA, MesiState::M, 43, 0, 1, false);
+
+    const auto generation = registry.captureGeneration(43, live.session_id, BindingId{});
+    CHECK(generation.has_value());
+    auto cleanup = registry.freezeFencedGenerationForCleanup(*generation);
+    CHECK(cleanup.has_value());
+    CHECK(registry.holderSnapshot(*cleanup).modified == std::vector<std::uint64_t>{kLineA});
+    registry.abortFencedCleanup(*cleanup);
+}
+
+void testAdmittedGetmPublishesTerminalFailureAfterDisconnectBeforeOfflineCleanup() {
+    MesiDirectory directory;
+    TestMemory memory;
+    memory.seed(kLineA, bytes(0x31));
+    memory.blockReads();
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(44));
+    CHECK(engine.bindSession(44, live.session_id));
+    auto request = requestFrame(Opcode::Getm, 1, live.session_id, 44);
+    setAddress(request, kLineA);
+    auto admission = registry.admitOperation(live.session_id, live.binding_id, request);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(admission.authority);
+    CHECK(static_cast<bool>(authority));
+
+    auto operation = std::async(std::launch::async, [&] { return engine.getm(kLineA, {44, live.session_id, 1}); });
+    memory.waitForRead();
+    CHECK(registry.disconnectAbruptly(44, live.session_id, live.binding_id));
+    (void)engine.notifyDisconnect(44, live.session_id);
+    auto eviction = std::async(std::launch::async, [&] {
+        return engine.evictHost(registry, 44, live.session_id, BindingId{}, HostFailurePolicy::AssertProcessStopped);
+    });
+    CHECK(eviction.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+
+    memory.releaseReads();
+    CHECK(ready(operation, "post-disconnect admitted GETM").status == Status::HostFenced);
+    auto failed_response = responseFrame(request);
+    setStatus(failed_response, Status::HostFenced);
+    setLineState(failed_response, lineState(request));
+    setEpoch(failed_response, epoch(request));
+    setPayloadLength(failed_response, 0);
+    CHECK(registry.pinResponse(authority, request, failed_response) == PinResponseResult::Pinned);
+    CHECK(registry.completeOperation(authority));
+    CHECK(registry.pinResponse(authority, request, failed_response) == PinResponseResult::SessionUnavailable);
+    const auto result = ready(eviction, "offline GETM cleanup barrier");
+    CHECK(result.status == AdministrativeStatus::Ok);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 0, true);
+    CHECK(!registry.inspect(live.session_id).has_value());
+}
+
+void testAdmittedPutmPublishesRemovalAfterDisconnectAndAllowsRetirement() {
+    MesiDirectory directory;
+    CHECK(directory.getm(kLineA, 45).committed());
+    TestMemory memory;
+    memory.seed(kLineA, bytes(0x41));
+    memory.blockWrites();
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(45));
+    CHECK(registry.addModifiedHolder(live.session_id, live.binding_id, kLineA));
+    CHECK(engine.bindSession(45, live.session_id));
+    auto request = requestFrame(Opcode::Putm, 1, live.session_id, 45);
+    setAddress(request, kLineA);
+    setEpoch(request, 1);
+    setLineState(request, LineState::M);
+    setPayloadLength(request, kLineSize);
+    auto admission = registry.admitOperation(live.session_id, live.binding_id, request);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(admission.authority);
+    CHECK(static_cast<bool>(authority));
+    const auto updated = bytes(0x52);
+
+    auto operation =
+        std::async(std::launch::async, [&] { return engine.putm(kLineA, {45, live.session_id, 1}, 1, updated); });
+    memory.waitForWrite();
+    CHECK(registry.disconnectAbruptly(45, live.session_id, live.binding_id));
+    (void)engine.notifyDisconnect(45, live.session_id);
+    auto eviction = std::async(std::launch::async, [&] {
+        return engine.evictHost(registry, 45, live.session_id, BindingId{}, HostFailurePolicy::AssertProcessStopped);
+    });
+    CHECK(eviction.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+
+    memory.releaseWrites();
+    CHECK(ready(operation, "post-disconnect admitted PUTM").status == Status::Ok);
+    CHECK(registry.removeModifiedHolder(authority, kLineA));
+    CHECK(registry.pinResponse(authority, request, responseFrame(request)) == PinResponseResult::Pinned);
+    CHECK(registry.completeOperation(authority));
+    const auto result = ready(eviction, "offline PUTM cleanup barrier");
+    CHECK(result.status == AdministrativeStatus::Ok);
+    CHECK(memory.line(kLineA) == updated);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+    CHECK(!registry.inspect(live.session_id).has_value());
+}
+
+void testDuplicateUnregisterExecutionCannotReleaseOwnerFreeze() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 46).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(46));
+    CHECK(registry.addCleanHolder(live.session_id, live.binding_id, kLineA));
+    const auto request = requestFrame(Opcode::Unregister, 1, live.session_id, 46);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, request) == RequestAdmissionResult::Accepted);
+    auto held_line = directory.lockLine(kLineA);
+    CHECK(held_line.has_value());
+    auto owner = std::async(std::launch::async, [&] {
+        return engine.unregisterSession(registry, 46, live.session_id, live.binding_id, request);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + kWait;
+    while (!registry.inspect(live.session_id)->unregister_in_progress) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            std::_Exit(EXIT_FAILURE);
+        std::this_thread::yield();
+    }
+    auto duplicate = std::async(std::launch::async, [&] {
+        return engine.unregisterSession(registry, 46, live.session_id, live.binding_id, request);
+    });
+    CHECK(ready(duplicate, "duplicate UNREGISTER execution") == Status::StaleSession);
+    CHECK(!registry.disconnectAbruptly(46, live.session_id, live.binding_id));
+    held_line.reset();
+    CHECK(ready(owner, "owning UNREGISTER execution") == Status::Ok);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+}
+
+void testDirtyUnregisterLeavesSessionAbleToDrainPutmAndRetry() {
+    MesiDirectory directory;
+    CHECK(directory.getm(kLineA, 50).committed());
+    TestMemory memory;
+    memory.seed(kLineA, bytes(0x61));
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(50));
+    CHECK(engine.bindSession(50, live.session_id));
+    CHECK(registry.addModifiedHolder(live.session_id, live.binding_id, kLineA));
+    const auto first_unregister = requestFrame(Opcode::Unregister, 1, live.session_id, 50);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, first_unregister) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(engine.unregisterSession(registry, 50, live.session_id, live.binding_id, first_unregister) ==
+          Status::InvalidState);
+    auto failed_unregister_response = responseFrame(first_unregister);
+    setStatus(failed_unregister_response, Status::InvalidState);
+    const auto failed_pin = registry.pinResponse(live.session_id, first_unregister, failed_unregister_response);
+    CHECK(failed_pin == PinResponseResult::Pinned);
+    if (failed_pin != PinResponseResult::Pinned)
+        return;
+
+    auto putm_request = requestFrame(Opcode::Putm, 2, live.session_id, 50);
+    setAddress(putm_request, kLineA);
+    setEpoch(putm_request, 1);
+    setLineState(putm_request, LineState::M);
+    setPayloadLength(putm_request, kLineSize);
+    auto admission = registry.admitOperation(live.session_id, live.binding_id, putm_request);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(admission.authority);
+    const auto updated = bytes(0x72);
+    CHECK(engine.putm(kLineA, {50, live.session_id, 2}, 1, updated).status == Status::Ok);
+    CHECK(registry.removeModifiedHolder(authority, kLineA));
+    CHECK(registry.pinResponse(authority, putm_request, responseFrame(putm_request)) == PinResponseResult::Pinned);
+    CHECK(registry.completeOperation(authority));
+
+    const auto retry = requestFrame(Opcode::Unregister, 3, live.session_id, 50);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, retry) == RequestAdmissionResult::Accepted);
+    CHECK(engine.unregisterSession(registry, 50, live.session_id, live.binding_id, retry) == Status::Ok);
+    CHECK(memory.line(kLineA) == updated);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+}
+
+void testForcedLossStaysStickyWhenSecondCandidateThrows() {
+    class ThrowOnOrdinal final : public MesiTransactionEngine::AdministrativeFaultInjector {
+    public:
+        explicit ThrowOnOrdinal(std::size_t ordinal) : ordinal_(ordinal) {}
+        void beforeLine(std::size_t ordinal, std::uint64_t) override {
+            if (ordinal == ordinal_)
+                throw std::runtime_error("injected administrative line failure");
+        }
+
+    private:
+        std::size_t ordinal_;
+    } injector(1);
+
+    MesiDirectory directory;
+    CHECK(directory.getm(kLineA, 47).committed());
+    CHECK(directory.getm(kLineB, 47).committed());
+    TestMemory memory;
+    TestTransport transport;
+    AcceptingAuditSink sink;
+    MesiTransactionEngine engine(directory, memory, transport, kWait, 1, &sink, 8, &injector);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(47));
+    CHECK(registry.addModifiedHolder(live.session_id, live.binding_id, kLineA));
+    CHECK(registry.addModifiedHolder(live.session_id, live.binding_id, kLineB));
+    CHECK(registry.disconnectAbruptly(47, live.session_id, live.binding_id));
+
+    const auto result = engine.evictHost(registry, 47, live.session_id, BindingId{}, HostFailurePolicy::ForceDataLoss);
+    CHECK(result.status == AdministrativeStatus::DataLoss);
+    CHECK(result.dirty_lost == 1);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+    checkState(directory, kLineB, MesiState::M, 47, 0, 1, false);
+    CHECK(engine.auditCounters().forced_dirty_loss == 1);
+    CHECK(sink.records.size() == 3);
+    CHECK(std::count_if(sink.records.begin(), sink.records.end(),
+                        [](const auto &record) { return record.phase == AuditRecordPhase::Intent; }) == 2);
+    CHECK(std::count_if(sink.records.begin(), sink.records.end(), [](const auto &record) {
+              return record.phase == AuditRecordPhase::Completion && record.line_address == kLineA;
+          }) == 1);
+    const auto completed = engine.auditRecords();
+    CHECK(completed.size() == 1);
+    CHECK(completed.front().line_address == kLineA);
+    CHECK(completed.front().phase == AuditRecordPhase::Completion);
+
+    const auto generation = registry.captureGeneration(47, live.session_id, BindingId{});
+    CHECK(generation.has_value());
+    auto cleanup = registry.freezeFencedGenerationForCleanup(*generation);
+    CHECK(cleanup.has_value());
+    CHECK(registry.holderSnapshot(*cleanup).modified == std::vector<std::uint64_t>{kLineB});
+    registry.abortFencedCleanup(*cleanup);
+
+    ThrowOnOrdinal first_injector(0);
+    MesiDirectory before_directory;
+    CHECK(before_directory.getm(kLineC, 48).committed());
+    TestMemory before_memory;
+    TestTransport before_transport;
+    AcceptingAuditSink before_sink;
+    MesiTransactionEngine before_engine(before_directory, before_memory, before_transport, kWait, 1, &before_sink, 8,
+                                        &first_injector);
+    EndpointSessionRegistry before_registry;
+    const auto before_live = before_registry.registerEndpoint(registration(48));
+    CHECK(before_registry.addModifiedHolder(before_live.session_id, before_live.binding_id, kLineC));
+    CHECK(before_registry.disconnectAbruptly(48, before_live.session_id, before_live.binding_id));
+    const auto before_result = before_engine.evictHost(before_registry, 48, before_live.session_id, BindingId{},
+                                                       HostFailurePolicy::ForceDataLoss);
+    CHECK(before_result.status == AdministrativeStatus::InvalidHost);
+    CHECK(before_result.dirty_lost == 0);
+    checkState(before_directory, kLineC, MesiState::M, 48, 0, 1, false);
+    CHECK(before_engine.auditCounters().forced_dirty_loss == 0);
+    CHECK(before_engine.auditRecords().empty());
+    CHECK(before_sink.records.size() == 1);
+    CHECK(before_sink.records.front().phase == AuditRecordPhase::Intent);
+}
+
 } // namespace
 
 int main() {
@@ -1288,6 +1717,15 @@ int main() {
     testUnregisterPreflightsAllCandidatesBeforeFirstRemoval();
     testForcedLossRequiresDurableAuditAndDiagnosticStorageIsBounded();
     testForcedLossKeepsSealedGenerationAcrossReentrantDisconnect();
+    testUnregisterRejectsMissingEarlierPinnedResponseBeforeMutation();
+    testUnregisterRejectsInFlightResponseRetirementBeforeMutation();
+    testRound2AuthorityAndStickyLossSurfacesArePresent();
+    testAdmittedAtomicPublishesAfterDisconnectBeforeOfflineCleanup();
+    testAdmittedGetmPublishesTerminalFailureAfterDisconnectBeforeOfflineCleanup();
+    testAdmittedPutmPublishesRemovalAfterDisconnectAndAllowsRetirement();
+    testDuplicateUnregisterExecutionCannotReleaseOwnerFreeze();
+    testDirtyUnregisterLeavesSessionAbleToDrainPutmAndRetry();
+    testForcedLossStaysStickyWhenSecondCandidateThrows();
 
     const auto count = failures.load(std::memory_order_relaxed);
     if (count != 0) {

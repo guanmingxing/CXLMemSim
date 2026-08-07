@@ -69,7 +69,9 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                 if (host != host_sessions_.end()) {
                     expected_old = sessions_.at(host->second);
                     if (expected_old->state != SessionState::Closed || !expected_old->closed_final_response_pinned ||
-                        !expected_old->pinned_responses.empty())
+                        !expected_old->pinned_responses.empty() ||
+                        std::any_of(expected_old->operation_records.begin(), expected_old->operation_records.end(),
+                                    [](const auto &entry) { return entry.second.claimed && !entry.second.terminal; }))
                         return {.status = protocol_v2::Status::DuplicateHost};
                 }
                 if (next_session_id_ == 0 || next_session_id_ == std::numeric_limits<SessionId>::max() ||
@@ -95,7 +97,9 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                     (expected_old &&
                      (host == host_sessions_.end() || sessions_.at(host->second) != expected_old ||
                       expected_old->state != SessionState::Closed || !expected_old->closed_final_response_pinned ||
-                      !expected_old->pinned_responses.empty()));
+                      !expected_old->pinned_responses.empty() ||
+                      std::any_of(expected_old->operation_records.begin(), expected_old->operation_records.end(),
+                                  [](const auto &entry) { return entry.second.claimed && !entry.second.terminal; })));
                 if (host_changed || next_session_id_ != id || next_binding_id_ != binding_id.value_) {
                     retry = true;
                 } else {
@@ -164,6 +168,9 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
             if ((session->state != SessionState::OfflineRetained && !closed_replay_pending) ||
                 session->host_id != request.host_id || session->capabilities != request.capabilities ||
                 session->cache_capacity != request.cache_capacity || session->cache_ways != request.cache_ways)
+                return {.status = protocol_v2::Status::StaleSession};
+            if (std::any_of(session->operation_records.begin(), session->operation_records.end(),
+                            [](const auto &entry) { return entry.second.claimed && !entry.second.terminal; }))
                 return {.status = protocol_v2::Status::StaleSession};
             if (session->binding_generation == std::numeric_limits<std::uint64_t>::max() || next_binding_id_ == 0 ||
                 next_binding_id_ == std::numeric_limits<std::uint64_t>::max())
@@ -258,13 +265,13 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
         found->second->binding_id != binding_id ||
         (found->second->state != SessionState::Active && found->second->state != SessionState::Fenced &&
          !closed_replay_pending) ||
-        found->second->unregister_frozen)
+        found->second->unregister_owner != 0)
         return false;
     session = found->second;
     if (session->binding_generation == std::numeric_limits<std::uint64_t>::max())
         return false;
     const auto retired = session->binding_generation;
-    const bool pinned_administrative_generation = session->state == SessionState::Fenced && session->cleanup_frozen;
+    const bool pinned_administrative_generation = session->state == SessionState::Fenced && session->cleanup_owner != 0;
     if (session->state == SessionState::Active)
         session->state = SessionState::OfflineRetained;
     retired_sender = std::move(session->sender);
@@ -294,7 +301,7 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
     session = found->second;
     const auto id = protocol_v2::requestId(unregister_request);
     const auto admitted = session->admitted_requests.find(id);
-    if (session->state != SessionState::Active || !session->clean_holders.empty() ||
+    if (session->state != SessionState::Active || session->unregister_owner != 0 || !session->clean_holders.empty() ||
         !session->modified_holders.empty() ||
         protocol_v2::opcode(unregister_request) != protocol_v2::Opcode::Unregister ||
         admitted == session->admitted_requests.end() || !sameFrame(admitted->second, unregister_request) ||
@@ -306,8 +313,13 @@ protocol_v2::Status EndpointSessionRegistry::gracefulClose(std::uint16_t host_id
         if (!session->pinned_responses.contains(lower->first))
             return protocol_v2::Status::InvalidState;
     }
+    {
+        std::lock_guard operation_lock(session->operations->mutex);
+        if (session->operations->completion_watermark < id - 1)
+            return protocol_v2::Status::InvalidState;
+    }
     session->state = SessionState::Closed;
-    session->unregister_frozen = false;
+    session->unregister_owner = 0;
     session->close_request = unregister_request;
     session->closed_final_response_pinned = session->pinned_responses.contains(id);
     return protocol_v2::Status::Ok;
@@ -336,27 +348,64 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     const bool active = session.state == SessionState::Active;
     const bool fenced_drain = session.state == SessionState::Fenced && !session.drain_sealed &&
                               drainOpcodeAdmissible(protocol_v2::opcode(request));
-    if ((!active && !fenced_drain) || !validOrdinaryRequest(session, request))
+    if ((!active && !fenced_drain) || !validOrdinaryRequest(session, request) ||
+        requiresOperationAuthority(protocol_v2::opcode(request)))
         return RequestAdmissionResult::InvalidRequest;
+    return admitRequestLocked(session, request, false).result;
+}
+
+OperationAdmission EndpointSessionRegistry::admitOperation(SessionId session_id, BindingId binding_id,
+                                                           const protocol_v2::CoherenceFrame &request) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(session_id);
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+        return {RequestAdmissionResult::SessionUnavailable, {}};
+    auto &session = *found->second;
+    const bool active = session.state == SessionState::Active;
+    const bool fenced_drain = session.state == SessionState::Fenced && !session.drain_sealed &&
+                              drainOpcodeAdmissible(protocol_v2::opcode(request));
+    if ((!active && !fenced_drain) || !validOrdinaryRequest(session, request))
+        return {RequestAdmissionResult::InvalidRequest, {}};
+    return admitRequestLocked(session, request, true);
+}
+
+OperationAdmission EndpointSessionRegistry::admitRequestLocked(Session &session,
+                                                               const protocol_v2::CoherenceFrame &request,
+                                                               bool claim_operation) {
     const auto id = protocol_v2::requestId(request);
     if (const auto existing = session.admitted_requests.find(id); existing != session.admitted_requests.end())
-        return sameFrame(existing->second, request) ? RequestAdmissionResult::Duplicate
-                                                    : RequestAdmissionResult::Conflict;
+        return {sameFrame(existing->second, request) ? RequestAdmissionResult::Duplicate
+                                                     : RequestAdmissionResult::Conflict,
+                {}};
     if (session.unregister_request_id)
-        return RequestAdmissionResult::InvalidRequest;
+        return {RequestAdmissionResult::InvalidRequest, {}};
     if (id < session.next_request_id || id <= session.response_watermark)
-        return RequestAdmissionResult::StaleRequest;
+        return {RequestAdmissionResult::StaleRequest, {}};
     if (id != session.next_request_id)
-        return RequestAdmissionResult::InvalidRequest;
-    if (session.admitted_requests.size() >= max_pinned_responses_per_session_)
-        return RequestAdmissionResult::Backpressure;
-    session.admitted_requests.emplace(id, request);
+        return {RequestAdmissionResult::InvalidRequest, {}};
+    if (session.operation_records.size() >= max_pinned_responses_per_session_)
+        return {RequestAdmissionResult::Backpressure, {}};
+    if (session.next_request_id == std::numeric_limits<std::uint64_t>::max() || next_authority_id_ == 0 ||
+        next_authority_id_ == std::numeric_limits<std::uint64_t>::max())
+        return {RequestAdmissionResult::InvalidRequest, {}};
+    const auto nonce = next_authority_id_;
+    const auto line_address = protocol_v2::address(request) & ~(std::uint64_t{protocol_v2::kLineSize - 1});
+    session.operation_records.emplace(id, Session::OperationRecord{session.binding_generation, nonce,
+                                                                   protocol_v2::opcode(request), line_address,
+                                                                   claim_operation, false, false});
+    try {
+        session.admitted_requests.emplace(id, request);
+    } catch (...) {
+        session.operation_records.erase(id);
+        throw;
+    }
+    ++next_authority_id_;
     if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister)
         session.unregister_request_id = id;
-    if (session.next_request_id == std::numeric_limits<std::uint64_t>::max())
-        return RequestAdmissionResult::InvalidRequest;
     ++session.next_request_id;
-    return RequestAdmissionResult::Accepted;
+    return {RequestAdmissionResult::Accepted,
+            claim_operation ? OperationAuthority{session.id, session.binding_generation, id, nonce}
+                            : OperationAuthority{}};
 }
 
 bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation,
@@ -364,7 +413,7 @@ bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &
     const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Fenced ||
                                    session.state == SessionState::Closed;
     if (!deliverable_state || !session.sender || !staged_sender || session.publishing ||
-        !session.pinned_responses.contains(session.publication_cursor))
+        session.unregister_owner != 0 || !session.pinned_responses.contains(session.publication_cursor))
         return false;
     sender = std::move(staged_sender);
     generation = session.binding_generation;
@@ -396,6 +445,15 @@ EndpointSessionRegistry::StoredResponseSender EndpointSessionRegistry::reclaimRe
     session.response_watermark = consumed;
     session.pinned_responses.erase(session.pinned_responses.begin(), session.pinned_responses.upper_bound(consumed));
     session.admitted_requests.erase(session.admitted_requests.begin(), session.admitted_requests.upper_bound(consumed));
+    for (auto operation = session.operation_records.begin();
+         operation != session.operation_records.end() && operation->first <= consumed;) {
+        if (operation->second.claimed && !operation->second.terminal) {
+            operation->second.response_reclaimed = true;
+            ++operation;
+        } else {
+            operation = session.operation_records.erase(operation);
+        }
+    }
     if (session.state == SessionState::Closed && session.closed_final_response_pinned &&
         session.pinned_responses.empty()) {
         auto retired_sender = std::move(session.sender);
@@ -510,6 +568,18 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
 
 PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                                        const protocol_v2::CoherenceFrame &response_frame) {
+    return pinResponseImpl(nullptr, session_id, request, response_frame);
+}
+
+PinResponseResult EndpointSessionRegistry::pinResponse(const OperationAuthority &authority,
+                                                       const protocol_v2::CoherenceFrame &request,
+                                                       const protocol_v2::CoherenceFrame &response_frame) {
+    return pinResponseImpl(&authority, authority.session_id_, request, response_frame);
+}
+
+PinResponseResult EndpointSessionRegistry::pinResponseImpl(const OperationAuthority *authority, SessionId session_id,
+                                                           const protocol_v2::CoherenceFrame &request,
+                                                           const protocol_v2::CoherenceFrame &response_frame) {
     std::shared_ptr<Session> session;
     std::uint64_t generation{};
     std::uint64_t observed_generation{};
@@ -522,6 +592,11 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
             return PinResponseResult::SessionUnavailable;
         session = found->second;
         const auto id = protocol_v2::requestId(request);
+        const auto operation = session->operation_records.find(id);
+        if ((authority == nullptr && !session->binding_id) ||
+            (authority == nullptr && operation != session->operation_records.end() && operation->second.claimed) ||
+            (authority != nullptr && (!validOperationAuthority(*session, *authority) || authority->request_id_ != id)))
+            return PinResponseResult::SessionUnavailable;
         if (!validOrdinaryRequest(*session, request) || !protocol_v2::validateResponse(response_frame, request))
             return PinResponseResult::InvalidResponse;
         const auto admitted = session->admitted_requests.find(id);
@@ -530,7 +605,9 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
                                                      : PinResponseResult::InvalidResponse;
         if (!sameFrame(admitted->second, request))
             return PinResponseResult::Conflict;
-        if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister && session->state != SessionState::Closed)
+        if (protocol_v2::opcode(request) == protocol_v2::Opcode::Unregister && session->state != SessionState::Closed &&
+            !(session->state == SessionState::Active && !session->unregister_request_id &&
+              protocol_v2::status(response_frame) != protocol_v2::Status::Ok))
             return PinResponseResult::InvalidResponse;
         if (const auto existing = session->pinned_responses.find(id); existing != session->pinned_responses.end()) {
             if (!sameFrame(existing->second.request, request) || !sameFrame(existing->second.response, response_frame))
@@ -548,6 +625,14 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
             if (session->state == SessionState::Closed)
                 session->closed_final_response_pinned = true;
         }
+        if (authority == nullptr) {
+            const auto operation = session->operation_records.find(id);
+            if (operation != session->operation_records.end()) {
+                std::lock_guard operation_lock(session->operations->mutex);
+                completeOperationStateLocked(*session->operations, id);
+                operation->second.terminal = true;
+            }
+        }
         const bool deliverable_state = session->state == SessionState::Active ||
                                        session->state == SessionState::Fenced || session->state == SessionState::Closed;
         if (deliverable_state && session->sender && !session->publishing &&
@@ -556,7 +641,6 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
             observed_generation = session->binding_generation;
         }
     }
-    completeOperationState(session->operations, protocol_v2::requestId(request));
     StoredResponseSender staged_sender;
     if (sender_to_copy)
         staged_sender = copySender(*sender_to_copy);
@@ -624,19 +708,18 @@ std::vector<std::uint64_t> EndpointSessionRegistry::pinnedResponseIds(SessionId 
     return ids;
 }
 
-void EndpointSessionRegistry::completeOperationState(const std::shared_ptr<Session::OperationState> &operations,
-                                                     std::uint64_t request_id) {
-    std::lock_guard lock(operations->mutex);
-    if (request_id <= operations->completion_watermark)
+void EndpointSessionRegistry::completeOperationStateLocked(Session::OperationState &operations,
+                                                           std::uint64_t request_id) {
+    if (request_id <= operations.completion_watermark)
         return;
-    operations->completed_out_of_order.insert(request_id);
-    while (operations->completion_watermark != std::numeric_limits<std::uint64_t>::max()) {
-        const auto next = operations->completion_watermark + 1;
-        if (operations->completed_out_of_order.erase(next) == 0)
+    operations.completed_out_of_order.insert(request_id);
+    while (operations.completion_watermark != std::numeric_limits<std::uint64_t>::max()) {
+        const auto next = operations.completion_watermark + 1;
+        if (operations.completed_out_of_order.erase(next) == 0)
             break;
-        operations->completion_watermark = next;
+        operations.completion_watermark = next;
     }
-    operations->changed.notify_all();
+    operations.changed.notify_all();
 }
 
 void EndpointSessionRegistry::publishBindingGeneration(Session &session) {
@@ -653,16 +736,32 @@ void EndpointSessionRegistry::publishBindingGeneration(Session &session) {
 }
 
 bool EndpointSessionRegistry::completeOperation(SessionId id, BindingId binding_id, std::uint64_t request_id) {
-    std::shared_ptr<Session::OperationState> operations;
-    {
-        std::lock_guard lock(mutex_);
-        const auto found = sessions_.find(id);
-        if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id ||
-            !found->second->admitted_requests.contains(request_id))
-            return false;
-        operations = found->second->operations;
-    }
-    completeOperationState(operations, request_id);
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(id);
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id ||
+        !found->second->admitted_requests.contains(request_id))
+        return false;
+    const auto operation = found->second->operation_records.find(request_id);
+    if (operation == found->second->operation_records.end() || operation->second.claimed || operation->second.terminal)
+        return false;
+    std::lock_guard operation_lock(found->second->operations->mutex);
+    completeOperationStateLocked(*found->second->operations, request_id);
+    operation->second.terminal = true;
+    return true;
+}
+
+bool EndpointSessionRegistry::completeOperation(OperationAuthority &authority) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validOperationAuthority(*found->second, authority))
+        return false;
+    auto operation = found->second->operation_records.find(authority.request_id_);
+    std::lock_guard operation_lock(found->second->operations->mutex);
+    completeOperationStateLocked(*found->second->operations, authority.request_id_);
+    operation->second.terminal = true;
+    if (operation->second.response_reclaimed)
+        found->second->operation_records.erase(operation);
+    authority = {};
     return true;
 }
 
@@ -690,8 +789,6 @@ bool EndpointSessionRegistry::waitForOperationsBefore(SessionId id, BindingId bi
 
 bool EndpointSessionRegistry::waitForOperationsThrough(SessionId id, BindingId binding_id,
                                                        std::uint64_t request_id) const {
-    if (request_id == 0)
-        return true;
     std::shared_ptr<Session::OperationState> operations;
     std::uint64_t generation{};
     {
@@ -702,6 +799,8 @@ bool EndpointSessionRegistry::waitForOperationsThrough(SessionId id, BindingId b
         operations = found->second->operations;
         generation = found->second->binding_generation;
     }
+    if (request_id == 0)
+        return true;
     std::unique_lock lock(operations->mutex);
     operations->changed.wait(lock, [&] {
         return operations->completion_watermark >= request_id || operations->binding_generation != generation;
@@ -711,8 +810,6 @@ bool EndpointSessionRegistry::waitForOperationsThrough(SessionId id, BindingId b
 
 bool EndpointSessionRegistry::waitForOperationsThrough(SessionGenerationToken generation,
                                                        std::uint64_t request_id) const {
-    if (request_id == 0)
-        return true;
     std::shared_ptr<Session::OperationState> operations;
     {
         std::lock_guard lock(mutex_);
@@ -721,6 +818,8 @@ bool EndpointSessionRegistry::waitForOperationsThrough(SessionGenerationToken ge
             return false;
         operations = found->second->operations;
     }
+    if (request_id == 0)
+        return true;
     std::unique_lock lock(operations->mutex);
     operations->changed.wait(lock, [&] {
         return operations->completion_watermark >= request_id ||
@@ -762,26 +861,77 @@ bool EndpointSessionRegistry::admittedRequestMatches(SessionId id, BindingId bin
     return request != found->second->admitted_requests.end() && sameFrame(request->second, expected_request);
 }
 
-bool EndpointSessionRegistry::freezeUnregister(SessionId id, BindingId binding_id,
-                                               const protocol_v2::CoherenceFrame &request) {
+std::optional<UnregisterAuthority>
+EndpointSessionRegistry::freezeUnregister(SessionId id, BindingId binding_id,
+                                          const protocol_v2::CoherenceFrame &request) {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(id);
     if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id ||
-        found->second->state != SessionState::Active)
-        return false;
+        found->second->state != SessionState::Active || found->second->unregister_owner != 0 ||
+        next_authority_id_ == 0 || next_authority_id_ == std::numeric_limits<std::uint64_t>::max())
+        return std::nullopt;
     const auto admitted = found->second->admitted_requests.find(protocol_v2::requestId(request));
     if (protocol_v2::opcode(request) != protocol_v2::Opcode::Unregister ||
         admitted == found->second->admitted_requests.end() || !sameFrame(admitted->second, request))
-        return false;
-    found->second->unregister_frozen = true;
-    return true;
+        return std::nullopt;
+    const auto nonce = next_authority_id_++;
+    found->second->unregister_owner = nonce;
+    return UnregisterAuthority{id, found->second->binding_generation, protocol_v2::requestId(request), nonce};
 }
 
-void EndpointSessionRegistry::abortUnregister(SessionId id, BindingId binding_id) noexcept {
+bool EndpointSessionRegistry::preflightGracefulClose(const UnregisterAuthority &authority, std::uint16_t host_id,
+                                                     const protocol_v2::CoherenceFrame &request) const {
     std::lock_guard lock(mutex_);
-    const auto found = sessions_.find(id);
-    if (found != sessions_.end() && found->second->binding_id == binding_id)
-        found->second->unregister_frozen = false;
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validUnregisterAuthority(*found->second, authority) ||
+        found->second->host_id != host_id || protocol_v2::opcode(request) != protocol_v2::Opcode::Unregister ||
+        protocol_v2::requestId(request) != authority.request_id_)
+        return false;
+    const auto &session = *found->second;
+    const auto admitted = session.admitted_requests.find(authority.request_id_);
+    if (session.state != SessionState::Active || admitted == session.admitted_requests.end() ||
+        !sameFrame(admitted->second, request) || session.unregister_request_id != authority.request_id_ ||
+        session.admitted_requests.upper_bound(authority.request_id_) != session.admitted_requests.end() ||
+        session.binding_generation == std::numeric_limits<std::uint64_t>::max() || session.publishing ||
+        !session.in_flight_deliveries.empty())
+        return false;
+    for (auto lower = session.admitted_requests.begin(); lower != admitted; ++lower)
+        if (!session.pinned_responses.contains(lower->first))
+            return false;
+    std::lock_guard operation_lock(session.operations->mutex);
+    return session.operations->completion_watermark >= authority.request_id_ - 1;
+}
+
+protocol_v2::Status EndpointSessionRegistry::completeGracefulClose(UnregisterAuthority &authority,
+                                                                   std::uint16_t host_id,
+                                                                   const protocol_v2::CoherenceFrame &request) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validUnregisterAuthority(*found->second, authority) ||
+        found->second->host_id != host_id || !found->second->clean_holders.empty() ||
+        !found->second->modified_holders.empty() || found->second->state != SessionState::Active ||
+        protocol_v2::requestId(request) != authority.request_id_)
+        return protocol_v2::Status::InvalidState;
+    auto &session = *found->second;
+    const auto admitted = session.admitted_requests.find(authority.request_id_);
+    if (admitted == session.admitted_requests.end() || !sameFrame(admitted->second, request))
+        return protocol_v2::Status::InvalidState;
+    session.state = SessionState::Closed;
+    session.unregister_owner = 0;
+    session.close_request = request;
+    session.closed_final_response_pinned = session.pinned_responses.contains(authority.request_id_);
+    authority = {};
+    return protocol_v2::Status::Ok;
+}
+
+void EndpointSessionRegistry::abortUnregister(UnregisterAuthority &authority) noexcept {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found != sessions_.end() && validUnregisterAuthority(*found->second, authority)) {
+        found->second->unregister_owner = 0;
+        found->second->unregister_request_id.reset();
+    }
+    authority = {};
 }
 
 bool EndpointSessionRegistry::waitForModifiedDrain(SessionId id, BindingId binding_id) const {
@@ -807,6 +957,8 @@ protocol_v2::Status EndpointSessionRegistry::fenceSession(std::uint16_t host_id,
     if (found == sessions_.end() || found->second->host_id != host_id)
         return protocol_v2::Status::StaleSession;
     const auto &session = *found->second;
+    if (session.unregister_owner != 0)
+        return protocol_v2::Status::InvalidState;
     const bool live_binding = binding_id && session.binding_id == binding_id &&
                               (session.state == SessionState::Active || session.state == SessionState::Fenced);
     const bool retained_offline =
@@ -818,6 +970,8 @@ protocol_v2::Status EndpointSessionRegistry::fenceSession(std::uint16_t host_id,
     found->second->state = SessionState::Fenced;
     if (!already_fenced)
         found->second->drain_sealed = false;
+    if (!already_fenced)
+        found->second->sealed_cutoff.reset();
     return protocol_v2::Status::Ok;
 }
 
@@ -850,24 +1004,35 @@ std::optional<std::uint64_t> EndpointSessionRegistry::sealFencedSession(SessionG
         found->second->state != SessionState::Fenced)
         return std::nullopt;
     found->second->drain_sealed = true;
-    return found->second->next_request_id - 1;
+    found->second->sealed_cutoff = found->second->next_request_id - 1;
+    return found->second->sealed_cutoff;
 }
 
-bool EndpointSessionRegistry::freezeFencedGenerationForCleanup(SessionGenerationToken generation) {
+std::optional<CleanupAuthority>
+EndpointSessionRegistry::freezeFencedGenerationForCleanup(SessionGenerationToken generation) {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(generation.session_id_);
     if (found == sessions_.end() || !validGeneration(*found->second, generation) ||
-        found->second->state != SessionState::Fenced || !found->second->drain_sealed || found->second->cleanup_frozen)
-        return false;
-    found->second->cleanup_frozen = true;
-    return true;
+        found->second->state != SessionState::Fenced || !found->second->drain_sealed || !found->second->sealed_cutoff ||
+        found->second->cleanup_owner != 0 || next_authority_id_ == 0 ||
+        next_authority_id_ == std::numeric_limits<std::uint64_t>::max())
+        return std::nullopt;
+    {
+        std::lock_guard operation_lock(found->second->operations->mutex);
+        if (found->second->operations->completion_watermark < *found->second->sealed_cutoff)
+            return std::nullopt;
+    }
+    const auto nonce = next_authority_id_++;
+    found->second->cleanup_owner = nonce;
+    return CleanupAuthority{generation.session_id_, generation.generation_, nonce};
 }
 
-void EndpointSessionRegistry::abortFencedCleanup(SessionGenerationToken generation) noexcept {
+void EndpointSessionRegistry::abortFencedCleanup(CleanupAuthority &authority) noexcept {
     std::lock_guard lock(mutex_);
-    const auto found = sessions_.find(generation.session_id_);
-    if (found != sessions_.end() && validGeneration(*found->second, generation))
-        found->second->cleanup_frozen = false;
+    const auto found = sessions_.find(authority.session_id_);
+    if (found != sessions_.end() && validCleanupAuthority(*found->second, authority))
+        found->second->cleanup_owner = 0;
+    authority = {};
 }
 
 bool EndpointSessionRegistry::controlFrameAdmissible(SessionId id, BindingId binding_id,
@@ -884,18 +1049,21 @@ bool EndpointSessionRegistry::controlFrameAdmissible(SessionId id, BindingId bin
 
 bool EndpointSessionRegistry::completeEviction(std::uint16_t host_id, SessionId id, BindingId binding_id) {
     const auto generation = captureGeneration(host_id, id, binding_id);
-    return generation && completeEviction(host_id, *generation);
+    if (!generation)
+        return false;
+    auto authority = freezeFencedGenerationForCleanup(*generation);
+    return authority && completeEviction(host_id, *authority);
 }
 
-bool EndpointSessionRegistry::completeEviction(std::uint16_t host_id, SessionGenerationToken generation) {
+bool EndpointSessionRegistry::completeEviction(std::uint16_t host_id, CleanupAuthority &authority) {
     StoredResponseSender retired_sender;
     std::shared_ptr<Session> session;
     std::unique_lock lock(mutex_);
-    const auto found = sessions_.find(generation.session_id_);
+    const auto found = sessions_.find(authority.session_id_);
     if (found == sessions_.end() || found->second->host_id != host_id)
         return false;
     session = found->second;
-    if (!validGeneration(*session, generation) || session->state != SessionState::Fenced || !session->cleanup_frozen ||
+    if (!validCleanupAuthority(*session, authority) || session->state != SessionState::Fenced ||
         !session->clean_holders.empty() || !session->modified_holders.empty() ||
         session->binding_generation == std::numeric_limits<std::uint64_t>::max())
         return false;
@@ -911,10 +1079,11 @@ bool EndpointSessionRegistry::completeEviction(std::uint16_t host_id, SessionGen
     session->state = SessionState::Closed;
 
     const auto host = host_sessions_.find(host_id);
-    if (host == host_sessions_.end() || host->second != generation.session_id_)
+    if (host == host_sessions_.end() || host->second != authority.session_id_)
         return false;
     host_sessions_.erase(host);
     sessions_.erase(found);
+    authority = {};
     return true;
 }
 
@@ -1002,17 +1171,58 @@ HolderSnapshot EndpointSessionRegistry::holderSnapshot(SessionId id, BindingId b
             {found->second->modified_holders.begin(), found->second->modified_holders.end()}};
 }
 
-bool EndpointSessionRegistry::removeCleanHolder(SessionGenerationToken generation, std::uint64_t line) {
+bool EndpointSessionRegistry::addCleanHolder(const OperationAuthority &authority, std::uint64_t line) {
     std::lock_guard lock(mutex_);
-    const auto found = sessions_.find(generation.session_id_);
-    return found != sessions_.end() && validGeneration(*found->second, generation) &&
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() ||
+        !validOperationHolderEffect(*found->second, authority, line, HolderEffect::AddClean) ||
+        found->second->modified_holders.contains(line))
+        return false;
+    auto &session = *found->second;
+    if (session.clean_holders.contains(line))
+        return true;
+    if (session.clean_holders.size() + session.modified_holders.size() >=
+        session.cache_capacity / protocol_v2::kLineSize)
+        return false;
+    session.clean_holders.insert(line);
+    return true;
+}
+
+bool EndpointSessionRegistry::removeCleanHolder(const OperationAuthority &authority, std::uint64_t line) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    return found != sessions_.end() &&
+           validOperationHolderEffect(*found->second, authority, line, HolderEffect::RemoveClean) &&
            found->second->clean_holders.erase(line) != 0;
 }
 
-bool EndpointSessionRegistry::removeModifiedHolder(SessionGenerationToken generation, std::uint64_t line) {
+bool EndpointSessionRegistry::addModifiedHolder(const OperationAuthority &authority, std::uint64_t line) {
     std::lock_guard lock(mutex_);
-    const auto found = sessions_.find(generation.session_id_);
-    if (found == sessions_.end() || !validGeneration(*found->second, generation) ||
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() ||
+        !validOperationHolderEffect(*found->second, authority, line, HolderEffect::AddModified) ||
+        found->second->clean_holders.contains(line))
+        return false;
+    auto &session = *found->second;
+    if (session.modified_holders.contains(line))
+        return true;
+    if (session.clean_holders.size() + session.modified_holders.size() >=
+        session.cache_capacity / protocol_v2::kLineSize)
+        return false;
+    session.modified_holders.insert(line);
+    {
+        std::lock_guard drain_lock(session.holder_drain->mutex);
+        session.holder_drain->modified_count = session.modified_holders.size();
+        session.holder_drain->changed.notify_all();
+    }
+    return true;
+}
+
+bool EndpointSessionRegistry::removeModifiedHolder(const OperationAuthority &authority, std::uint64_t line) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() ||
+        !validOperationHolderEffect(*found->second, authority, line, HolderEffect::RemoveModified) ||
         found->second->modified_holders.erase(line) == 0)
         return false;
     {
@@ -1023,10 +1233,31 @@ bool EndpointSessionRegistry::removeModifiedHolder(SessionGenerationToken genera
     return true;
 }
 
-HolderSnapshot EndpointSessionRegistry::holderSnapshot(SessionGenerationToken generation) const {
+bool EndpointSessionRegistry::removeCleanHolder(const CleanupAuthority &authority, std::uint64_t line) {
     std::lock_guard lock(mutex_);
-    const auto found = sessions_.find(generation.session_id_);
-    if (found == sessions_.end() || !validGeneration(*found->second, generation))
+    const auto found = sessions_.find(authority.session_id_);
+    return found != sessions_.end() && validCleanupAuthority(*found->second, authority) &&
+           found->second->clean_holders.erase(line) != 0;
+}
+
+bool EndpointSessionRegistry::removeModifiedHolder(const CleanupAuthority &authority, std::uint64_t line) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validCleanupAuthority(*found->second, authority) ||
+        found->second->modified_holders.erase(line) == 0)
+        return false;
+    {
+        std::lock_guard drain_lock(found->second->holder_drain->mutex);
+        found->second->holder_drain->modified_count = found->second->modified_holders.size();
+        found->second->holder_drain->changed.notify_all();
+    }
+    return true;
+}
+
+HolderSnapshot EndpointSessionRegistry::holderSnapshot(const CleanupAuthority &authority) const {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validCleanupAuthority(*found->second, authority))
         return {};
     return {{found->second->clean_holders.begin(), found->second->clean_holders.end()},
             {found->second->modified_holders.begin(), found->second->modified_holders.end()}};
@@ -1057,9 +1288,10 @@ std::optional<SessionSnapshot> EndpointSessionRegistry::inspect(SessionId id) co
                                        : s.response_watermark + 1,
                                    s.pinned_responses.size(),
                                    max_pinned_responses_per_session_,
-                                   s.admitted_requests.size() >= max_pinned_responses_per_session_,
+                                   s.operation_records.size() >= max_pinned_responses_per_session_,
                                    s.closed_final_response_pinned,
-                                   0};
+                                   0,
+                                   s.unregister_owner != 0};
     }
     std::lock_guard operation_lock(operations->mutex);
     snapshot.operation_completion_watermark = operations->completion_watermark;
@@ -1073,6 +1305,51 @@ bool EndpointSessionRegistry::validHolderSession(const Session &s, BindingId bin
 }
 bool EndpointSessionRegistry::validGeneration(const Session &session, SessionGenerationToken generation) noexcept {
     return generation && session.id == generation.session_id_ && session.binding_generation == generation.generation_;
+}
+bool EndpointSessionRegistry::validOperationAuthority(const Session &session,
+                                                      const OperationAuthority &authority) noexcept {
+    if (!authority || session.id != authority.session_id_)
+        return false;
+    const auto operation = session.operation_records.find(authority.request_id_);
+    return operation != session.operation_records.end() && operation->second.claimed && !operation->second.terminal &&
+           operation->second.binding_generation == authority.generation_ && operation->second.nonce == authority.nonce_;
+}
+bool EndpointSessionRegistry::validOperationHolderEffect(const Session &session, const OperationAuthority &authority,
+                                                         std::uint64_t line, HolderEffect effect) noexcept {
+    if (!validOperationAuthority(session, authority) || !aligned(line))
+        return false;
+    const auto &operation = session.operation_records.at(authority.request_id_);
+    if (operation.line_address != line)
+        return false;
+    switch (effect) {
+    case HolderEffect::AddClean:
+        return operation.opcode == protocol_v2::Opcode::Gets;
+    case HolderEffect::RemoveClean:
+        return operation.opcode == protocol_v2::Opcode::Puts || operation.opcode == protocol_v2::Opcode::Upgrade ||
+               operation.opcode == protocol_v2::Opcode::AtomicFaa || operation.opcode == protocol_v2::Opcode::AtomicCas;
+    case HolderEffect::AddModified:
+        return operation.opcode == protocol_v2::Opcode::Getm || operation.opcode == protocol_v2::Opcode::Upgrade ||
+               operation.opcode == protocol_v2::Opcode::AtomicFaa || operation.opcode == protocol_v2::Opcode::AtomicCas;
+    case HolderEffect::RemoveModified:
+        return operation.opcode == protocol_v2::Opcode::Putm;
+    }
+    return false;
+}
+bool EndpointSessionRegistry::validCleanupAuthority(const Session &session,
+                                                    const CleanupAuthority &authority) noexcept {
+    return authority && session.id == authority.session_id_ && session.binding_generation == authority.generation_ &&
+           session.cleanup_owner == authority.nonce_ && session.state == SessionState::Fenced && session.drain_sealed;
+}
+bool EndpointSessionRegistry::validUnregisterAuthority(const Session &session,
+                                                       const UnregisterAuthority &authority) noexcept {
+    return authority && session.id == authority.session_id_ && session.binding_generation == authority.generation_ &&
+           session.unregister_owner == authority.nonce_ && session.unregister_request_id == authority.request_id_;
+}
+bool EndpointSessionRegistry::requiresOperationAuthority(protocol_v2::Opcode opcode) noexcept {
+    return opcode == protocol_v2::Opcode::Gets || opcode == protocol_v2::Opcode::Getm ||
+           opcode == protocol_v2::Opcode::Upgrade || opcode == protocol_v2::Opcode::Puts ||
+           opcode == protocol_v2::Opcode::Putm || opcode == protocol_v2::Opcode::AtomicFaa ||
+           opcode == protocol_v2::Opcode::AtomicCas;
 }
 bool EndpointSessionRegistry::aligned(std::uint64_t line) noexcept { return line % protocol_v2::kLineSize == 0; }
 RegistrationResult EndpointSessionRegistry::resultFor(const Session &s, protocol_v2::Status status) const {

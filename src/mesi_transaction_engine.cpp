@@ -39,19 +39,32 @@ bool isAtomicOperation(MesiTransactionEngine::Operation operation) noexcept {
 
 class FencedCleanupLease {
 public:
-    FencedCleanupLease(EndpointSessionRegistry &registry, SessionGenerationToken generation)
-        : registry_(&registry), generation_(generation) {}
+    FencedCleanupLease(EndpointSessionRegistry &registry, CleanupAuthority &authority)
+        : registry_(&registry), authority_(&authority) {}
     FencedCleanupLease(const FencedCleanupLease &) = delete;
     FencedCleanupLease &operator=(const FencedCleanupLease &) = delete;
     ~FencedCleanupLease() {
         if (registry_)
-            registry_->abortFencedCleanup(generation_);
+            registry_->abortFencedCleanup(*authority_);
     }
     void release() noexcept { registry_ = nullptr; }
 
 private:
     EndpointSessionRegistry *registry_;
-    SessionGenerationToken generation_;
+    CleanupAuthority *authority_;
+};
+
+class UnregisterLease {
+public:
+    UnregisterLease(EndpointSessionRegistry &registry, UnregisterAuthority &authority)
+        : registry_(&registry), authority_(&authority) {}
+    UnregisterLease(const UnregisterLease &) = delete;
+    UnregisterLease &operator=(const UnregisterLease &) = delete;
+    ~UnregisterLease() { registry_->abortUnregister(*authority_); }
+
+private:
+    EndpointSessionRegistry *registry_;
+    UnregisterAuthority *authority_;
 };
 
 } // namespace
@@ -118,10 +131,12 @@ MesiTransactionEngine::MesiTransactionEngine(MesiDirectory &directory, Duration 
 MesiTransactionEngine::MesiTransactionEngine(MesiDirectory &directory, CoherenceMemoryBackend &memory,
                                              CoherenceTransport &transport, Duration snoop_timeout,
                                              std::uint64_t first_snoop_id, AuditSink *audit_sink,
-                                             std::size_t audit_capacity)
+                                             std::size_t audit_capacity,
+                                             AdministrativeFaultInjector *administrative_fault_injector)
     : MesiTransactionEngine(directory, snoop_timeout, first_snoop_id) {
     audit_sink_ = audit_sink;
     audit_capacity_ = std::max<std::size_t>(1, audit_capacity);
+    administrative_fault_injector_ = administrative_fault_injector;
     audit_records_.reserve(audit_capacity_);
     configure(memory, transport, snoop_timeout);
 }
@@ -1245,21 +1260,27 @@ protocol_v2::Status MesiTransactionEngine::unregisterSession(EndpointSessionRegi
         !registry.waitForOperationsBefore(session_id, binding_id, request_id))
         return protocol_v2::Status::InvalidState;
 
-    if (!registry.freezeUnregister(session_id, binding_id, unregister_request))
+    auto unregister_authority = registry.freezeUnregister(session_id, binding_id, unregister_request);
+    if (!unregister_authority)
         return protocol_v2::Status::StaleSession;
-    const auto abort = [&] { registry.abortUnregister(session_id, binding_id); };
-    if (sessionFor(host_id) == session_id) {
-        if (!fenceEngineSession(host_id, session_id) || !sealEngineSession(host_id, session_id) ||
-            !waitEngineQuiescent(host_id, session_id)) {
-            abort();
-            return protocol_v2::Status::StaleSession;
-        }
+    UnregisterLease unregister_lease(registry, *unregister_authority);
+    const auto abort = [&] { registry.abortUnregister(*unregister_authority); };
+    if (!registry.preflightGracefulClose(*unregister_authority, host_id, unregister_request)) {
+        abort();
+        return protocol_v2::Status::InvalidState;
     }
 
     const auto candidates = registry.holderSnapshot(session_id, binding_id);
     if (!candidates.modified.empty()) {
         abort();
         return protocol_v2::Status::InvalidState;
+    }
+    if (sessionFor(host_id) == session_id) {
+        if (!fenceEngineSession(host_id, session_id) || !sealEngineSession(host_id, session_id) ||
+            !waitEngineQuiescent(host_id, session_id)) {
+            abort();
+            return protocol_v2::Status::StaleSession;
+        }
     }
 
     // Frozen admission means this host cannot legally gain M after preflight. Inspect every sorted candidate before the
@@ -1306,7 +1327,7 @@ protocol_v2::Status MesiTransactionEngine::unregisterSession(EndpointSessionRegi
         }
         (void)registry.removeCleanHolder(session_id, binding_id, address);
     }
-    const auto status = registry.gracefulClose(host_id, session_id, binding_id, unregister_request);
+    const auto status = registry.completeGracefulClose(*unregister_authority, host_id, unregister_request);
     if (status != protocol_v2::Status::Ok)
         abort();
     return status;
@@ -1382,11 +1403,12 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
         return {AdministrativeStatus::StaleSession, 0, 0};
     if (!registry.waitForOperationsThrough(*generation, *cutoff))
         return {AdministrativeStatus::StaleSession, 0, 0};
-    if (!registry.freezeFencedGenerationForCleanup(*generation))
+    auto cleanup_authority = registry.freezeFencedGenerationForCleanup(*generation);
+    if (!cleanup_authority)
         return {AdministrativeStatus::StaleSession, 0, 0};
-    FencedCleanupLease cleanup_lease(registry, *generation);
+    FencedCleanupLease cleanup_lease(registry, *cleanup_authority);
 
-    auto candidates = registry.holderSnapshot(*generation);
+    auto candidates = registry.holderSnapshot(*cleanup_authority);
     if (policy != HostFailurePolicy::ForceDataLoss) {
         for (const auto address : candidates.modified) {
             auto line = directory_.lockLine(address);
@@ -1405,14 +1427,20 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
 
     if (policy == HostFailurePolicy::ForceDataLoss) {
         for (const auto address : addresses) {
-            auto line = directory_.lockLine(address);
+            std::optional<MesiDirectory::LockedLine> line;
+            try {
+                line = directory_.lockLine(address);
+            } catch (...) {
+                return {AdministrativeStatus::InvalidHost, 0, 0};
+            }
             if (!line)
                 return {AdministrativeStatus::InvalidHost, 0, 0};
             const auto current = line->snapshot();
             if (current.state != MesiState::M || current.owner != host_id)
                 continue;
             const CoherenceAuditRecord intent{
-                AuditEventKind::ForcedDirtyLoss, AuditSeverity::High, host_id, session_id, address, current.epoch + 1};
+                AuditEventKind::ForcedDirtyLoss, AuditSeverity::High, host_id, session_id, address, current.epoch + 1,
+                AuditRecordPhase::Intent};
             line.reset();
             if (!acceptForcedLoss(intent))
                 return {AdministrativeStatus::AuditFailure, 0, 0};
@@ -1420,55 +1448,72 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
     }
 
     EvictionResult result{AdministrativeStatus::Ok, 0, 0};
-    for (const auto address : addresses) {
-        auto line = directory_.lockLine(address);
-        if (!line)
-            return {AdministrativeStatus::InvalidHost, result.clean_removed, result.dirty_lost};
-        const auto current = line->snapshot();
-        const bool clean_shared = current.state == MesiState::S && (current.sharers & holder(host_id)) != 0;
-        const bool clean_exclusive = current.state == MesiState::E && current.owner == host_id;
-        const bool dirty_owner = current.state == MesiState::M && current.owner == host_id;
+    for (std::size_t ordinal = 0; ordinal < addresses.size(); ++ordinal) {
+        const auto address = addresses[ordinal];
+        try {
+            if (administrative_fault_injector_ != nullptr)
+                administrative_fault_injector_->beforeLine(ordinal, address);
+            auto line = directory_.lockLine(address);
+            if (!line)
+                return {result.dirty_lost == 0 ? AdministrativeStatus::InvalidHost : AdministrativeStatus::DataLoss,
+                        result.clean_removed, result.dirty_lost};
+            const auto current = line->snapshot();
+            const bool clean_shared = current.state == MesiState::S && (current.sharers & holder(host_id)) != 0;
+            const bool clean_exclusive = current.state == MesiState::E && current.owner == host_id;
+            const bool dirty_owner = current.state == MesiState::M && current.owner == host_id;
 
-        if (dirty_owner) {
-            if (policy != HostFailurePolicy::ForceDataLoss)
-                return {AdministrativeStatus::DirtyDataPresent, result.clean_removed, result.dirty_lost};
-            const auto transition =
-                line->commitAdministrativeEvict(host_id, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
-            if (!transition.succeeded())
-                return {AdministrativeStatus::InvalidHost, result.clean_removed, result.dirty_lost};
-            (void)registry.removeModifiedHolder(*generation, address);
-            ++result.dirty_lost;
-            forced_dirty_losses_.fetch_add(1, std::memory_order_relaxed);
-            recordAudit(AuditEventKind::ForcedDirtyLoss, AuditSeverity::High, host_id, session_id, address,
-                        transition.snapshot.epoch);
-            continue;
-        }
-
-        if (clean_shared || clean_exclusive) {
-            DirectorySnapshot next;
-            if (clean_shared) {
-                const auto remaining = current.sharers & ~holder(host_id);
-                next = remaining == 0 ? DirectorySnapshot{MesiState::I, std::nullopt, 0, current.epoch, true}
-                                      : DirectorySnapshot{MesiState::S, std::nullopt, remaining, current.epoch, true};
-            } else {
-                next = {MesiState::I, std::nullopt, 0, current.epoch, true};
+            if (dirty_owner) {
+                if (policy != HostFailurePolicy::ForceDataLoss)
+                    return {AdministrativeStatus::DirtyDataPresent, result.clean_removed, result.dirty_lost};
+                const auto transition = line->commitAdministrativeEvict(
+                    host_id, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
+                if (!transition.succeeded())
+                    return {result.dirty_lost == 0 ? AdministrativeStatus::InvalidHost : AdministrativeStatus::DataLoss,
+                            result.clean_removed, result.dirty_lost};
+                ++result.dirty_lost;
+                forced_dirty_losses_.fetch_add(1, std::memory_order_relaxed);
+                const CoherenceAuditRecord completion{
+                    AuditEventKind::ForcedDirtyLoss, AuditSeverity::High,         host_id, session_id, address,
+                    transition.snapshot.epoch,       AuditRecordPhase::Completion};
+                line.reset();
+                (void)acceptForcedLoss(completion);
+                recordAudit(completion.kind, completion.severity, completion.host_id, completion.session_id,
+                            completion.line_address, completion.epoch, completion.phase);
+                (void)registry.removeModifiedHolder(*cleanup_authority, address);
+                continue;
             }
-            const auto transition = line->commitAdministrativeEvict(host_id, current, next);
-            if (!transition.succeeded())
-                return {AdministrativeStatus::InvalidHost, result.clean_removed, result.dirty_lost};
-            (void)registry.removeCleanHolder(*generation, address);
-            ++result.clean_removed;
-            forced_clean_removals_.fetch_add(1, std::memory_order_relaxed);
-            recordAudit(AuditEventKind::ForcedCleanRemoval, AuditSeverity::Warning, host_id, session_id, address,
-                        transition.snapshot.epoch);
-        } else {
-            (void)registry.removeCleanHolder(*generation, address);
-            (void)registry.removeModifiedHolder(*generation, address);
+
+            if (clean_shared || clean_exclusive) {
+                DirectorySnapshot next;
+                if (clean_shared) {
+                    const auto remaining = current.sharers & ~holder(host_id);
+                    next = remaining == 0
+                               ? DirectorySnapshot{MesiState::I, std::nullopt, 0, current.epoch, true}
+                               : DirectorySnapshot{MesiState::S, std::nullopt, remaining, current.epoch, true};
+                } else {
+                    next = {MesiState::I, std::nullopt, 0, current.epoch, true};
+                }
+                const auto transition = line->commitAdministrativeEvict(host_id, current, next);
+                if (!transition.succeeded())
+                    return {result.dirty_lost == 0 ? AdministrativeStatus::InvalidHost : AdministrativeStatus::DataLoss,
+                            result.clean_removed, result.dirty_lost};
+                (void)registry.removeCleanHolder(*cleanup_authority, address);
+                ++result.clean_removed;
+                forced_clean_removals_.fetch_add(1, std::memory_order_relaxed);
+                recordAudit(AuditEventKind::ForcedCleanRemoval, AuditSeverity::Warning, host_id, session_id, address,
+                            transition.snapshot.epoch);
+            } else {
+                (void)registry.removeCleanHolder(*cleanup_authority, address);
+                (void)registry.removeModifiedHolder(*cleanup_authority, address);
+            }
+        } catch (...) {
+            return {result.dirty_lost == 0 ? AdministrativeStatus::InvalidHost : AdministrativeStatus::DataLoss,
+                    result.clean_removed, result.dirty_lost};
         }
     }
     if (result.dirty_lost != 0)
         result.status = AdministrativeStatus::DataLoss;
-    if (!registry.completeEviction(host_id, *generation)) {
+    if (!registry.completeEviction(host_id, *cleanup_authority)) {
         if (result.dirty_lost != 0)
             return result;
         return {AdministrativeStatus::StaleSession, result.clean_removed, result.dirty_lost};
@@ -1493,12 +1538,12 @@ std::vector<CoherenceAuditRecord> MesiTransactionEngine::auditRecords() const {
 }
 
 void MesiTransactionEngine::recordAudit(AuditEventKind kind, AuditSeverity severity, std::uint16_t host_id,
-                                        std::uint64_t session_id, std::uint64_t line_address,
-                                        std::uint64_t epoch) noexcept {
+                                        std::uint64_t session_id, std::uint64_t line_address, std::uint64_t epoch,
+                                        AuditRecordPhase phase) noexcept {
     std::lock_guard lock(audit_mutex_);
     if (audit_records_.size() == audit_capacity_)
         audit_records_.erase(audit_records_.begin());
-    audit_records_.push_back({kind, severity, host_id, session_id, line_address, epoch});
+    audit_records_.push_back({kind, severity, host_id, session_id, line_address, epoch, phase});
 }
 
 bool MesiTransactionEngine::acceptForcedLoss(const CoherenceAuditRecord &record) noexcept {

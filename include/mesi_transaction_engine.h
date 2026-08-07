@@ -65,6 +65,7 @@ enum class AuditEventKind : std::uint8_t {
     InvalidOwnership,
 };
 enum class AuditSeverity : std::uint8_t { Info, Warning, High };
+enum class AuditRecordPhase : std::uint8_t { Event, Intent, Completion };
 
 struct CoherenceAuditCounters {
     std::uint64_t timeout{};
@@ -82,6 +83,7 @@ struct CoherenceAuditRecord {
     std::uint64_t session_id{};
     std::uint64_t line_address{};
     std::uint64_t epoch{};
+    AuditRecordPhase phase{AuditRecordPhase::Event};
 };
 
 class MesiTransactionEngine {
@@ -92,14 +94,24 @@ public:
     using TimePoint = Clock::time_point;
     using Duration = Clock::duration;
 
-    // Forced dirty loss is permitted only after this synchronous sink accepts the exact High-severity record. Returning
-    // true promises durable acceptance. The callback may synchronously reenter registry/engine APIs; it runs without
-    // lifecycle, operation-wait, transport, audit, or directory locks. The sink is caller-owned and must outlive the
-    // engine.
+    // Forced dirty loss is permitted only after this synchronous sink durably accepts the exact High-severity Intent
+    // record. Returning true promises durable acceptance. After the typed M -> I commit, the exact Completion is also
+    // presented synchronously; its return value cannot undo the discard or replace DATA_LOSS. The callback may
+    // synchronously reenter registry/engine APIs and runs without lifecycle, operation-wait, transport, audit, or
+    // directory locks. The sink is caller-owned and must outlive the engine.
     class AuditSink {
     public:
         virtual ~AuditSink() = default;
         virtual bool accept(const CoherenceAuditRecord &record) = 0;
+    };
+
+    // Optional deterministic administrative boundary used by fault-injection and supervisory integrations. It runs
+    // immediately before each candidate line lock, without lifecycle, registry, audit, or directory locks. Throwing
+    // fails closed before the first dirty discard; after one or more committed discards, DATA_LOSS remains sticky.
+    class AdministrativeFaultInjector {
+    public:
+        virtual ~AdministrativeFaultInjector() = default;
+        virtual void beforeLine(std::size_t ordinal, std::uint64_t line_address) = 0;
     };
 
     // first_snoop_id seeds the never-reused monotonic allocator. Zero means
@@ -108,7 +120,8 @@ public:
                                    std::uint64_t first_snoop_id = 1);
     MesiTransactionEngine(MesiDirectory &directory, CoherenceMemoryBackend &memory, CoherenceTransport &transport,
                           Duration snoop_timeout = std::chrono::milliseconds(1000), std::uint64_t first_snoop_id = 1,
-                          AuditSink *audit_sink = nullptr, std::size_t audit_capacity = 256);
+                          AuditSink *audit_sink = nullptr, std::size_t audit_capacity = 256,
+                          AdministrativeFaultInjector *administrative_fault_injector = nullptr);
     ~MesiTransactionEngine();
 
     MesiTransactionEngine(const MesiTransactionEngine &) = delete;
@@ -224,7 +237,8 @@ private:
     std::shared_ptr<const TransactionDependencies> dependencySnapshot() const;
     static protocol_v2::Status statusFor(TransitionStatus status) noexcept;
     void recordAudit(AuditEventKind kind, AuditSeverity severity, std::uint16_t host_id, std::uint64_t session_id,
-                     std::uint64_t line_address, std::uint64_t epoch) noexcept;
+                     std::uint64_t line_address, std::uint64_t epoch,
+                     AuditRecordPhase phase = AuditRecordPhase::Event) noexcept;
     bool acceptForcedLoss(const CoherenceAuditRecord &record) noexcept;
 
     MesiDirectory &directory_;
@@ -252,6 +266,7 @@ private:
     std::vector<CoherenceAuditRecord> audit_records_;
     AuditSink *audit_sink_{};
     std::size_t audit_capacity_{256};
+    AdministrativeFaultInjector *administrative_fault_injector_{};
 };
 
 } // namespace cxlmemsim::mesi_v2

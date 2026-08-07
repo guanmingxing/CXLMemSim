@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace cxlmemsim {
@@ -48,6 +49,93 @@ private:
     friend class EndpointSessionRegistry;
 };
 
+class OperationAuthority {
+public:
+    constexpr OperationAuthority() noexcept = default;
+    OperationAuthority(const OperationAuthority &) = delete;
+    OperationAuthority &operator=(const OperationAuthority &) = delete;
+    constexpr OperationAuthority(OperationAuthority &&other) noexcept
+        : session_id_(std::exchange(other.session_id_, 0)), generation_(std::exchange(other.generation_, 0)),
+          request_id_(std::exchange(other.request_id_, 0)), nonce_(std::exchange(other.nonce_, 0)) {}
+    constexpr OperationAuthority &operator=(OperationAuthority &&other) noexcept {
+        if (this != &other) {
+            session_id_ = std::exchange(other.session_id_, 0);
+            generation_ = std::exchange(other.generation_, 0);
+            request_id_ = std::exchange(other.request_id_, 0);
+            nonce_ = std::exchange(other.nonce_, 0);
+        }
+        return *this;
+    }
+    constexpr explicit operator bool() const noexcept { return nonce_ != 0; }
+
+private:
+    constexpr OperationAuthority(SessionId session_id, std::uint64_t generation, std::uint64_t request_id,
+                                 std::uint64_t nonce) noexcept
+        : session_id_(session_id), generation_(generation), request_id_(request_id), nonce_(nonce) {}
+    SessionId session_id_{};
+    std::uint64_t generation_{};
+    std::uint64_t request_id_{};
+    std::uint64_t nonce_{};
+    friend class EndpointSessionRegistry;
+};
+
+class CleanupAuthority {
+public:
+    constexpr CleanupAuthority() noexcept = default;
+    CleanupAuthority(const CleanupAuthority &) = delete;
+    CleanupAuthority &operator=(const CleanupAuthority &) = delete;
+    constexpr CleanupAuthority(CleanupAuthority &&other) noexcept
+        : session_id_(std::exchange(other.session_id_, 0)), generation_(std::exchange(other.generation_, 0)),
+          nonce_(std::exchange(other.nonce_, 0)) {}
+    constexpr CleanupAuthority &operator=(CleanupAuthority &&other) noexcept {
+        if (this != &other) {
+            session_id_ = std::exchange(other.session_id_, 0);
+            generation_ = std::exchange(other.generation_, 0);
+            nonce_ = std::exchange(other.nonce_, 0);
+        }
+        return *this;
+    }
+    constexpr explicit operator bool() const noexcept { return nonce_ != 0; }
+
+private:
+    constexpr CleanupAuthority(SessionId session_id, std::uint64_t generation, std::uint64_t nonce) noexcept
+        : session_id_(session_id), generation_(generation), nonce_(nonce) {}
+    SessionId session_id_{};
+    std::uint64_t generation_{};
+    std::uint64_t nonce_{};
+    friend class EndpointSessionRegistry;
+};
+
+class UnregisterAuthority {
+public:
+    constexpr UnregisterAuthority() noexcept = default;
+    UnregisterAuthority(const UnregisterAuthority &) = delete;
+    UnregisterAuthority &operator=(const UnregisterAuthority &) = delete;
+    constexpr UnregisterAuthority(UnregisterAuthority &&other) noexcept
+        : session_id_(std::exchange(other.session_id_, 0)), generation_(std::exchange(other.generation_, 0)),
+          request_id_(std::exchange(other.request_id_, 0)), nonce_(std::exchange(other.nonce_, 0)) {}
+    constexpr UnregisterAuthority &operator=(UnregisterAuthority &&other) noexcept {
+        if (this != &other) {
+            session_id_ = std::exchange(other.session_id_, 0);
+            generation_ = std::exchange(other.generation_, 0);
+            request_id_ = std::exchange(other.request_id_, 0);
+            nonce_ = std::exchange(other.nonce_, 0);
+        }
+        return *this;
+    }
+    constexpr explicit operator bool() const noexcept { return nonce_ != 0; }
+
+private:
+    constexpr UnregisterAuthority(SessionId session_id, std::uint64_t generation, std::uint64_t request_id,
+                                  std::uint64_t nonce) noexcept
+        : session_id_(session_id), generation_(generation), request_id_(request_id), nonce_(nonce) {}
+    SessionId session_id_{};
+    std::uint64_t generation_{};
+    std::uint64_t request_id_{};
+    std::uint64_t nonce_{};
+    friend class EndpointSessionRegistry;
+};
+
 #ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
 namespace endpoint_session_registry_test {
 enum class FailurePoint {
@@ -78,6 +166,11 @@ enum class RequestAdmissionResult {
     StaleRequest,
     InvalidRequest,
     SessionUnavailable
+};
+
+struct OperationAdmission {
+    RequestAdmissionResult result{RequestAdmissionResult::SessionUnavailable};
+    OperationAuthority authority;
 };
 
 struct RegistrationRequest {
@@ -118,6 +211,7 @@ struct SessionSnapshot {
     bool response_backpressured;
     bool closed_final_response_pinned;
     std::uint64_t operation_completion_watermark;
+    bool unregister_in_progress;
 };
 
 struct HolderSnapshot {
@@ -135,9 +229,18 @@ public:
     protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id, BindingId binding_id,
                                       const protocol_v2::CoherenceFrame &unregister_request);
 
+    // Replay-safe control/lifecycle admission. Holder-changing v2 commands are rejected here and must use
+    // admitOperation() so their exact directory/index effects cannot escape request-scoped authority.
     RequestAdmissionResult admitRequest(SessionId session_id, BindingId binding_id,
                                         const protocol_v2::CoherenceFrame &request);
+    // Atomically accepts a handler request and returns its sole move-only authority. The authority binds the admitting
+    // generation and request ID, remains valid across transport retirement only until terminal completion, and cannot
+    // authorize a resumed binding or another request. No method below holds the registry mutex across callbacks.
+    OperationAdmission admitOperation(SessionId session_id, BindingId binding_id,
+                                      const protocol_v2::CoherenceFrame &request);
     PinResponseResult pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
+                                  const protocol_v2::CoherenceFrame &response);
+    PinResponseResult pinResponse(const OperationAuthority &authority, const protocol_v2::CoherenceFrame &request,
                                   const protocol_v2::CoherenceFrame &response);
     bool acknowledgeResponses(SessionId session_id, BindingId binding_id, std::uint64_t highest_contiguous_consumed);
     std::uint64_t responseWatermark(SessionId session_id) const;
@@ -150,9 +253,10 @@ public:
     // releases that mutex before blocking. These methods never invoke response callbacks and different sessions never
     // share a wait mutex.
     bool completeOperation(SessionId session_id, BindingId binding_id, std::uint64_t request_id);
+    bool completeOperation(OperationAuthority &authority);
     bool waitForOperationsBefore(SessionId session_id, BindingId binding_id, std::uint64_t request_id) const;
-    // Waits through an already captured admission watermark. A zero watermark is immediately complete. The wait is
-    // generation exact, releases all registry locks, and wakes false when that binding retires.
+    // Waits through an already captured admission watermark. A zero watermark skips blocking only after exact identity
+    // validation. The wait is generation exact, releases all registry locks, and wakes false when that binding retires.
     bool waitForOperationsThrough(SessionId session_id, BindingId binding_id, std::uint64_t request_id) const;
     bool waitForOperationsThrough(SessionGenerationToken generation, std::uint64_t request_id) const;
     std::uint64_t operationCompletionWatermark(SessionId session_id) const;
@@ -182,15 +286,16 @@ public:
     // frames and validates only the exact still-live fenced binding; the engine performs opcode-specific validation.
     std::optional<std::uint64_t> sealFencedSession(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
     std::optional<std::uint64_t> sealFencedSession(SessionGenerationToken generation);
-    // After the sealed operation barrier completes, exactly one administrative cleanup may pin the generation. A
-    // subsequent transport disconnect retires only BindingId callbacks, not this token. abortFencedCleanup releases a
-    // failed attempt without reopening ordinary admission. These methods neither wait nor invoke callbacks.
-    bool freezeFencedGenerationForCleanup(SessionGenerationToken generation);
-    void abortFencedCleanup(SessionGenerationToken generation) noexcept;
+    // After the sealed operation barrier completes, exactly one administrative cleanup may acquire a move-only
+    // capability. A subsequent transport disconnect retires only BindingId callbacks, not that capability.
+    // abortFencedCleanup releases a failed attempt without reopening ordinary admission. These methods neither wait nor
+    // invoke callbacks.
+    std::optional<CleanupAuthority> freezeFencedGenerationForCleanup(SessionGenerationToken generation);
+    void abortFencedCleanup(CleanupAuthority &authority) noexcept;
     bool controlFrameAdmissible(SessionId session_id, BindingId binding_id,
                                 const protocol_v2::CoherenceFrame &frame) const;
     bool completeEviction(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
-    bool completeEviction(std::uint16_t host_id, SessionGenerationToken generation);
+    bool completeEviction(std::uint16_t host_id, CleanupAuthority &authority);
     bool drainOpcodeAdmissible(protocol_v2::Opcode opcode) const noexcept;
 
     // Reverse-index mutation is exact to the immutable live binding. After sealing, callers may publish only effects
@@ -203,16 +308,25 @@ public:
     std::vector<std::uint64_t> cleanHolders(SessionId session_id, BindingId binding_id) const;
     std::vector<std::uint64_t> modifiedHolders(SessionId session_id, BindingId binding_id) const;
     HolderSnapshot holderSnapshot(SessionId session_id, BindingId binding_id) const;
-    bool removeCleanHolder(SessionGenerationToken generation, std::uint64_t line_address);
-    bool removeModifiedHolder(SessionGenerationToken generation, std::uint64_t line_address);
-    HolderSnapshot holderSnapshot(SessionGenerationToken generation) const;
+    bool addCleanHolder(const OperationAuthority &authority, std::uint64_t line_address);
+    bool removeCleanHolder(const OperationAuthority &authority, std::uint64_t line_address);
+    bool addModifiedHolder(const OperationAuthority &authority, std::uint64_t line_address);
+    bool removeModifiedHolder(const OperationAuthority &authority, std::uint64_t line_address);
+    bool removeCleanHolder(const CleanupAuthority &authority, std::uint64_t line_address);
+    bool removeModifiedHolder(const CleanupAuthority &authority, std::uint64_t line_address);
+    HolderSnapshot holderSnapshot(const CleanupAuthority &authority) const;
 
     // UNREGISTER is already the terminal admitted ordinary command. Freezing after its earlier-operation wait prevents
-    // binding retirement during the preflight/commit interval; abortUnregister releases that pin without changing any
-    // directory or holder metadata.
-    bool freezeUnregister(SessionId session_id, BindingId binding_id,
-                          const protocol_v2::CoherenceFrame &unregister_request);
-    void abortUnregister(SessionId session_id, BindingId binding_id) noexcept;
+    // binding retirement during the preflight/commit interval. abortUnregister releases that pin and reopens admission
+    // after a failed close without changing directory or holder metadata; the failed response remains independently
+    // pinnable for ordered replay.
+    std::optional<UnregisterAuthority> freezeUnregister(SessionId session_id, BindingId binding_id,
+                                                        const protocol_v2::CoherenceFrame &unregister_request);
+    bool preflightGracefulClose(const UnregisterAuthority &authority, std::uint16_t host_id,
+                                const protocol_v2::CoherenceFrame &unregister_request) const;
+    protocol_v2::Status completeGracefulClose(UnregisterAuthority &authority, std::uint16_t host_id,
+                                              const protocol_v2::CoherenceFrame &unregister_request);
+    void abortUnregister(UnregisterAuthority &authority) noexcept;
 
     std::optional<SessionSnapshot> inspect(SessionId session_id) const;
 
@@ -248,10 +362,21 @@ private:
         std::unordered_map<std::uint64_t, std::size_t> in_flight_response_deliveries;
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> admitted_requests;
         std::map<std::uint64_t, PinnedResponse> pinned_responses;
+        struct OperationRecord {
+            std::uint64_t binding_generation{};
+            std::uint64_t nonce{};
+            protocol_v2::Opcode opcode{protocol_v2::Opcode::Heartbeat};
+            std::uint64_t line_address{};
+            bool claimed{};
+            bool terminal{};
+            bool response_reclaimed{};
+        };
+        std::map<std::uint64_t, OperationRecord> operation_records;
         std::optional<std::uint64_t> unregister_request_id;
-        bool unregister_frozen{};
+        std::uint64_t unregister_owner{};
         bool drain_sealed{};
-        bool cleanup_frozen{};
+        std::optional<std::uint64_t> sealed_cutoff;
+        std::uint64_t cleanup_owner{};
         std::uint64_t next_request_id{1};
         std::uint64_t publication_cursor{1};
         bool publishing{};
@@ -277,9 +402,21 @@ private:
 
     bool validHolderSession(const Session &session, BindingId binding_id) const noexcept;
     static bool validGeneration(const Session &session, SessionGenerationToken generation) noexcept;
+    static bool validOperationAuthority(const Session &session, const OperationAuthority &authority) noexcept;
+    enum class HolderEffect : std::uint8_t { AddClean, RemoveClean, AddModified, RemoveModified };
+    static bool validOperationHolderEffect(const Session &session, const OperationAuthority &authority,
+                                           std::uint64_t line_address, HolderEffect effect) noexcept;
+    static bool validCleanupAuthority(const Session &session, const CleanupAuthority &authority) noexcept;
+    static bool validUnregisterAuthority(const Session &session, const UnregisterAuthority &authority) noexcept;
+    static bool requiresOperationAuthority(protocol_v2::Opcode opcode) noexcept;
     bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
+    OperationAdmission admitRequestLocked(Session &session, const protocol_v2::CoherenceFrame &request,
+                                          bool claim_operation);
     bool beginDrainLocked(Session &session, std::uint64_t &generation, StoredResponseSender &sender,
                           StoredResponseSender &&staged_sender);
+    PinResponseResult pinResponseImpl(const OperationAuthority *authority, SessionId session_id,
+                                      const protocol_v2::CoherenceFrame &request,
+                                      const protocol_v2::CoherenceFrame &response);
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                         const StoredResponseSender &sender);
     StoredResponseSender finishDeliveryAttemptLocked(Session &session, std::uint64_t response_id, bool delivered);
@@ -290,8 +427,7 @@ private:
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
     bool validRegistration(const RegistrationRequest &request) const noexcept;
     static StoredResponseSender copySender(const ResponseSender &sender);
-    static void completeOperationState(const std::shared_ptr<Session::OperationState> &operations,
-                                       std::uint64_t request_id);
+    static void completeOperationStateLocked(Session::OperationState &operations, std::uint64_t request_id);
     static void publishBindingGeneration(Session &session);
 
     const std::uint16_t max_hosts_;
@@ -300,6 +436,7 @@ private:
     std::condition_variable delivery_finished_;
     SessionId next_session_id_{1};
     std::uint64_t next_binding_id_{1};
+    std::uint64_t next_authority_id_{1};
     std::unordered_map<SessionId, std::shared_ptr<Session>> sessions_;
     std::unordered_map<std::uint16_t, SessionId> host_sessions_;
 };

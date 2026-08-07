@@ -195,11 +195,43 @@ CoherenceFrame response(const CoherenceFrame &request) {
     return frame;
 }
 
+CoherenceFrame getsResponse(const CoherenceFrame &request) {
+    auto frame = response(request);
+    setAddress(frame, address(request));
+    setLineState(frame, LineState::E);
+    setEpoch(frame, epoch(request) + 1);
+    setPayloadLength(frame, kLineSize);
+    return frame;
+}
+
+CoherenceFrame getmResponse(const CoherenceFrame &request) {
+    auto frame = response(request);
+    setAddress(frame, address(request));
+    setLineState(frame, LineState::M);
+    setEpoch(frame, epoch(request) + 1);
+    setPayloadLength(frame, kLineSize);
+    return frame;
+}
+
 PinResponseResult pinHeartbeat(EndpointSessionRegistry &registry, SessionId session_id, std::uint64_t request_id,
                                std::uint16_t host) {
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, request_id, session_id, host);
     (void)registry.admitRequest(session_id, activeBinding(registry, session_id), heartbeat);
     return registry.pinResponse(session_id, heartbeat, response(heartbeat));
+}
+
+template <typename Registry, typename Token>
+bool identityCanRemoveClean(Registry &registry, const Token &token, std::uint64_t address) {
+    if constexpr (requires { registry.removeCleanHolder(token, address); })
+        return registry.removeCleanHolder(token, address);
+    return false;
+}
+
+template <typename Registry, typename Token>
+HolderSnapshot identityHolderSnapshot(Registry &registry, const Token &token) {
+    if constexpr (requires { registry.holderSnapshot(token); })
+        return registry.holderSnapshot(token);
+    return {};
 }
 
 Status closeSession(EndpointSessionRegistry &registry, std::uint16_t host, SessionId session_id,
@@ -285,8 +317,8 @@ void testDisconnectResumeAndReplay() {
     CHECK(registry.inspect(original.session_id)->state == SessionState::OfflineRetained);
     const auto offline_generation = registry.captureGeneration(7, original.session_id, BindingId{});
     CHECK(offline_generation.has_value());
-    CHECK(registry.holderSnapshot(*offline_generation).clean == std::vector<std::uint64_t>{0x1000});
-    CHECK(registry.holderSnapshot(*offline_generation).modified == std::vector<std::uint64_t>{0x2000});
+    CHECK(identityHolderSnapshot(registry, *offline_generation).clean.empty());
+    CHECK(identityHolderSnapshot(registry, *offline_generation).modified.empty());
     CHECK(registry.pinnedResponseIds(original.session_id) == (std::vector<std::uint64_t>{1, 2}));
 
     auto stale = request(7);
@@ -323,6 +355,9 @@ void testDisconnectResumeAndReplay() {
     CHECK(resumed.session_id == original.session_id);
     CHECK(replayed == (std::vector<std::uint64_t>{1, 2}));
     CHECK(registry.inspect(original.session_id)->transport_name == "rdma-B");
+    CHECK(registry.holderSnapshot(resumed.session_id, resumed.binding_id).clean == std::vector<std::uint64_t>{0x1000});
+    CHECK(registry.holderSnapshot(resumed.session_id, resumed.binding_id).modified ==
+          std::vector<std::uint64_t>{0x2000});
     CHECK(registry.pinnedResponseIds(original.session_id) == (std::vector<std::uint64_t>{1, 2}));
     CHECK(registry.registerEndpoint(resume).status == Status::DuplicateHost);
 
@@ -1553,12 +1588,11 @@ void testRequestSpecificCloseAndHolderBound() {
     CHECK(registry.addModifiedHolder(registered.session_id, registered.binding_id, 0x2000));
     CHECK(registry.disconnectAbruptly(26, registered.session_id, activeBinding(registry, registered.session_id)));
     CHECK(!registry.addCleanHolder(registered.session_id, registered.binding_id, 0x3000));
-    const auto offline = registry.captureGeneration(26, registered.session_id, BindingId{});
-    CHECK(offline.has_value());
-    CHECK(registry.removeModifiedHolder(*offline, 0x2000));
     auto resume = one_line;
     resume.requested_session_id = registered.session_id;
-    CHECK(registry.registerEndpoint(resume).status == Status::Ok);
+    const auto resumed = registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
+    CHECK(registry.removeModifiedHolder(resumed.session_id, resumed.binding_id, 0x2000));
     const auto close_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 26);
     CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), close_request) ==
           RequestAdmissionResult::Accepted);
@@ -1779,6 +1813,175 @@ void testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder() {
     CHECK(registry.acknowledgeResponses(session_id, activeBinding(registry, session_id), 2));
 }
 
+void testCleanupRequiresPostSealWatermarkCapabilityAndValidatesZeroCutoff() {
+    EndpointSessionRegistry active_registry;
+    const auto active = active_registry.registerEndpoint(request(40));
+    CHECK(active_registry.addCleanHolder(active.session_id, active.binding_id, 0x1000));
+    const auto active_identity = active_registry.captureGeneration(40, active.session_id, active.binding_id);
+    CHECK(active_identity.has_value());
+    CHECK(!identityCanRemoveClean(active_registry, *active_identity, 0x1000));
+    CHECK(active_registry.cleanHolders(active.session_id, active.binding_id) == std::vector<std::uint64_t>{0x1000});
+
+    EndpointSessionRegistry fenced_registry;
+    const auto fenced = fenced_registry.registerEndpoint(request(41));
+    CHECK(fenced_registry.addCleanHolder(fenced.session_id, fenced.binding_id, 0x2000));
+    CHECK(fenced_registry.fenceSession(41, fenced.session_id, fenced.binding_id) == Status::Ok);
+    const auto fenced_identity = fenced_registry.captureGeneration(41, fenced.session_id, fenced.binding_id);
+    CHECK(fenced_identity.has_value());
+    CHECK(identityHolderSnapshot(fenced_registry, *fenced_identity).clean.empty());
+
+    const auto cutoff = fenced_registry.sealFencedSession(*fenced_identity);
+    CHECK(cutoff == 0);
+    CHECK(fenced_registry.waitForOperationsThrough(*fenced_identity, *cutoff));
+    auto cleanup = fenced_registry.freezeFencedGenerationForCleanup(*fenced_identity);
+    CHECK(cleanup.has_value());
+    CHECK(fenced_registry.holderSnapshot(*cleanup).clean == std::vector<std::uint64_t>{0x2000});
+    CHECK(fenced_registry.removeCleanHolder(*cleanup, 0x2000));
+    CHECK(fenced_registry.completeEviction(41, *cleanup));
+    CHECK(!fenced_registry.inspect(fenced.session_id).has_value());
+
+    CHECK(!fenced_registry.waitForOperationsThrough(*fenced_identity, 0));
+}
+
+void testDuplicateUnregisterCannotShareOrReleaseExecutionFreeze() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(42));
+    const auto unregister_request = protocolRequest(Opcode::Unregister, 1, registered.session_id, 42);
+    CHECK(registry.admitRequest(registered.session_id, registered.binding_id, unregister_request) ==
+          RequestAdmissionResult::Accepted);
+    auto owner = registry.freezeUnregister(registered.session_id, registered.binding_id, unregister_request);
+    CHECK(owner.has_value());
+    auto duplicate = registry.freezeUnregister(registered.session_id, registered.binding_id, unregister_request);
+    CHECK(!duplicate.has_value());
+    UnregisterAuthority failed_execution;
+    registry.abortUnregister(failed_execution);
+    CHECK(!registry.disconnectAbruptly(42, registered.session_id, registered.binding_id));
+    registry.abortUnregister(*owner);
+    CHECK(registry.disconnectAbruptly(42, registered.session_id, registered.binding_id));
+}
+
+void testOperationAuthorityIsRequestGenerationScopedAndTerminallyConsumed() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(43));
+    auto gets = protocolRequest(Opcode::Gets, 1, registered.session_id, 43);
+    setAddress(gets, 0x3000);
+    auto admission = registry.admitOperation(registered.session_id, registered.binding_id, gets);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    auto authority = std::move(admission.authority);
+    CHECK(static_cast<bool>(authority));
+    CHECK(registry.admitOperation(registered.session_id, registered.binding_id, gets).result ==
+          RequestAdmissionResult::Duplicate);
+    CHECK(registry.pinResponse(registered.session_id, gets, getsResponse(gets)) ==
+          PinResponseResult::SessionUnavailable);
+    CHECK(!registry.completeOperation(registered.session_id, registered.binding_id, 1));
+    CHECK(registry.operationCompletionWatermark(registered.session_id) == 0);
+    CHECK(registry.disconnectAbruptly(43, registered.session_id, registered.binding_id));
+    CHECK(registry.pinResponse(registered.session_id, gets, getsResponse(gets)) ==
+          PinResponseResult::SessionUnavailable);
+    const auto wrong = protocolRequest(Opcode::Heartbeat, 2, registered.session_id, 43);
+    CHECK(registry.pinResponse(authority, wrong, response(wrong)) == PinResponseResult::SessionUnavailable);
+    CHECK(registry.pinResponse(authority, gets, getsResponse(gets)) == PinResponseResult::Pinned);
+    CHECK(registry.addCleanHolder(authority, 0x3000));
+    CHECK(!registry.addCleanHolder(authority, 0x4000));
+    CHECK(!registry.addModifiedHolder(authority, 0x3000));
+    CHECK(registry.completeOperation(authority));
+    CHECK(!registry.addCleanHolder(authority, 0x4000));
+    CHECK(!registry.completeOperation(authority));
+
+    auto resume = request(43);
+    resume.requested_session_id = registered.session_id;
+    const auto resumed = registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
+    CHECK(registry.pinResponse(authority, gets, getsResponse(gets)) == PinResponseResult::SessionUnavailable);
+    CHECK(registry.cleanHolders(resumed.session_id, resumed.binding_id) == std::vector<std::uint64_t>{0x3000});
+}
+
+void testReentrantAckRetainsClaimedAuthorityUntilTerminalCompletion() {
+    EndpointSessionRegistry registry;
+    SessionId session_id{};
+    BindingId binding_id{};
+    auto registration = request(44, "reentrant", [&](const CoherenceFrame &frame) {
+        CHECK(registry.acknowledgeResponses(session_id, binding_id, requestId(frame)));
+        return true;
+    });
+    const auto registered = registry.registerEndpoint(registration);
+    session_id = registered.session_id;
+    binding_id = registered.binding_id;
+    auto gets = protocolRequest(Opcode::Gets, 1, session_id, 44);
+    setAddress(gets, 0x5000);
+    auto admission = registry.admitOperation(session_id, binding_id, gets);
+    auto authority = std::move(admission.authority);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    CHECK(registry.pinResponse(authority, gets, getsResponse(gets)) == PinResponseResult::Pinned);
+    CHECK(registry.responseWatermark(session_id) == 1);
+    CHECK(registry.addCleanHolder(authority, 0x5000));
+    CHECK(registry.completeOperation(authority));
+    CHECK(registry.operationCompletionWatermark(session_id) == 1);
+}
+
+void testUnregisterOwnerExcludesAdministrativeFence() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(46));
+    const auto unregister = protocolRequest(Opcode::Unregister, 1, registered.session_id, 46);
+    CHECK(registry.admitRequest(registered.session_id, registered.binding_id, unregister) ==
+          RequestAdmissionResult::Accepted);
+    auto owner = registry.freezeUnregister(registered.session_id, registered.binding_id, unregister);
+    CHECK(owner.has_value());
+    CHECK(registry.preflightGracefulClose(*owner, 46, unregister));
+    CHECK(registry.fenceSession(46, registered.session_id, registered.binding_id) == Status::InvalidState);
+    registry.abortUnregister(*owner);
+}
+
+void testPublicCloseWaitsForClaimedOperationCompletion() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(47));
+    auto getm = protocolRequest(Opcode::Getm, 1, registered.session_id, 47);
+    setAddress(getm, 0x6000);
+    auto admission = registry.admitOperation(registered.session_id, registered.binding_id, getm);
+    auto authority = std::move(admission.authority);
+    CHECK(admission.result == RequestAdmissionResult::Accepted);
+    const auto unregister = protocolRequest(Opcode::Unregister, 2, registered.session_id, 47);
+    CHECK(registry.admitRequest(registered.session_id, registered.binding_id, unregister) ==
+          RequestAdmissionResult::Accepted);
+    CHECK(registry.pinResponse(authority, getm, getmResponse(getm)) == PinResponseResult::Pinned);
+    CHECK(registry.gracefulClose(47, registered.session_id, registered.binding_id, unregister) == Status::InvalidState);
+    CHECK(registry.inspect(registered.session_id)->state == SessionState::Active);
+    CHECK(registry.addModifiedHolder(authority, 0x6000));
+    CHECK(registry.completeOperation(authority));
+}
+
+void testEffectfulRequestsRequireOperationAuthority() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(48));
+    auto getm = protocolRequest(Opcode::Getm, 1, registered.session_id, 48);
+    setAddress(getm, 0x7000);
+    CHECK(registry.admitRequest(registered.session_id, registered.binding_id, getm) ==
+          RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.admitOperation(registered.session_id, registered.binding_id, getm).result ==
+          RequestAdmissionResult::Accepted);
+}
+
+void testReclaimedClaimedOperationStillConsumesAdmissionCapacity() {
+    EndpointSessionRegistry registry(64, 1);
+    SessionId session_id{};
+    BindingId binding_id{};
+    auto registration = request(49, "bounded", [&](const CoherenceFrame &frame) {
+        CHECK(registry.acknowledgeResponses(session_id, binding_id, requestId(frame)));
+        return true;
+    });
+    const auto registered = registry.registerEndpoint(registration);
+    session_id = registered.session_id;
+    binding_id = registered.binding_id;
+    auto gets = protocolRequest(Opcode::Gets, 1, session_id, 49);
+    setAddress(gets, 0x8000);
+    auto admission = registry.admitOperation(session_id, binding_id, gets);
+    auto authority = std::move(admission.authority);
+    CHECK(registry.pinResponse(authority, gets, getsResponse(gets)) == PinResponseResult::Pinned);
+    CHECK(registry.admitRequest(session_id, binding_id, protocolRequest(Opcode::Heartbeat, 2, session_id, 49)) ==
+          RequestAdmissionResult::Backpressure);
+    CHECK(registry.completeOperation(authority));
+}
+
 } // namespace
 
 int main() {
@@ -1832,6 +2035,14 @@ int main() {
     testUnregisterAdmissionIsTerminal();
     testUnregisterNeverClosesOverLaterAdmittedWork();
     testCloseRejectsUnfinishedEarlierRequestThenPublishesInOrder();
+    testCleanupRequiresPostSealWatermarkCapabilityAndValidatesZeroCutoff();
+    testDuplicateUnregisterCannotShareOrReleaseExecutionFreeze();
+    testOperationAuthorityIsRequestGenerationScopedAndTerminallyConsumed();
+    testReentrantAckRetainsClaimedAuthorityUntilTerminalCompletion();
+    testUnregisterOwnerExcludesAdministrativeFence();
+    testPublicCloseWaitsForClaimedOperationCompletion();
+    testEffectfulRequestsRequireOperationAuthority();
+    testReclaimedClaimedOperationStillConsumesAdmissionCapacity();
     if (failures != 0) {
         std::cerr << failures << " checks failed\n";
         return EXIT_FAILURE;
