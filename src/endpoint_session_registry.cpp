@@ -200,6 +200,7 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                 retry = true;
             } else {
                 ++session->binding_generation;
+                publishBindingGeneration(*session);
                 generation = session->binding_generation;
                 session->binding_id = BindingId{staged_binding_value};
                 ++next_binding_id_;
@@ -268,6 +269,7 @@ bool EndpointSessionRegistry::disconnectAbruptly(std::uint16_t host_id, SessionI
     session->transport_name.clear();
     session->publishing = false;
     ++session->binding_generation;
+    publishBindingGeneration(*session);
     waitForRetiredGeneration(lock, *session, retired);
     return true;
 }
@@ -322,7 +324,10 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
     if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
         return RequestAdmissionResult::SessionUnavailable;
     auto &session = *found->second;
-    if (session.state != SessionState::Active || !validOrdinaryRequest(session, request))
+    const bool active = session.state == SessionState::Active;
+    const bool fenced_drain =
+        session.state == SessionState::Fenced && drainOpcodeAdmissible(protocol_v2::opcode(request));
+    if ((!active && !fenced_drain) || !validOrdinaryRequest(session, request))
         return RequestAdmissionResult::InvalidRequest;
     const auto id = protocol_v2::requestId(request);
     if (const auto existing = session.admitted_requests.find(id); existing != session.admitted_requests.end())
@@ -347,7 +352,8 @@ RequestAdmissionResult EndpointSessionRegistry::admitRequest(SessionId session_i
 
 bool EndpointSessionRegistry::beginDrainLocked(Session &session, std::uint64_t &generation,
                                                StoredResponseSender &sender, StoredResponseSender &&staged_sender) {
-    const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Closed;
+    const bool deliverable_state = session.state == SessionState::Active || session.state == SessionState::Fenced ||
+                                   session.state == SessionState::Closed;
     if (!deliverable_state || !session.sender || !staged_sender || session.publishing ||
         !session.pinned_responses.contains(session.publication_cursor))
         return false;
@@ -366,6 +372,7 @@ void EndpointSessionRegistry::retireFailedBinding(const std::shared_ptr<Session>
             return;
         if (session->binding_generation != std::numeric_limits<std::uint64_t>::max())
             ++session->binding_generation;
+        publishBindingGeneration(*session);
         if (session->state != SessionState::Closed)
             session->state = SessionState::OfflineRetained;
         retired_sender = std::move(session->sender);
@@ -417,7 +424,8 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
         {
             std::lock_guard lock(mutex_);
             if (session->binding_generation != generation ||
-                (session->state != SessionState::Active && session->state != SessionState::Closed) ||
+                (session->state != SessionState::Active && session->state != SessionState::Fenced &&
+                 session->state != SessionState::Closed) ||
                 !session->publishing || session->publisher_generation != generation) {
                 return true;
             }
@@ -525,19 +533,21 @@ PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, con
                  session->closed_final_response_pinned))
                 return PinResponseResult::InvalidResponse;
             if (session->state != SessionState::Active && session->state != SessionState::OfflineRetained &&
-                session->state != SessionState::Closed)
+                session->state != SessionState::Fenced && session->state != SessionState::Closed)
                 return PinResponseResult::SessionUnavailable;
             session->pinned_responses.emplace(id, PinnedResponse{request, response_frame});
             if (session->state == SessionState::Closed)
                 session->closed_final_response_pinned = true;
         }
-        const bool deliverable_state = session->state == SessionState::Active || session->state == SessionState::Closed;
+        const bool deliverable_state = session->state == SessionState::Active ||
+                                       session->state == SessionState::Fenced || session->state == SessionState::Closed;
         if (deliverable_state && session->sender && !session->publishing &&
             session->pinned_responses.contains(session->publication_cursor)) {
             sender_to_copy = session->sender;
             observed_generation = session->binding_generation;
         }
     }
+    completeOperationState(session->operations, protocol_v2::requestId(request));
     StoredResponseSender staged_sender;
     if (sender_to_copy)
         staged_sender = copySender(*sender_to_copy);
@@ -605,6 +615,175 @@ std::vector<std::uint64_t> EndpointSessionRegistry::pinnedResponseIds(SessionId 
     return ids;
 }
 
+void EndpointSessionRegistry::completeOperationState(const std::shared_ptr<Session::OperationState> &operations,
+                                                     std::uint64_t request_id) {
+    std::lock_guard lock(operations->mutex);
+    if (request_id <= operations->completion_watermark)
+        return;
+    operations->completed_out_of_order.insert(request_id);
+    while (operations->completion_watermark != std::numeric_limits<std::uint64_t>::max()) {
+        const auto next = operations->completion_watermark + 1;
+        if (operations->completed_out_of_order.erase(next) == 0)
+            break;
+        operations->completion_watermark = next;
+    }
+    operations->changed.notify_all();
+}
+
+void EndpointSessionRegistry::publishBindingGeneration(Session &session) {
+    {
+        std::lock_guard lock(session.operations->mutex);
+        session.operations->binding_generation = session.binding_generation;
+        session.operations->changed.notify_all();
+    }
+    {
+        std::lock_guard lock(session.holder_drain->mutex);
+        session.holder_drain->binding_generation = session.binding_generation;
+        session.holder_drain->changed.notify_all();
+    }
+}
+
+bool EndpointSessionRegistry::completeOperation(SessionId id, BindingId binding_id, std::uint64_t request_id) {
+    std::shared_ptr<Session::OperationState> operations;
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(id);
+        if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id ||
+            !found->second->admitted_requests.contains(request_id))
+            return false;
+        operations = found->second->operations;
+    }
+    completeOperationState(operations, request_id);
+    return true;
+}
+
+bool EndpointSessionRegistry::waitForOperationsBefore(SessionId id, BindingId binding_id,
+                                                      std::uint64_t request_id) const {
+    if (request_id == 0)
+        return false;
+    std::shared_ptr<Session::OperationState> operations;
+    std::uint64_t generation{};
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(id);
+        if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id ||
+            !found->second->admitted_requests.contains(request_id))
+            return false;
+        operations = found->second->operations;
+        generation = found->second->binding_generation;
+    }
+    std::unique_lock lock(operations->mutex);
+    operations->changed.wait(lock, [&] {
+        return operations->completion_watermark >= request_id - 1 || operations->binding_generation != generation;
+    });
+    return operations->binding_generation == generation;
+}
+
+std::uint64_t EndpointSessionRegistry::operationCompletionWatermark(SessionId id) const {
+    std::shared_ptr<Session::OperationState> operations;
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end())
+            return 0;
+        operations = found->second->operations;
+    }
+    std::lock_guard lock(operations->mutex);
+    return operations->completion_watermark;
+}
+
+bool EndpointSessionRegistry::admittedRequestHasOpcode(SessionId id, BindingId binding_id, std::uint64_t request_id,
+                                                       protocol_v2::Opcode expected_opcode) const {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(id);
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+        return false;
+    const auto request = found->second->admitted_requests.find(request_id);
+    return request != found->second->admitted_requests.end() && protocol_v2::opcode(request->second) == expected_opcode;
+}
+
+bool EndpointSessionRegistry::admittedRequestMatches(SessionId id, BindingId binding_id,
+                                                     const protocol_v2::CoherenceFrame &expected_request) const {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(id);
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+        return false;
+    const auto request = found->second->admitted_requests.find(protocol_v2::requestId(expected_request));
+    return request != found->second->admitted_requests.end() && sameFrame(request->second, expected_request);
+}
+
+bool EndpointSessionRegistry::waitForModifiedDrain(SessionId id, BindingId binding_id) const {
+    std::shared_ptr<Session::HolderDrainState> holder_drain;
+    std::uint64_t generation{};
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(id);
+        if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+            return false;
+        holder_drain = found->second->holder_drain;
+        generation = found->second->binding_generation;
+    }
+    std::unique_lock lock(holder_drain->mutex);
+    holder_drain->changed.wait(
+        lock, [&] { return holder_drain->modified_count == 0 || holder_drain->binding_generation != generation; });
+    return holder_drain->binding_generation == generation;
+}
+
+protocol_v2::Status EndpointSessionRegistry::fenceSession(std::uint16_t host_id, SessionId id, BindingId binding_id) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(id);
+    if (found == sessions_.end() || found->second->host_id != host_id)
+        return protocol_v2::Status::StaleSession;
+    const auto &session = *found->second;
+    const bool live_binding = binding_id && session.binding_id == binding_id &&
+                              (session.state == SessionState::Active || session.state == SessionState::Fenced);
+    const bool retained_offline =
+        !binding_id && !session.binding_id &&
+        (session.state == SessionState::OfflineRetained || session.state == SessionState::Fenced);
+    if (!live_binding && !retained_offline)
+        return protocol_v2::Status::InvalidState;
+    found->second->state = SessionState::Fenced;
+    return protocol_v2::Status::Ok;
+}
+
+bool EndpointSessionRegistry::completeEviction(std::uint16_t host_id, SessionId id, BindingId binding_id) {
+    StoredResponseSender retired_sender;
+    std::shared_ptr<Session> session;
+    std::unique_lock lock(mutex_);
+    const auto found = sessions_.find(id);
+    if (found == sessions_.end() || found->second->host_id != host_id)
+        return false;
+    session = found->second;
+    const bool matching_binding =
+        (binding_id && session->binding_id == binding_id) || (!binding_id && !session->binding_id);
+    if (!matching_binding || session->state != SessionState::Fenced || !session->clean_holders.empty() ||
+        !session->modified_holders.empty() || session->binding_generation == std::numeric_limits<std::uint64_t>::max())
+        return false;
+
+    const auto retired = session->binding_generation;
+    ++session->binding_generation;
+    publishBindingGeneration(*session);
+    retired_sender = std::move(session->sender);
+    session->binding_id = {};
+    session->transport_name.clear();
+    session->publishing = false;
+    waitForRetiredGeneration(lock, *session, retired);
+    session->state = SessionState::Closed;
+
+    const auto host = host_sessions_.find(host_id);
+    if (host == host_sessions_.end() || host->second != id)
+        return false;
+    host_sessions_.erase(host);
+    sessions_.erase(found);
+    return true;
+}
+
+bool EndpointSessionRegistry::drainOpcodeAdmissible(protocol_v2::Opcode opcode) const noexcept {
+    return opcode == protocol_v2::Opcode::Putm || opcode == protocol_v2::Opcode::Fence ||
+           opcode == protocol_v2::Opcode::Heartbeat || opcode == protocol_v2::Opcode::SnoopAck ||
+           opcode == protocol_v2::Opcode::HostFence;
+}
+
 bool EndpointSessionRegistry::addCleanHolder(SessionId id, std::uint64_t line) {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(id);
@@ -639,13 +818,25 @@ bool EndpointSessionRegistry::addModifiedHolder(SessionId id, std::uint64_t line
         session.cache_capacity / protocol_v2::kLineSize)
         return false;
     session.modified_holders.insert(line);
+    {
+        std::lock_guard drain_lock(session.holder_drain->mutex);
+        session.holder_drain->modified_count = session.modified_holders.size();
+        session.holder_drain->changed.notify_all();
+    }
     return true;
 }
 bool EndpointSessionRegistry::removeModifiedHolder(SessionId id, std::uint64_t line) {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(id);
-    return found != sessions_.end() && validHolderSession(*found->second) &&
-           found->second->modified_holders.erase(line) != 0;
+    if (found == sessions_.end() || !validHolderSession(*found->second) ||
+        found->second->modified_holders.erase(line) == 0)
+        return false;
+    {
+        std::lock_guard drain_lock(found->second->holder_drain->mutex);
+        found->second->holder_drain->modified_count = found->second->modified_holders.size();
+        found->second->holder_drain->changed.notify_all();
+    }
+    return true;
 }
 std::vector<std::uint64_t> EndpointSessionRegistry::cleanHolders(SessionId id) const {
     std::lock_guard lock(mutex_);
@@ -662,28 +853,47 @@ std::vector<std::uint64_t> EndpointSessionRegistry::modifiedHolders(SessionId id
                                                                  found->second->modified_holders.end());
 }
 
-std::optional<SessionSnapshot> EndpointSessionRegistry::inspect(SessionId id) const {
+HolderSnapshot EndpointSessionRegistry::holderSnapshot(SessionId id) const {
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(id);
     if (found == sessions_.end())
-        return std::nullopt;
-    const auto &s = *found->second;
-    return SessionSnapshot{s.id,
-                           s.binding_id,
-                           s.host_id,
-                           s.state,
-                           s.capabilities,
-                           s.cache_capacity,
-                           s.cache_ways,
-                           s.transport_name,
-                           static_cast<bool>(s.sender),
-                           s.response_watermark,
-                           s.response_watermark == std::numeric_limits<std::uint64_t>::max() ? s.response_watermark
-                                                                                             : s.response_watermark + 1,
-                           s.pinned_responses.size(),
-                           max_pinned_responses_per_session_,
-                           s.admitted_requests.size() >= max_pinned_responses_per_session_,
-                           s.closed_final_response_pinned};
+        return {};
+    return {{found->second->clean_holders.begin(), found->second->clean_holders.end()},
+            {found->second->modified_holders.begin(), found->second->modified_holders.end()}};
+}
+
+std::optional<SessionSnapshot> EndpointSessionRegistry::inspect(SessionId id) const {
+    std::shared_ptr<Session::OperationState> operations;
+    SessionSnapshot snapshot;
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end())
+            return std::nullopt;
+        const auto &s = *found->second;
+        operations = s.operations;
+        snapshot = SessionSnapshot{s.id,
+                                   s.binding_id,
+                                   s.host_id,
+                                   s.state,
+                                   s.capabilities,
+                                   s.cache_capacity,
+                                   s.cache_ways,
+                                   s.transport_name,
+                                   static_cast<bool>(s.sender),
+                                   s.response_watermark,
+                                   s.response_watermark == std::numeric_limits<std::uint64_t>::max()
+                                       ? s.response_watermark
+                                       : s.response_watermark + 1,
+                                   s.pinned_responses.size(),
+                                   max_pinned_responses_per_session_,
+                                   s.admitted_requests.size() >= max_pinned_responses_per_session_,
+                                   s.closed_final_response_pinned,
+                                   0};
+    }
+    std::lock_guard operation_lock(operations->mutex);
+    snapshot.operation_completion_watermark = operations->completion_watermark;
+    return snapshot;
 }
 
 bool EndpointSessionRegistry::validHolderSession(const Session &s) const noexcept {

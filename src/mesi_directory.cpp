@@ -24,6 +24,8 @@ private:
     std::atomic<std::uint64_t> upgrade_transitions{};
     std::atomic<std::uint64_t> puts_transitions{};
     std::atomic<std::uint64_t> putm_transitions{};
+    std::atomic<std::uint64_t> atomic_transitions{};
+    std::atomic<std::uint64_t> administrative_evict_transitions{};
 };
 
 bool isValidSnapshot(const DirectorySnapshot &snapshot) noexcept {
@@ -131,6 +133,19 @@ TransitionResult MesiDirectory::LockedLine::commitPutm(std::uint16_t requester, 
     return state_->commit(*entry_, DirectoryOperation::Putm, requester, expected, next);
 }
 
+TransitionResult MesiDirectory::LockedLine::commitAtomic(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                         const DirectorySnapshot &next) {
+    requireLock();
+    return state_->commit(*entry_, DirectoryOperation::Atomic, requester, expected, next);
+}
+
+TransitionResult MesiDirectory::LockedLine::commitAdministrativeEvict(std::uint16_t requester,
+                                                                      const DirectorySnapshot &expected,
+                                                                      const DirectorySnapshot &next) {
+    requireLock();
+    return state_->commit(*entry_, DirectoryOperation::AdministrativeEvict, requester, expected, next);
+}
+
 bool MesiDirectory::aligned(std::uint64_t line_address) noexcept { return (line_address & (kLineSize - 1)) == 0; }
 
 bool MesiDirectory::validHost(std::uint16_t host_id) noexcept { return host_id < kMaximumHosts; }
@@ -154,6 +169,10 @@ bool MesiDirectory::validTransition(DirectoryOperation operation, std::uint16_t 
         return validPutsTransition(requester, current, next);
     case DirectoryOperation::Putm:
         return validPutmTransition(requester, current, next);
+    case DirectoryOperation::Atomic:
+        return validAtomicTransition(requester, current, next);
+    case DirectoryOperation::AdministrativeEvict:
+        return validAdministrativeEvictTransition(requester, current, next);
     }
     return false;
 }
@@ -227,6 +246,30 @@ bool MesiDirectory::validPutsTransition(std::uint16_t requester, const Directory
 bool MesiDirectory::validPutmTransition(std::uint16_t requester, const DirectorySnapshot &current,
                                         const DirectorySnapshot &next) noexcept {
     return current.state == MesiState::M && current.owner == requester && next.state == MesiState::I;
+}
+
+bool MesiDirectory::validAtomicTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                          const DirectorySnapshot &next) noexcept {
+    if (next.state == MesiState::M)
+        return next.owner == requester && next.sharers == 0 && !next.server_copy_current;
+    if (current.state == MesiState::S) {
+        const auto removed = current.sharers & ~next.sharers;
+        return removed != 0 && (next.sharers & ~current.sharers) == 0 && next.owner == std::nullopt &&
+               next.server_copy_current && next.state == (next.sharers == 0 ? MesiState::I : MesiState::S);
+    }
+    return (current.state == MesiState::E || current.state == MesiState::M) && current.owner &&
+           next.state == MesiState::I && next.owner == std::nullopt && next.sharers == 0 && next.server_copy_current;
+}
+
+bool MesiDirectory::validAdministrativeEvictTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                                       const DirectorySnapshot &next) noexcept {
+    if (current.state == MesiState::S && hasSharer(current, requester)) {
+        const auto remaining = current.sharers & ~holderBit(requester);
+        return next.owner == std::nullopt && next.sharers == remaining && next.server_copy_current &&
+               next.state == (remaining == 0 ? MesiState::I : MesiState::S);
+    }
+    return (current.state == MesiState::E || current.state == MesiState::M) && current.owner == requester &&
+           next.state == MesiState::I && !next.owner && next.sharers == 0 && next.server_copy_current;
 }
 
 std::optional<std::size_t> MesiDirectory::shardIndexFor(std::uint64_t line_address) const noexcept {
@@ -343,6 +386,10 @@ std::atomic<std::uint64_t> &MesiDirectory::State::counterFor(DirectoryOperation 
         return puts_transitions;
     case DirectoryOperation::Putm:
         return putm_transitions;
+    case DirectoryOperation::Atomic:
+        return atomic_transitions;
+    case DirectoryOperation::AdministrativeEvict:
+        return administrative_evict_transitions;
     }
     return gets_transitions;
 }
@@ -359,6 +406,10 @@ std::uint64_t &MesiDirectory::diagnosticFor(DirectoryEntry &entry, DirectoryOper
         return entry.diagnostics.puts;
     case DirectoryOperation::Putm:
         return entry.diagnostics.putm;
+    case DirectoryOperation::Atomic:
+        return entry.diagnostics.atomic;
+    case DirectoryOperation::AdministrativeEvict:
+        return entry.diagnostics.administrative_evict;
     }
     return entry.diagnostics.gets;
 }
@@ -376,7 +427,9 @@ TransitionResult MesiDirectory::State::commit(DirectoryEntry &entry, DirectoryOp
         return MesiDirectory::rejected(TransitionStatus::StaleMetadata, current);
     if (!MesiDirectory::validTransition(operation, requester, current, next))
         return MesiDirectory::rejected(TransitionStatus::InvalidState, current);
-    if (MesiDirectory::metadataEqual(current, next))
+    // Atomic data changes are not represented by the coherence metadata. Even when the current M owner remains the
+    // owner, committing the new authoritative bytes must advance the epoch and retain the typed atomic accounting.
+    if (operation != DirectoryOperation::Atomic && MesiDirectory::metadataEqual(current, next))
         return MesiDirectory::rejected(TransitionStatus::NoChange, current);
 
     next.epoch = current.epoch + 1;
@@ -497,9 +550,13 @@ TransitionCounters MesiDirectory::transitionCounters() const noexcept { return s
 
 TransitionCounters MesiDirectory::State::transitionCounters() const noexcept {
     return {
-        gets_transitions.load(std::memory_order_relaxed),    getm_transitions.load(std::memory_order_relaxed),
-        upgrade_transitions.load(std::memory_order_relaxed), puts_transitions.load(std::memory_order_relaxed),
+        gets_transitions.load(std::memory_order_relaxed),
+        getm_transitions.load(std::memory_order_relaxed),
+        upgrade_transitions.load(std::memory_order_relaxed),
+        puts_transitions.load(std::memory_order_relaxed),
         putm_transitions.load(std::memory_order_relaxed),
+        atomic_transitions.load(std::memory_order_relaxed),
+        administrative_evict_transitions.load(std::memory_order_relaxed),
     };
 }
 

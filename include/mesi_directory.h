@@ -49,6 +49,8 @@ struct TransitionCounters {
     std::uint64_t upgrade{};
     std::uint64_t puts{};
     std::uint64_t putm{};
+    std::uint64_t atomic{};
+    std::uint64_t administrative_evict{};
 };
 
 struct EntryDiagnostics {
@@ -57,6 +59,8 @@ struct EntryDiagnostics {
     std::uint64_t upgrade{};
     std::uint64_t puts{};
     std::uint64_t putm{};
+    std::uint64_t atomic{};
+    std::uint64_t administrative_evict{};
 };
 
 class DirectoryEntry {
@@ -83,7 +87,7 @@ private:
 
 class MesiDirectory {
 private:
-    enum class DirectoryOperation : std::uint8_t { Gets, Getm, Upgrade, Puts, Putm };
+    enum class DirectoryOperation : std::uint8_t { Gets, Getm, Upgrade, Puts, Putm, Atomic, AdministrativeEvict };
     struct State;
 
 public:
@@ -125,6 +129,12 @@ public:
                                     const DirectorySnapshot &next);
         TransitionResult commitPutm(std::uint16_t requester, const DirectorySnapshot &expected,
                                     const DirectorySnapshot &next);
+        TransitionResult commitAtomic(std::uint16_t requester, const DirectorySnapshot &expected,
+                                      const DirectorySnapshot &next);
+        // Administrative eviction is deliberately distinct from PUTM. It may remove M only after the caller selected an
+        // explicit data-loss policy and must never increment a protocol operation counter.
+        TransitionResult commitAdministrativeEvict(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                   const DirectorySnapshot &next);
 
     private:
         friend class MesiDirectory;
@@ -184,6 +194,10 @@ private:
                                     const DirectorySnapshot &next) noexcept;
     static bool validPutmTransition(std::uint16_t requester, const DirectorySnapshot &current,
                                     const DirectorySnapshot &next) noexcept;
+    static bool validAtomicTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                      const DirectorySnapshot &next) noexcept;
+    static bool validAdministrativeEvictTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                                   const DirectorySnapshot &next) noexcept;
     static DirectorySnapshot snapshotOf(const DirectoryEntry &entry) noexcept;
     static EntryDiagnostics diagnosticsOf(const DirectoryEntry &entry) noexcept;
     static std::shared_ptr<PendingTransaction> pendingTransactionOf(const DirectoryEntry &entry) noexcept;

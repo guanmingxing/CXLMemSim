@@ -104,6 +104,12 @@ struct SessionSnapshot {
     std::size_t pinned_response_limit;
     bool response_backpressured;
     bool closed_final_response_pinned;
+    std::uint64_t operation_completion_watermark;
+};
+
+struct HolderSnapshot {
+    std::vector<std::uint64_t> clean;
+    std::vector<std::uint64_t> modified;
 };
 
 class EndpointSessionRegistry {
@@ -125,12 +131,41 @@ public:
     std::uint64_t replayFloor(SessionId session_id) const;
     std::vector<std::uint64_t> pinnedResponseIds(SessionId session_id) const;
 
+    // Operation completion is independent from response-consumption acknowledgement. admitRequest() creates an
+    // incomplete operation; completeOperation() may be called out of order and advances only the highest contiguous
+    // completion watermark. waitForOperationsBefore() snapshots the per-session wait state under the registry mutex and
+    // releases that mutex before blocking. These methods never invoke response callbacks and different sessions never
+    // share a wait mutex.
+    bool completeOperation(SessionId session_id, BindingId binding_id, std::uint64_t request_id);
+    bool waitForOperationsBefore(SessionId session_id, BindingId binding_id, std::uint64_t request_id) const;
+    std::uint64_t operationCompletionWatermark(SessionId session_id) const;
+    // Lifecycle handlers use these read-only checks before any external mutation. They compare under the registry lock
+    // and neither retain that lock nor invoke callbacks.
+    bool admittedRequestHasOpcode(SessionId session_id, BindingId binding_id, std::uint64_t request_id,
+                                  protocol_v2::Opcode opcode) const;
+    bool admittedRequestMatches(SessionId session_id, BindingId binding_id,
+                                const protocol_v2::CoherenceFrame &request) const;
+
+    // Waits until the reverse holder index contains no modified candidates. The registry mutex is not held while
+    // waiting. Callers must first stop ordinary admission (for example with fenceSession()) so a new dirty holder
+    // cannot race success.
+    bool waitForModifiedDrain(SessionId session_id, BindingId binding_id) const;
+
+    // Administrative fencing is idempotent for the same live binding, or for an exact retained session with no binding.
+    // It blocks ordinary commands while retaining the bounded drain opcodes needed to finish coherence. Once the caller
+    // has revalidated and removed every reverse-index holding, completeEviction() retires callbacks and releases the
+    // host identity for a new generation. Neither method invokes a sender callback or acquires a directory lock.
+    protocol_v2::Status fenceSession(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    bool completeEviction(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    bool drainOpcodeAdmissible(protocol_v2::Opcode opcode) const noexcept;
+
     bool addCleanHolder(SessionId session_id, std::uint64_t line_address);
     bool removeCleanHolder(SessionId session_id, std::uint64_t line_address);
     bool addModifiedHolder(SessionId session_id, std::uint64_t line_address);
     bool removeModifiedHolder(SessionId session_id, std::uint64_t line_address);
     std::vector<std::uint64_t> cleanHolders(SessionId session_id) const;
     std::vector<std::uint64_t> modifiedHolders(SessionId session_id) const;
+    HolderSnapshot holderSnapshot(SessionId session_id) const;
 
     std::optional<SessionSnapshot> inspect(SessionId session_id) const;
 
@@ -173,6 +208,21 @@ private:
         std::uint64_t publisher_generation{};
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
+        struct OperationState {
+            mutable std::mutex mutex;
+            std::condition_variable changed;
+            std::uint64_t binding_generation{};
+            std::uint64_t completion_watermark{};
+            std::set<std::uint64_t> completed_out_of_order;
+        };
+        struct HolderDrainState {
+            mutable std::mutex mutex;
+            std::condition_variable changed;
+            std::uint64_t binding_generation{};
+            std::size_t modified_count{};
+        };
+        std::shared_ptr<OperationState> operations{std::make_shared<OperationState>()};
+        std::shared_ptr<HolderDrainState> holder_drain{std::make_shared<HolderDrainState>()};
     };
 
     bool validHolderSession(const Session &session) const noexcept;
@@ -189,6 +239,9 @@ private:
     RegistrationResult resultFor(const Session &session, protocol_v2::Status status) const;
     bool validRegistration(const RegistrationRequest &request) const noexcept;
     static StoredResponseSender copySender(const ResponseSender &sender);
+    static void completeOperationState(const std::shared_ptr<Session::OperationState> &operations,
+                                       std::uint64_t request_id);
+    static void publishBindingGeneration(Session &session);
 
     const std::uint16_t max_hosts_;
     const std::size_t max_pinned_responses_per_session_;

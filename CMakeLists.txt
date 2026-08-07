@@ -207,6 +207,12 @@ target_link_libraries(test_mesi_transaction_engine cxlmemsim)
 add_test(NAME test_mesi_transaction_engine COMMAND test_mesi_transaction_engine)
 set_tests_properties(test_mesi_transaction_engine PROPERTIES TIMEOUT 30)
 
+add_executable(test_mesi_writeback_and_atomics tests/test_mesi_writeback_and_atomics.cpp)
+target_include_directories(test_mesi_writeback_and_atomics PRIVATE include)
+target_link_libraries(test_mesi_writeback_and_atomics cxlmemsim)
+add_test(NAME test_mesi_writeback_and_atomics COMMAND test_mesi_writeback_and_atomics)
+set_tests_properties(test_mesi_writeback_and_atomics PROPERTIES TIMEOUT 30)
+
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
 add_executable(test_back_invalidation tests/test_back_invalidation.cpp)
