@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
@@ -85,6 +84,7 @@ private:
 class MesiDirectory {
 private:
     enum class DirectoryOperation : std::uint8_t { Gets, Getm, Upgrade, Puts, Putm };
+    struct State;
 
 public:
     static constexpr std::size_t kLineSize = 64;
@@ -102,7 +102,7 @@ public:
         LockedLine(const LockedLine &) = delete;
         LockedLine &operator=(const LockedLine &) = delete;
         LockedLine(LockedLine &&) noexcept = default;
-        LockedLine &operator=(LockedLine &&) noexcept = default;
+        LockedLine &operator=(LockedLine &&other) noexcept;
         ~LockedLine() = default;
 
         std::uint64_t lineAddress() const;
@@ -129,11 +129,13 @@ public:
     private:
         friend class MesiDirectory;
 
-        LockedLine(MesiDirectory &directory, std::shared_ptr<DirectoryEntry> entry,
+        LockedLine(std::shared_ptr<State> state, std::shared_ptr<DirectoryEntry> entry,
                    std::unique_lock<std::mutex> transaction_lock) noexcept;
         void requireLock() const;
 
-        MesiDirectory *directory_;
+        // The state owns the commit machinery and global counters. Keeping it
+        // alive makes an escaped guard independent of MesiDirectory lifetime.
+        std::shared_ptr<State> state_;
         std::shared_ptr<DirectoryEntry> entry_;
         std::unique_lock<std::mutex> transaction_lock_;
     };
@@ -191,18 +193,11 @@ private:
     static bool metadataEqual(const DirectorySnapshot &left, const DirectorySnapshot &right) noexcept;
     static TransitionResult rejected(TransitionStatus status, const DirectorySnapshot &snapshot) noexcept;
     static void validateSnapshot(const DirectorySnapshot &snapshot);
-    TransitionResult commitLocked(DirectoryEntry &entry, DirectoryOperation operation, std::uint16_t requester,
-                                  const DirectorySnapshot &expected, DirectorySnapshot next);
-    std::atomic<std::uint64_t> &counterFor(DirectoryOperation operation) noexcept;
     static std::uint64_t &diagnosticFor(DirectoryEntry &entry, DirectoryOperation operation) noexcept;
 
     const std::size_t shard_count_;
+    std::shared_ptr<State> state_;
     std::vector<std::unique_ptr<Shard>> shards_;
-    std::atomic<std::uint64_t> gets_transitions_{};
-    std::atomic<std::uint64_t> getm_transitions_{};
-    std::atomic<std::uint64_t> upgrade_transitions_{};
-    std::atomic<std::uint64_t> puts_transitions_{};
-    std::atomic<std::uint64_t> putm_transitions_{};
 };
 
 } // namespace cxlmemsim::mesi_v2

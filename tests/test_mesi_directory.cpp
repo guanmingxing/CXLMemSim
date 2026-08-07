@@ -137,6 +137,7 @@ void testLockedLineIsMoveOnlyAndOwnsPendingReference() {
     static_assert(!std::is_copy_constructible_v<MesiDirectory::LockedLine>);
     static_assert(!std::is_copy_assignable_v<MesiDirectory::LockedLine>);
     static_assert(std::is_move_constructible_v<MesiDirectory::LockedLine>);
+    static_assert(std::is_nothrow_move_assignable_v<MesiDirectory::LockedLine>);
 
     MesiDirectory directory;
     auto locked = directory.lockLine(kLineA);
@@ -153,6 +154,94 @@ void testLockedLineIsMoveOnlyAndOwnsPendingReference() {
     CHECK(locked->pendingTransaction()->marker == 17);
     locked->setPendingTransaction(nullptr);
     CHECK(locked->pendingTransaction() == nullptr);
+}
+
+void testLockedLineMoveAssignmentIsSafeAfterDirectoryLifetimeEnds() {
+    std::optional<MesiDirectory::LockedLine> first;
+    std::optional<MesiDirectory::LockedLine> second;
+
+    {
+        auto directory = std::make_unique<MesiDirectory>();
+        CHECK(directory->gets(kLineA, 1).status == TransitionStatus::Committed);
+        CHECK(directory->gets(kLineB, 2).status == TransitionStatus::Committed);
+        first = directory->lockLine(kLineA);
+        second = directory->lockLine(kLineB);
+        CHECK(first.has_value());
+        CHECK(second.has_value());
+        if (!first || !second)
+            return;
+    }
+
+    *first = std::move(*second);
+    CHECK(first->lineAddress() == kLineB);
+    const auto expected = first->snapshot();
+    checkExclusive(expected, 2, 1);
+
+    bool moved_from_rejected = false;
+    try {
+        (void)second->snapshot();
+    } catch (const std::logic_error &) {
+        moved_from_rejected = true;
+    }
+    CHECK(moved_from_rejected);
+
+    const DirectorySnapshot modified{MesiState::M, 2, 0, expected.epoch, false};
+    const auto result = first->commitUpgrade(2, expected, modified);
+    CHECK(result.status == TransitionStatus::Committed);
+    checkModified(result.snapshot, 2, 2);
+    CHECK(first->diagnostics().upgrade == 1);
+}
+
+void testLockedLineSelfMoveAssignmentIsANoOp() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 3).status == TransitionStatus::Committed);
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    auto &guard = *locked;
+    guard = std::move(guard);
+    CHECK(guard.lineAddress() == kLineA);
+    const auto expected = guard.snapshot();
+    checkExclusive(expected, 3, 1);
+
+    const DirectorySnapshot modified{MesiState::M, 3, 0, expected.epoch, false};
+    const auto result = guard.commitUpgrade(3, expected, modified);
+    CHECK(result.status == TransitionStatus::Committed);
+    checkModified(result.snapshot, 3, 2);
+}
+
+void testLockedLineRemainsUsableAfterDirectoryLifetimeEnds() {
+    std::optional<MesiDirectory::LockedLine> escaped;
+    DirectorySnapshot expected;
+
+    {
+        auto directory = std::make_unique<MesiDirectory>();
+        CHECK(directory->gets(kLineA, 7).status == TransitionStatus::Committed);
+        escaped = directory->lockLine(kLineA);
+        CHECK(escaped.has_value());
+        if (!escaped)
+            return;
+        expected = escaped->snapshot();
+    }
+
+    CHECK(escaped.has_value());
+    if (!escaped)
+        return;
+
+    const DirectorySnapshot modified{MesiState::M, 7, 0, expected.epoch, false};
+    const auto result = escaped->commitUpgrade(7, expected, modified);
+    CHECK(result.status == TransitionStatus::Committed);
+    checkModified(result.snapshot, 7, 2);
+    checkModified(escaped->snapshot(), 7, 2);
+
+    const auto diagnostics = escaped->diagnostics();
+    CHECK(diagnostics.gets == 1);
+    CHECK(diagnostics.getm == 0);
+    CHECK(diagnostics.upgrade == 1);
+    CHECK(diagnostics.puts == 0);
+    CHECK(diagnostics.putm == 0);
 }
 
 void testLockedCommitFinalizesTask4PostSnoopTransitions() {
@@ -829,6 +918,9 @@ void testCoherencyEngineOwnsIndependentStrictV2Directory() {
 int main() {
     testUntouchedLinesAreImplicitInvalidAndSparse();
     testLockedLineIsMoveOnlyAndOwnsPendingReference();
+    testLockedLineMoveAssignmentIsSafeAfterDirectoryLifetimeEnds();
+    testLockedLineSelfMoveAssignmentIsANoOp();
+    testLockedLineRemainsUsableAfterDirectoryLifetimeEnds();
     testLockedCommitFinalizesTask4PostSnoopTransitions();
     testLockedCommitRejectsSameOwnerExclusiveToModifiedAsGetm();
     testLockedUpgradeCommitsSameOwnerExclusiveToModified();

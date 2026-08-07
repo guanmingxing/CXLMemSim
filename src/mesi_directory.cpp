@@ -1,5 +1,6 @@
 #include "mesi_directory.h"
 
+#include <atomic>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -8,6 +9,21 @@ namespace cxlmemsim::mesi_v2 {
 struct MesiDirectory::Shard {
     mutable std::mutex mutex;
     std::unordered_map<std::uint64_t, std::shared_ptr<DirectoryEntry>> entries;
+};
+
+struct MesiDirectory::State {
+    TransitionResult commit(DirectoryEntry &entry, DirectoryOperation operation, std::uint16_t requester,
+                            const DirectorySnapshot &expected, DirectorySnapshot next);
+    TransitionCounters transitionCounters() const noexcept;
+
+private:
+    std::atomic<std::uint64_t> &counterFor(DirectoryOperation operation) noexcept;
+
+    std::atomic<std::uint64_t> gets_transitions{};
+    std::atomic<std::uint64_t> getm_transitions{};
+    std::atomic<std::uint64_t> upgrade_transitions{};
+    std::atomic<std::uint64_t> puts_transitions{};
+    std::atomic<std::uint64_t> putm_transitions{};
 };
 
 bool isValidSnapshot(const DirectorySnapshot &snapshot) noexcept {
@@ -25,7 +41,7 @@ bool isValidSnapshot(const DirectorySnapshot &snapshot) noexcept {
     return false;
 }
 
-MesiDirectory::MesiDirectory(std::size_t shard_count) : shard_count_(shard_count) {
+MesiDirectory::MesiDirectory(std::size_t shard_count) : shard_count_(shard_count), state_(std::make_shared<State>()) {
     if (shard_count == 0)
         throw std::invalid_argument("MESI directory requires at least one shard");
 
@@ -36,12 +52,25 @@ MesiDirectory::MesiDirectory(std::size_t shard_count) : shard_count_(shard_count
 
 MesiDirectory::~MesiDirectory() = default;
 
-MesiDirectory::LockedLine::LockedLine(MesiDirectory &directory, std::shared_ptr<DirectoryEntry> entry,
+MesiDirectory::LockedLine::LockedLine(std::shared_ptr<State> state, std::shared_ptr<DirectoryEntry> entry,
                                       std::unique_lock<std::mutex> transaction_lock) noexcept
-    : directory_(&directory), entry_(std::move(entry)), transaction_lock_(std::move(transaction_lock)) {}
+    : state_(std::move(state)), entry_(std::move(entry)), transaction_lock_(std::move(transaction_lock)) {}
+
+MesiDirectory::LockedLine &MesiDirectory::LockedLine::operator=(LockedLine &&other) noexcept {
+    if (this == &other)
+        return *this;
+
+    // Release the destination mutex before replacing the shared owner of the
+    // mutex-bearing entry. This also works when the destination is moved-from.
+    transaction_lock_ = std::unique_lock<std::mutex>{};
+    state_ = std::move(other.state_);
+    entry_ = std::move(other.entry_);
+    transaction_lock_ = std::move(other.transaction_lock_);
+    return *this;
+}
 
 void MesiDirectory::LockedLine::requireLock() const {
-    if (directory_ == nullptr || entry_ == nullptr || !transaction_lock_.owns_lock())
+    if (state_ == nullptr || entry_ == nullptr || !transaction_lock_.owns_lock())
         throw std::logic_error("MESI locked-line guard does not own a transaction lock");
 }
 
@@ -75,31 +104,31 @@ void MesiDirectory::LockedLine::setPendingTransaction(std::shared_ptr<PendingTra
 TransitionResult MesiDirectory::LockedLine::commitGets(std::uint16_t requester, const DirectorySnapshot &expected,
                                                        const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, DirectoryOperation::Gets, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Gets, requester, expected, next);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitGetm(std::uint16_t requester, const DirectorySnapshot &expected,
                                                        const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, DirectoryOperation::Getm, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Getm, requester, expected, next);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitUpgrade(std::uint16_t requester, const DirectorySnapshot &expected,
                                                           const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, DirectoryOperation::Upgrade, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Upgrade, requester, expected, next);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitPuts(std::uint16_t requester, const DirectorySnapshot &expected,
                                                        const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, DirectoryOperation::Puts, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Puts, requester, expected, next);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitPutm(std::uint16_t requester, const DirectorySnapshot &expected,
                                                        const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, DirectoryOperation::Putm, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Putm, requester, expected, next);
 }
 
 bool MesiDirectory::aligned(std::uint64_t line_address) noexcept { return (line_address & (kLineSize - 1)) == 0; }
@@ -230,7 +259,7 @@ std::optional<MesiDirectory::LockedLine> MesiDirectory::lockLine(std::uint64_t l
     // getOrCreate has released the shard lock before this per-entry lock is
     // acquired, so no path nests the two lock classes.
     std::unique_lock<std::mutex> transaction_lock(entry->transaction_mutex);
-    LockedLine locked(*this, std::move(entry), std::move(transaction_lock));
+    LockedLine locked(state_, std::move(entry), std::move(transaction_lock));
     return std::optional<LockedLine>(std::move(locked));
 }
 
@@ -302,20 +331,20 @@ void MesiDirectory::validateSnapshot(const DirectorySnapshot &snapshot) {
 #endif
 }
 
-std::atomic<std::uint64_t> &MesiDirectory::counterFor(DirectoryOperation operation) noexcept {
+std::atomic<std::uint64_t> &MesiDirectory::State::counterFor(DirectoryOperation operation) noexcept {
     switch (operation) {
     case DirectoryOperation::Gets:
-        return gets_transitions_;
+        return gets_transitions;
     case DirectoryOperation::Getm:
-        return getm_transitions_;
+        return getm_transitions;
     case DirectoryOperation::Upgrade:
-        return upgrade_transitions_;
+        return upgrade_transitions;
     case DirectoryOperation::Puts:
-        return puts_transitions_;
+        return puts_transitions;
     case DirectoryOperation::Putm:
-        return putm_transitions_;
+        return putm_transitions;
     }
-    return gets_transitions_;
+    return gets_transitions;
 }
 
 std::uint64_t &MesiDirectory::diagnosticFor(DirectoryEntry &entry, DirectoryOperation operation) noexcept {
@@ -334,21 +363,21 @@ std::uint64_t &MesiDirectory::diagnosticFor(DirectoryEntry &entry, DirectoryOper
     return entry.diagnostics.gets;
 }
 
-TransitionResult MesiDirectory::commitLocked(DirectoryEntry &entry, DirectoryOperation operation,
-                                             std::uint16_t requester, const DirectorySnapshot &expected,
-                                             DirectorySnapshot next) {
-    const auto current = snapshotOf(entry);
-    validateSnapshot(current);
-    if (!validHost(requester))
-        return rejected(TransitionStatus::InvalidHost, current);
+TransitionResult MesiDirectory::State::commit(DirectoryEntry &entry, DirectoryOperation operation,
+                                              std::uint16_t requester, const DirectorySnapshot &expected,
+                                              DirectorySnapshot next) {
+    const auto current = MesiDirectory::snapshotOf(entry);
+    MesiDirectory::validateSnapshot(current);
+    if (!MesiDirectory::validHost(requester))
+        return MesiDirectory::rejected(TransitionStatus::InvalidHost, current);
     if (!isValidSnapshot(current) || !isValidSnapshot(expected) || !isValidSnapshot(next))
-        return rejected(TransitionStatus::InvalidState, current);
-    if (!snapshotsEqual(current, expected) || next.epoch != expected.epoch)
-        return rejected(TransitionStatus::StaleMetadata, current);
-    if (!validTransition(operation, requester, current, next))
-        return rejected(TransitionStatus::InvalidState, current);
-    if (metadataEqual(current, next))
-        return rejected(TransitionStatus::NoChange, current);
+        return MesiDirectory::rejected(TransitionStatus::InvalidState, current);
+    if (!MesiDirectory::snapshotsEqual(current, expected) || next.epoch != expected.epoch)
+        return MesiDirectory::rejected(TransitionStatus::StaleMetadata, current);
+    if (!MesiDirectory::validTransition(operation, requester, current, next))
+        return MesiDirectory::rejected(TransitionStatus::InvalidState, current);
+    if (MesiDirectory::metadataEqual(current, next))
+        return MesiDirectory::rejected(TransitionStatus::NoChange, current);
 
     next.epoch = current.epoch + 1;
     entry.state = next.state;
@@ -357,8 +386,8 @@ TransitionResult MesiDirectory::commitLocked(DirectoryEntry &entry, DirectoryOpe
     entry.epoch = next.epoch;
     entry.server_copy_current = next.server_copy_current;
     counterFor(operation).fetch_add(1, std::memory_order_relaxed);
-    ++diagnosticFor(entry, operation);
-    validateSnapshot(snapshotOf(entry));
+    ++MesiDirectory::diagnosticFor(entry, operation);
+    MesiDirectory::validateSnapshot(MesiDirectory::snapshotOf(entry));
     return {TransitionStatus::Committed, next};
 }
 
@@ -464,11 +493,13 @@ TransitionResult MesiDirectory::putm(std::uint64_t line_address, std::uint16_t r
     return locked->commitPutm(requester, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
 }
 
-TransitionCounters MesiDirectory::transitionCounters() const noexcept {
+TransitionCounters MesiDirectory::transitionCounters() const noexcept { return state_->transitionCounters(); }
+
+TransitionCounters MesiDirectory::State::transitionCounters() const noexcept {
     return {
-        gets_transitions_.load(std::memory_order_relaxed),    getm_transitions_.load(std::memory_order_relaxed),
-        upgrade_transitions_.load(std::memory_order_relaxed), puts_transitions_.load(std::memory_order_relaxed),
-        putm_transitions_.load(std::memory_order_relaxed),
+        gets_transitions.load(std::memory_order_relaxed),    getm_transitions.load(std::memory_order_relaxed),
+        upgrade_transitions.load(std::memory_order_relaxed), puts_transitions.load(std::memory_order_relaxed),
+        putm_transitions.load(std::memory_order_relaxed),
     };
 }
 
