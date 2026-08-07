@@ -95,8 +95,8 @@ bool MesiTransactionEngine::bindSession(std::uint16_t host_id, std::uint64_t ses
     if (host_id >= MesiDirectory::kMaximumHosts || session_id == 0)
         return false;
     std::lock_guard lock(sessions_mutex_);
-    sessions_[host_id] = session_id;
-    return true;
+    const auto [found, inserted] = sessions_.try_emplace(host_id, session_id);
+    return inserted || found->second == session_id;
 }
 
 std::uint64_t MesiTransactionEngine::sessionFor(std::uint16_t host_id) const {
@@ -105,11 +105,15 @@ std::uint64_t MesiTransactionEngine::sessionFor(std::uint16_t host_id) const {
     return found == sessions_.end() ? 0 : found->second;
 }
 
-protocol_v2::Status MesiTransactionEngine::validateRequest(const TransactionRequest &request) const {
+protocol_v2::Status
+MesiTransactionEngine::validateRequest(const TransactionRequest &request,
+                                       const std::shared_ptr<const TransactionDependencies> &dependencies) const {
     if (request.host_id >= MesiDirectory::kMaximumHosts)
         return protocol_v2::Status::InvalidState;
     if (request.session_id == 0)
-        return protocol_v2::Status::Ok;
+        return dependencies->memory == nullptr && dependencies->transport == nullptr
+                   ? protocol_v2::Status::Ok
+                   : protocol_v2::Status::StaleSession;
     return sessionFor(request.host_id) == request.session_id ? protocol_v2::Status::Ok
                                                              : protocol_v2::Status::StaleSession;
 }
@@ -151,10 +155,10 @@ TransitionResult MesiTransactionEngine::putm(std::uint64_t line_address, std::ui
 
 TransactionResult MesiTransactionEngine::acquire(std::uint64_t line_address, TransactionRequest request,
                                                  Operation operation) {
-    if (const auto request_status = validateRequest(request); request_status != protocol_v2::Status::Ok)
+    const auto dependencies = dependencySnapshot();
+    if (const auto request_status = validateRequest(request, dependencies); request_status != protocol_v2::Status::Ok)
         return {request_status, unchanged(TransitionStatus::InvalidHost, {}), false, {}};
 
-    const auto dependencies = dependencySnapshot();
     auto locked = directory_.lockLine(line_address);
     if (!locked)
         return {protocol_v2::Status::InvalidState, unchanged(TransitionStatus::UnalignedAddress, {}), false, {}};
@@ -396,11 +400,9 @@ TransactionResult MesiTransactionEngine::transact(MesiDirectory::LockedLine &lin
         pending->changed.notify_all();
     };
     auto request_timeout_if_expired = [&] {
-        if (Clock::now() < pending->deadline)
+        if (Clock::now() < pending->deadline || pending->phase != PendingPhase::Open)
             return;
         pending->timeout_requested = true;
-        if (pending->phase == PendingPhase::Completed && !pending->disconnect_requested)
-            pending->phase = PendingPhase::TimedOut;
         pending->changed.notify_all();
     };
 

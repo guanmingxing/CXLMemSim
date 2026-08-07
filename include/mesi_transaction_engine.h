@@ -57,6 +57,9 @@ public:
     // transaction captures the complete configuration atomically, so a
     // concurrent configure() cannot mix dependency generations.
     void configure(CoherenceMemoryBackend &memory, CoherenceTransport &transport, Duration snoop_timeout);
+
+    // Inserts a previously unbound session or confirms the identical generation. A different generation fails without
+    // changing the binding; replacement is allowed only after notifyDisconnect() removes the matching old generation.
     bool bindSession(std::uint16_t host_id, std::uint64_t session_id);
     std::uint64_t sessionFor(std::uint16_t host_id) const;
 
@@ -79,7 +82,8 @@ private:
                                const DirectorySnapshot &current,
                                const std::shared_ptr<const TransactionDependencies> &dependencies);
     TransactionResult reconcile(MesiDirectory::LockedLine &line, const std::shared_ptr<PendingTransaction> &pending);
-    protocol_v2::Status validateRequest(const TransactionRequest &request) const;
+    protocol_v2::Status validateRequest(const TransactionRequest &request,
+                                        const std::shared_ptr<const TransactionDependencies> &dependencies) const;
     std::optional<std::uint64_t> allocateSnoopId() noexcept;
     void registerPending(const std::shared_ptr<PendingTransaction> &pending);
     void unregisterPending(const std::shared_ptr<PendingTransaction> &pending);

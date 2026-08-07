@@ -26,13 +26,13 @@ using namespace cxlmemsim::protocol_v2;
 
 namespace {
 
-int failures = 0;
+std::atomic<int> failures{};
 
 #define CHECK(condition)                                                                                               \
     do {                                                                                                               \
         if (!(condition)) {                                                                                            \
             std::cerr << __func__ << ':' << __LINE__ << ": CHECK failed: " #condition << '\n';                         \
-            ++failures;                                                                                                \
+            failures.fetch_add(1, std::memory_order_relaxed);                                                          \
         }                                                                                                              \
     } while (false)
 
@@ -185,10 +185,11 @@ public:
     bool sendToHost(std::uint16_t host, const CoherenceFrame &frame) override {
         std::function<void(std::uint16_t, const CoherenceFrame &)> callback;
         bool throw_after_callback = false;
+        std::size_t send_number = 0;
         {
             std::unique_lock lock(mutex_);
             sent_.emplace_back(host, frame);
-            const auto send_number = sent_.size();
+            send_number = sent_.size();
             sent_cv_.notify_all();
             sent_cv_.wait(lock, [&] { return blocked_send_ != send_number; });
             if (throw_on_send_)
@@ -198,6 +199,12 @@ public:
         }
         if (callback)
             callback(host, frame);
+        {
+            std::unique_lock lock(mutex_);
+            callback_completed_.push_back(send_number);
+            sent_cv_.notify_all();
+            sent_cv_.wait(lock, [&] { return blocked_after_callback_send_ != send_number; });
+        }
         if (throw_after_callback)
             throw std::runtime_error("injected post-callback transport failure");
         return send_success_.load();
@@ -225,10 +232,32 @@ public:
         blocked_send_ = send_number;
     }
 
+    void blockAfterCallback(std::size_t send_number) {
+        std::lock_guard lock(mutex_);
+        blocked_after_callback_send_ = send_number;
+    }
+
     void releaseSend() {
         std::lock_guard lock(mutex_);
         blocked_send_ = 0;
         sent_cv_.notify_all();
+    }
+
+    void releaseAfterCallback() {
+        std::lock_guard lock(mutex_);
+        blocked_after_callback_send_ = 0;
+        sent_cv_.notify_all();
+    }
+
+    void waitForCallback(std::size_t send_number) const {
+        std::unique_lock lock(mutex_);
+        if (!sent_cv_.wait_for(lock, kTestTimeout, [&] {
+                return std::find(callback_completed_.begin(), callback_completed_.end(), send_number) !=
+                       callback_completed_.end();
+            })) {
+            std::cerr << "transport callback wait timed out\n";
+            std::_Exit(EXIT_FAILURE);
+        }
     }
 
     std::vector<std::pair<std::uint16_t, CoherenceFrame>> waitFor(std::size_t count) const {
@@ -250,10 +279,12 @@ private:
     mutable std::condition_variable sent_cv_;
     std::vector<std::pair<std::uint16_t, CoherenceFrame>> sent_;
     std::function<void(std::uint16_t, const CoherenceFrame &)> callback_;
+    std::vector<std::size_t> callback_completed_;
     std::atomic<bool> send_success_{true};
     bool throw_on_send_{};
     bool throw_after_callback_{};
     std::size_t blocked_send_{};
+    std::size_t blocked_after_callback_send_{};
 };
 
 CoherenceFrame ackFor(const CoherenceFrame &snoop, const std::array<std::byte, 64> &dirty = {}) {
@@ -290,7 +321,7 @@ template <typename Function> std::optional<TransactionResult> transactionWithout
         return std::forward<Function>(function)();
     } catch (const std::exception &error) {
         std::cerr << "unexpected transaction exception: " << error.what() << '\n';
-        ++failures;
+        failures.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 }
@@ -831,6 +862,34 @@ void testNaturalDeadlineDuringBlockedSendStopsLaterSnoops() {
     checkNoPending(directory, kLineA);
 }
 
+void testAcceptedFinalAckBeforeDeadlineSurvivesSuccessfulSlowSendReturn() {
+    constexpr auto snoop_timeout = std::chrono::milliseconds(500);
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 1).committed());
+    FakeMemoryBackend memory;
+    memory.seed(kLineA, bytes(0x6a));
+    FakeTransport transport;
+    transport.blockAfterCallback(1);
+    MesiTransactionEngine engine(directory, memory, transport, snoop_timeout);
+    bind(engine, {{1, 101}, {2, 102}});
+    transport.onSend([&](std::uint16_t, const CoherenceFrame &snoop) {
+        CHECK(engine.handleSnoopAck(ackFor(snoop)) == AckDisposition::Accepted);
+    });
+
+    auto future = std::async(std::launch::async, [&] { return engine.getm(kLineA, {2, 102, 9207}); });
+    transport.waitForCallback(1);
+    CHECK(future.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    std::this_thread::sleep_for(snoop_timeout + std::chrono::milliseconds(50));
+    transport.releaseAfterCallback();
+    const auto result = ready(future, "accepted final ACK before slow successful send return");
+
+    CHECK(result.status == Status::Ok);
+    CHECK(result.granted);
+    CHECK(result.data == bytes(0x6a));
+    checkState(directory, kLineA, MesiState::M, 2, 0, 2, false);
+    checkNoPending(directory, kLineA);
+}
+
 void checkFinalSynchronousAckSendFailure(bool throw_after_callback) {
     MesiDirectory directory;
     CHECK(directory.gets(kLineA, 1).committed());
@@ -882,6 +941,64 @@ void testRegisteredDirectDataGrantRequiresConfiguredBackend() {
     }
 }
 
+void testConfiguredStrictV2RejectsSessionZeroBeforeBackendAccess() {
+    MesiDirectory directory;
+    FakeMemoryBackend memory;
+    memory.seed(kLineA, bytes(0x71));
+    FakeTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kTestTimeout);
+
+    const auto result = engine.gets(kLineA, {1, 0, 9208});
+
+    CHECK(result.status == Status::StaleSession);
+    CHECK(!result.granted);
+    CHECK(memory.reads() == 0);
+    CHECK(memory.writes() == 0);
+    CHECK(transport.sent().empty());
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 0, true);
+
+    CoherencyEngine wrapper(0, nullptr, nullptr);
+    wrapper.configureStrictV2(memory, transport, kTestTimeout);
+    CHECK(!wrapper.strictV2Gets(kLineB, 2).succeeded());
+    CHECK(memory.reads() == 0);
+    CHECK(transport.sent().empty());
+    checkState(wrapper.strictV2Directory(), kLineB, MesiState::I, std::nullopt, 0, 0, true);
+}
+
+void testSessionGenerationCannotBeReplacedUntilDisconnect() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 1).committed());
+    FakeMemoryBackend memory;
+    memory.seed(kLineA, bytes(0x72));
+    FakeTransport transport;
+    transport.blockAfterCallback(1);
+    MesiTransactionEngine engine(directory, memory, transport, kTestTimeout);
+    bind(engine, {{1, 101}, {2, 102}});
+    CHECK(engine.bindSession(2, 102));
+    transport.onSend([&](std::uint16_t, const CoherenceFrame &snoop) {
+        CHECK(engine.handleSnoopAck(ackFor(snoop)) == AckDisposition::Accepted);
+    });
+
+    auto future = std::async(std::launch::async, [&] { return engine.getm(kLineA, {2, 102, 9209}); });
+    transport.waitForCallback(1);
+    CHECK(!engine.bindSession(2, 202));
+    CHECK(engine.sessionFor(2) == 102);
+    CHECK(engine.bindSession(2, 102));
+    transport.releaseAfterCallback();
+    const auto result = ready(future, "old session transaction after rejected replacement");
+
+    CHECK(result.status == Status::Ok);
+    CHECK(result.granted);
+    CHECK(result.data == bytes(0x72));
+    CHECK(engine.sessionFor(2) == 102);
+    checkState(directory, kLineA, MesiState::M, 2, 0, 2, false);
+
+    CHECK(engine.notifyDisconnect(2, 102) == 0);
+    CHECK(engine.sessionFor(2) == 0);
+    CHECK(engine.bindSession(2, 202));
+    CHECK(engine.sessionFor(2) == 202);
+}
+
 void testUnconfiguredStrictWrapperPreservesMetadataOnlyCompatibility() {
     CoherencyEngine engine(0, nullptr, nullptr);
 
@@ -914,15 +1031,16 @@ void testDependencyFailuresReturnIoErrorAndClearPending() {
         memory.setThrowRead(true);
         FakeTransport transport;
         MesiTransactionEngine engine(directory, memory, transport, kTestTimeout);
+        bind(engine, {{1, 101}});
 
-        const auto result = transactionWithoutThrow([&] { return engine.gets(kLineA, {1, 0, 9103}); });
+        const auto result = transactionWithoutThrow([&] { return engine.gets(kLineA, {1, 101, 9103}); });
         CHECK(result && result->status == Status::IoError);
         CHECK(result && !result->granted);
         checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 0, true);
         checkNoPending(directory, kLineA);
 
         memory.setThrowRead(false);
-        const auto retry = engine.gets(kLineA, {1, 0, 9104});
+        const auto retry = engine.gets(kLineA, {1, 101, 9104});
         CHECK(retry.status == Status::Ok);
         CHECK(retry.granted);
     }
@@ -1293,9 +1411,12 @@ int main() {
     testRequesterDisconnectDuringDirectReadFailsCommit();
     testTimeoutDuringBlockedSendStopsLaterSnoops();
     testNaturalDeadlineDuringBlockedSendStopsLaterSnoops();
+    testAcceptedFinalAckBeforeDeadlineSurvivesSuccessfulSlowSendReturn();
     testFinalSynchronousAckCannotHideFalseSendResult();
     testFinalSynchronousAckCannotHideThrownSendFailure();
     testRegisteredDirectDataGrantRequiresConfiguredBackend();
+    testConfiguredStrictV2RejectsSessionZeroBeforeBackendAccess();
+    testSessionGenerationCannotBeReplacedUntilDisconnect();
     testUnconfiguredStrictWrapperPreservesMetadataOnlyCompatibility();
     testDependencyFailuresReturnIoErrorAndClearPending();
     testDirtyAckPersistenceFailureIsRetryableBeforeAcceptance();
@@ -1311,8 +1432,9 @@ int main() {
     testTransactionUsesOneDependencySnapshotAcrossReconfigure();
     testSnoopIdExhaustionFailsClosedWithoutReuse();
 
-    if (failures != 0) {
-        std::cerr << failures << " checks failed\n";
+    const auto failure_count = failures.load(std::memory_order_relaxed);
+    if (failure_count != 0) {
+        std::cerr << failure_count << " checks failed\n";
         return EXIT_FAILURE;
     }
     std::cout << "MESI transaction engine tests passed\n";
