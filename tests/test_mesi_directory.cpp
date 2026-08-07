@@ -78,6 +78,41 @@ void checkModified(const DirectorySnapshot &snapshot, std::uint16_t owner, std::
     CHECK(isValidSnapshot(snapshot));
 }
 
+void checkSnapshotEqual(const DirectorySnapshot &actual, const DirectorySnapshot &expected) {
+    CHECK(actual.state == expected.state);
+    CHECK(actual.owner == expected.owner);
+    CHECK(actual.sharers == expected.sharers);
+    CHECK(actual.epoch == expected.epoch);
+    CHECK(actual.server_copy_current == expected.server_copy_current);
+}
+
+void checkCountersEqual(const TransitionCounters &actual, const TransitionCounters &expected) {
+    CHECK(actual.gets == expected.gets);
+    CHECK(actual.getm == expected.getm);
+    CHECK(actual.upgrade == expected.upgrade);
+    CHECK(actual.puts == expected.puts);
+    CHECK(actual.putm == expected.putm);
+}
+
+void checkDiagnosticsEqual(const EntryDiagnostics &actual, const EntryDiagnostics &expected) {
+    CHECK(actual.gets == expected.gets);
+    CHECK(actual.getm == expected.getm);
+    CHECK(actual.upgrade == expected.upgrade);
+    CHECK(actual.puts == expected.puts);
+    CHECK(actual.putm == expected.putm);
+}
+
+void checkRejectedWithoutMutation(MesiDirectory &directory, MesiDirectory::LockedLine &locked,
+                                  const TransitionResult &result, const DirectorySnapshot &expected,
+                                  const TransitionCounters &counters_before,
+                                  const EntryDiagnostics &diagnostics_before) {
+    CHECK(result.status == TransitionStatus::InvalidState);
+    checkSnapshotEqual(result.snapshot, expected);
+    checkSnapshotEqual(locked.snapshot(), expected);
+    checkCountersEqual(directory.transitionCounters(), counters_before);
+    checkDiagnosticsEqual(locked.diagnostics(), diagnostics_before);
+}
+
 void testUntouchedLinesAreImplicitInvalidAndSparse() {
     MesiDirectory directory;
 
@@ -131,7 +166,7 @@ void testLockedCommitFinalizesTask4PostSnoopTransitions() {
             return;
         const auto expected = locked->snapshot();
         const DirectorySnapshot next{MesiState::S, std::nullopt, holder(1) | holder(2), expected.epoch, true};
-        const auto result = locked->commit(DirectoryOperation::Gets, expected, next);
+        const auto result = locked->commitGets(2, expected, next);
         CHECK(result.status == TransitionStatus::Committed);
         checkShared(result.snapshot, holder(1) | holder(2), 2);
         const auto diagnostics = locked->diagnostics();
@@ -147,7 +182,7 @@ void testLockedCommitFinalizesTask4PostSnoopTransitions() {
             return;
         const auto expected = locked->snapshot();
         const DirectorySnapshot next{MesiState::M, 4, 0, expected.epoch, false};
-        const auto result = locked->commit(DirectoryOperation::Getm, expected, next);
+        const auto result = locked->commitGetm(4, expected, next);
         CHECK(result.status == TransitionStatus::Committed);
         checkModified(result.snapshot, 4, 2);
         const auto diagnostics = locked->diagnostics();
@@ -163,7 +198,7 @@ void testLockedCommitFinalizesTask4PostSnoopTransitions() {
             return;
         const auto expected = locked->snapshot();
         const DirectorySnapshot next{MesiState::M, 5, 0, expected.epoch, false};
-        const auto result = locked->commit(DirectoryOperation::Upgrade, expected, next);
+        const auto result = locked->commitUpgrade(5, expected, next);
         CHECK(result.status == TransitionStatus::Committed);
         checkModified(result.snapshot, 5, 3);
         const auto diagnostics = locked->diagnostics();
@@ -177,6 +212,288 @@ void testLockedCommitFinalizesTask4PostSnoopTransitions() {
     CHECK(counters.upgrade == 1);
     CHECK(counters.puts == 0);
     CHECK(counters.putm == 0);
+}
+
+void testLockedCommitRejectsSameOwnerExclusiveToModifiedAsGetm() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 7).status == TransitionStatus::Committed);
+
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    const auto expected = locked->snapshot();
+    const auto counters_before = directory.transitionCounters();
+    const auto diagnostics_before = locked->diagnostics();
+    const DirectorySnapshot next{MesiState::M, 7, 0, expected.epoch, false};
+    const auto result = locked->commitGetm(7, expected, next);
+
+    CHECK(result.status == TransitionStatus::InvalidState);
+    checkExclusive(result.snapshot, 7, 1);
+    checkExclusive(locked->snapshot(), 7, 1);
+
+    const auto counters_after = directory.transitionCounters();
+    CHECK(counters_after.gets == counters_before.gets);
+    CHECK(counters_after.getm == counters_before.getm);
+    CHECK(counters_after.upgrade == counters_before.upgrade);
+    CHECK(counters_after.puts == counters_before.puts);
+    CHECK(counters_after.putm == counters_before.putm);
+    const auto diagnostics_after = locked->diagnostics();
+    CHECK(diagnostics_after.gets == diagnostics_before.gets);
+    CHECK(diagnostics_after.getm == diagnostics_before.getm);
+    CHECK(diagnostics_after.upgrade == diagnostics_before.upgrade);
+    CHECK(diagnostics_after.puts == diagnostics_before.puts);
+    CHECK(diagnostics_after.putm == diagnostics_before.putm);
+}
+
+void testLockedUpgradeCommitsSameOwnerExclusiveToModified() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 7).status == TransitionStatus::Committed);
+
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    const auto expected = locked->snapshot();
+    const DirectorySnapshot next{MesiState::M, 7, 0, expected.epoch, false};
+    const auto result = locked->commitUpgrade(7, expected, next);
+    CHECK(result.status == TransitionStatus::Committed);
+    checkModified(result.snapshot, 7, 2);
+    checkModified(locked->snapshot(), 7, 2);
+
+    const auto counters = directory.transitionCounters();
+    CHECK(counters.gets == 1);
+    CHECK(counters.getm == 0);
+    CHECK(counters.upgrade == 1);
+    CHECK(counters.puts == 0);
+    CHECK(counters.putm == 0);
+    const auto diagnostics = locked->diagnostics();
+    CHECK(diagnostics.gets == 1);
+    CHECK(diagnostics.getm == 0);
+    CHECK(diagnostics.upgrade == 1);
+    CHECK(diagnostics.puts == 0);
+    CHECK(diagnostics.putm == 0);
+}
+
+void testLockedGetmRejectsSharedRequesterPromotionWithoutMutation() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 1).status == TransitionStatus::Committed);
+    CHECK(directory.gets(kLineA, 2).status == TransitionStatus::Committed);
+
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    const auto expected = locked->snapshot();
+    const auto counters_before = directory.transitionCounters();
+    const auto diagnostics_before = locked->diagnostics();
+    const DirectorySnapshot modified{MesiState::M, 1, 0, expected.epoch, false};
+    const auto result = locked->commitGetm(1, expected, modified);
+
+    checkRejectedWithoutMutation(directory, *locked, result, expected, counters_before, diagnostics_before);
+}
+
+void testLockedGetmRejectsSharedRequesterPartialReconciliationWithoutMutation() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 1).status == TransitionStatus::Committed);
+    CHECK(directory.gets(kLineA, 2).status == TransitionStatus::Committed);
+    CHECK(directory.gets(kLineA, 3).status == TransitionStatus::Committed);
+
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    const auto expected = locked->snapshot();
+    const auto counters_before = directory.transitionCounters();
+    const auto diagnostics_before = locked->diagnostics();
+    const DirectorySnapshot partially_invalidated{MesiState::S, std::nullopt, holder(1) | holder(3), expected.epoch,
+                                                  true};
+    const auto result = locked->commitGetm(1, expected, partially_invalidated);
+
+    checkRejectedWithoutMutation(directory, *locked, result, expected, counters_before, diagnostics_before);
+}
+
+void testLockedGetmCommitsNonSharerPromotionFromShared() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 1).status == TransitionStatus::Committed);
+    CHECK(directory.gets(kLineA, 2).status == TransitionStatus::Committed);
+
+    auto locked = directory.lockLine(kLineA);
+    CHECK(locked.has_value());
+    if (!locked)
+        return;
+
+    const auto expected = locked->snapshot();
+    const DirectorySnapshot modified{MesiState::M, 3, 0, expected.epoch, false};
+    const auto result = locked->commitGetm(3, expected, modified);
+
+    CHECK(result.status == TransitionStatus::Committed);
+    checkModified(result.snapshot, 3, 3);
+    CHECK(directory.transitionCounters().getm == 1);
+    CHECK(locked->diagnostics().getm == 1);
+}
+
+void testLockedFinalizersCommitLegalPartialAckReconciliation() {
+    {
+        MesiDirectory directory;
+        CHECK(directory.getm(kLineA, 1).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+
+        const auto expected = locked->snapshot();
+        const DirectorySnapshot downgraded_without_grant{MesiState::S, std::nullopt, holder(1), expected.epoch, true};
+        const auto result = locked->commitGets(2, expected, downgraded_without_grant);
+        CHECK(result.status == TransitionStatus::Committed);
+        checkShared(result.snapshot, holder(1), 2);
+        CHECK(directory.transitionCounters().gets == 1);
+        CHECK(locked->diagnostics().gets == 1);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 3).status == TransitionStatus::Committed);
+        CHECK(directory.gets(kLineA, 4).status == TransitionStatus::Committed);
+        CHECK(directory.gets(kLineA, 5).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+
+        const auto expected = locked->snapshot();
+        const DirectorySnapshot partially_invalidated{MesiState::S, std::nullopt, holder(4) | holder(5), expected.epoch,
+                                                      true};
+        const auto result = locked->commitGetm(6, expected, partially_invalidated);
+        CHECK(result.status == TransitionStatus::Committed);
+        checkShared(result.snapshot, holder(4) | holder(5), 4);
+        CHECK(directory.transitionCounters().getm == 1);
+        CHECK(locked->diagnostics().getm == 1);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 7).status == TransitionStatus::Committed);
+        CHECK(directory.gets(kLineA, 8).status == TransitionStatus::Committed);
+        CHECK(directory.gets(kLineA, 9).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+
+        const auto expected = locked->snapshot();
+        const DirectorySnapshot partially_invalidated{MesiState::S, std::nullopt, holder(7) | holder(9), expected.epoch,
+                                                      true};
+        const auto result = locked->commitUpgrade(7, expected, partially_invalidated);
+        CHECK(result.status == TransitionStatus::Committed);
+        checkShared(result.snapshot, holder(7) | holder(9), 4);
+        CHECK(directory.transitionCounters().upgrade == 1);
+        CHECK(locked->diagnostics().upgrade == 1);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 10).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+
+        const auto expected = locked->snapshot();
+        const DirectorySnapshot invalidated_without_grant{MesiState::I, std::nullopt, 0, expected.epoch, true};
+        const auto result = locked->commitGetm(11, expected, invalidated_without_grant);
+        CHECK(result.status == TransitionStatus::Committed);
+        CHECK(result.snapshot.state == MesiState::I);
+        CHECK(result.snapshot.epoch == 2);
+        CHECK(directory.transitionCounters().getm == 1);
+        CHECK(locked->diagnostics().getm == 1);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.getm(kLineA, 12).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+
+        const auto expected = locked->snapshot();
+        const DirectorySnapshot data_invalidated_without_grant{MesiState::I, std::nullopt, 0, expected.epoch, true};
+        const auto result = locked->commitGetm(13, expected, data_invalidated_without_grant);
+        CHECK(result.status == TransitionStatus::Committed);
+        CHECK(result.snapshot.state == MesiState::I);
+        CHECK(result.snapshot.epoch == 2);
+        CHECK(directory.transitionCounters().getm == 2);
+        CHECK(locked->diagnostics().getm == 2);
+    }
+}
+
+void testLockedFinalizersRejectRelabelingAndInvalidRelationships() {
+    {
+        MesiDirectory directory;
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+        const auto expected = locked->snapshot();
+        const auto counters_before = directory.transitionCounters();
+        const auto diagnostics_before = locked->diagnostics();
+        const DirectorySnapshot modified{MesiState::M, 1, 0, expected.epoch, false};
+        const auto result = locked->commitGets(1, expected, modified);
+        checkRejectedWithoutMutation(directory, *locked, result, expected, counters_before, diagnostics_before);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 1).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+        const auto expected = locked->snapshot();
+        const auto counters_before = directory.transitionCounters();
+        const auto diagnostics_before = locked->diagnostics();
+        const DirectorySnapshot shared{MesiState::S, std::nullopt, holder(1) | holder(2), expected.epoch, true};
+        const auto result = locked->commitPutm(1, expected, shared);
+        checkRejectedWithoutMutation(directory, *locked, result, expected, counters_before, diagnostics_before);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.getm(kLineA, 1).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+        const auto expected = locked->snapshot();
+        const auto counters_before = directory.transitionCounters();
+        const auto diagnostics_before = locked->diagnostics();
+        const DirectorySnapshot shared_without_old_owner{MesiState::S, std::nullopt, holder(2), expected.epoch, true};
+        const auto result = locked->commitGets(2, expected, shared_without_old_owner);
+        checkRejectedWithoutMutation(directory, *locked, result, expected, counters_before, diagnostics_before);
+    }
+
+    {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 1).status == TransitionStatus::Committed);
+        CHECK(directory.gets(kLineA, 2).status == TransitionStatus::Committed);
+        auto locked = directory.lockLine(kLineA);
+        CHECK(locked.has_value());
+        if (!locked)
+            return;
+        const auto expected = locked->snapshot();
+        const auto counters_before = directory.transitionCounters();
+        const auto diagnostics_before = locked->diagnostics();
+        const DirectorySnapshot requester_removed{MesiState::S, std::nullopt, holder(2), expected.epoch, true};
+        const auto getm_result = locked->commitGetm(1, expected, requester_removed);
+        checkRejectedWithoutMutation(directory, *locked, getm_result, expected, counters_before, diagnostics_before);
+        const auto upgrade_result = locked->commitUpgrade(1, expected, requester_removed);
+        checkRejectedWithoutMutation(directory, *locked, upgrade_result, expected, counters_before, diagnostics_before);
+    }
 }
 
 void testLockedCommitRejectsStaleOrInvalidMetadataWithoutMutation() {
@@ -197,7 +514,7 @@ void testLockedCommitRejectsStaleOrInvalidMetadataWithoutMutation() {
     --stale_epoch.epoch;
     auto stale_next = desired;
     stale_next.epoch = stale_epoch.epoch;
-    const auto epoch_rejection = locked->commit(DirectoryOperation::Getm, stale_epoch, stale_next);
+    const auto epoch_rejection = locked->commitGetm(8, stale_epoch, stale_next);
     CHECK(epoch_rejection.status == TransitionStatus::StaleMetadata);
     CHECK(epoch_rejection.snapshot.epoch == original.epoch);
     CHECK(epoch_rejection.snapshot.owner == original.owner);
@@ -205,13 +522,13 @@ void testLockedCommitRejectsStaleOrInvalidMetadataWithoutMutation() {
     auto stale_state = original;
     stale_state.state = MesiState::E;
     stale_state.server_copy_current = true;
-    const auto state_rejection = locked->commit(DirectoryOperation::Getm, stale_state, desired);
+    const auto state_rejection = locked->commitGetm(8, stale_state, desired);
     CHECK(state_rejection.status == TransitionStatus::StaleMetadata);
 
     auto invalid_next = desired;
     invalid_next.state = MesiState::S;
     invalid_next.sharers = holder(8);
-    const auto invalid_rejection = locked->commit(DirectoryOperation::Gets, original, invalid_next);
+    const auto invalid_rejection = locked->commitGets(8, original, invalid_next);
     CHECK(invalid_rejection.status == TransitionStatus::InvalidState);
 
     const auto after = locked->snapshot();
@@ -480,7 +797,7 @@ void testControlledCommitRejectsOwnerSharerCoexistence() {
 
     const auto expected = locked->snapshot();
     const DirectorySnapshot invalid{MesiState::S, 1, holder(2), expected.epoch, true};
-    const auto result = locked->commit(DirectoryOperation::Gets, expected, invalid);
+    const auto result = locked->commitGets(1, expected, invalid);
     CHECK(result.status == TransitionStatus::InvalidState);
     checkInvalid(result.snapshot);
     checkInvalid(locked->snapshot());
@@ -513,6 +830,13 @@ int main() {
     testUntouchedLinesAreImplicitInvalidAndSparse();
     testLockedLineIsMoveOnlyAndOwnsPendingReference();
     testLockedCommitFinalizesTask4PostSnoopTransitions();
+    testLockedCommitRejectsSameOwnerExclusiveToModifiedAsGetm();
+    testLockedUpgradeCommitsSameOwnerExclusiveToModified();
+    testLockedGetmRejectsSharedRequesterPromotionWithoutMutation();
+    testLockedGetmRejectsSharedRequesterPartialReconciliationWithoutMutation();
+    testLockedGetmCommitsNonSharerPromotionFromShared();
+    testLockedFinalizersCommitLegalPartialAckReconciliation();
+    testLockedFinalizersRejectRelabelingAndInvalidRelationships();
     testLockedCommitRejectsStaleOrInvalidMetadataWithoutMutation();
     testConcurrentGetsSerializeThroughLockedCommitPath();
     testGetsStableTransitionsAndNoOpEpoch();

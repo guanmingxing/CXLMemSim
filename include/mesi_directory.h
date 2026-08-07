@@ -60,8 +60,6 @@ struct EntryDiagnostics {
     std::uint64_t putm{};
 };
 
-enum class DirectoryOperation : std::uint8_t { Gets, Getm, Upgrade, Puts, Putm };
-
 class DirectoryEntry {
 public:
     explicit DirectoryEntry(std::uint64_t address) noexcept : line_address(address) {}
@@ -85,6 +83,9 @@ private:
 };
 
 class MesiDirectory {
+private:
+    enum class DirectoryOperation : std::uint8_t { Gets, Getm, Upgrade, Puts, Putm };
+
 public:
     static constexpr std::size_t kLineSize = 64;
     static constexpr std::size_t kDefaultShardCount = 256;
@@ -110,11 +111,20 @@ public:
         std::shared_ptr<PendingTransaction> pendingTransaction() const;
         void setPendingTransaction(std::shared_ptr<PendingTransaction> pending_transaction);
 
-        // expected and next must both carry the current epoch. A successful
+        // These requester-aware finalizers are the Task 4 post-snoop commit
+        // surface. expected and next must both carry the current epoch. A real
         // metadata change commits next with epoch + 1 and increments exactly
-        // one global and per-entry counter selected by operation.
-        TransitionResult commit(DirectoryOperation operation, const DirectorySnapshot &expected,
-                                const DirectorySnapshot &next);
+        // one matching global and per-entry counter.
+        TransitionResult commitGets(std::uint16_t requester, const DirectorySnapshot &expected,
+                                    const DirectorySnapshot &next);
+        TransitionResult commitGetm(std::uint16_t requester, const DirectorySnapshot &expected,
+                                    const DirectorySnapshot &next);
+        TransitionResult commitUpgrade(std::uint16_t requester, const DirectorySnapshot &expected,
+                                       const DirectorySnapshot &next);
+        TransitionResult commitPuts(std::uint16_t requester, const DirectorySnapshot &expected,
+                                    const DirectorySnapshot &next);
+        TransitionResult commitPutm(std::uint16_t requester, const DirectorySnapshot &expected,
+                                    const DirectorySnapshot &next);
 
     private:
         friend class MesiDirectory;
@@ -158,8 +168,20 @@ private:
 
     static bool aligned(std::uint64_t line_address) noexcept;
     static bool validHost(std::uint16_t host_id) noexcept;
-    static bool validOperation(DirectoryOperation operation) noexcept;
     static std::uint64_t holderBit(std::uint16_t host_id) noexcept;
+    static bool hasSharer(const DirectorySnapshot &snapshot, std::uint16_t host_id) noexcept;
+    static bool validTransition(DirectoryOperation operation, std::uint16_t requester, const DirectorySnapshot &current,
+                                const DirectorySnapshot &next) noexcept;
+    static bool validGetsTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                    const DirectorySnapshot &next) noexcept;
+    static bool validGetmTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                    const DirectorySnapshot &next) noexcept;
+    static bool validUpgradeTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                       const DirectorySnapshot &next) noexcept;
+    static bool validPutsTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                    const DirectorySnapshot &next) noexcept;
+    static bool validPutmTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                    const DirectorySnapshot &next) noexcept;
     static DirectorySnapshot snapshotOf(const DirectoryEntry &entry) noexcept;
     static EntryDiagnostics diagnosticsOf(const DirectoryEntry &entry) noexcept;
     static std::shared_ptr<PendingTransaction> pendingTransactionOf(const DirectoryEntry &entry) noexcept;
@@ -169,7 +191,7 @@ private:
     static bool metadataEqual(const DirectorySnapshot &left, const DirectorySnapshot &right) noexcept;
     static TransitionResult rejected(TransitionStatus status, const DirectorySnapshot &snapshot) noexcept;
     static void validateSnapshot(const DirectorySnapshot &snapshot);
-    TransitionResult commitLocked(DirectoryEntry &entry, DirectoryOperation operation,
+    TransitionResult commitLocked(DirectoryEntry &entry, DirectoryOperation operation, std::uint16_t requester,
                                   const DirectorySnapshot &expected, DirectorySnapshot next);
     std::atomic<std::uint64_t> &counterFor(DirectoryOperation operation) noexcept;
     static std::uint64_t &diagnosticFor(DirectoryEntry &entry, DirectoryOperation operation) noexcept;

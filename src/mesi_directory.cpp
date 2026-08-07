@@ -72,29 +72,133 @@ void MesiDirectory::LockedLine::setPendingTransaction(std::shared_ptr<PendingTra
     MesiDirectory::setPendingTransactionOf(*entry_, std::move(pending_transaction));
 }
 
-TransitionResult MesiDirectory::LockedLine::commit(DirectoryOperation operation, const DirectorySnapshot &expected,
-                                                   const DirectorySnapshot &next) {
+TransitionResult MesiDirectory::LockedLine::commitGets(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                       const DirectorySnapshot &next) {
     requireLock();
-    return directory_->commitLocked(*entry_, operation, expected, next);
+    return directory_->commitLocked(*entry_, DirectoryOperation::Gets, requester, expected, next);
+}
+
+TransitionResult MesiDirectory::LockedLine::commitGetm(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                       const DirectorySnapshot &next) {
+    requireLock();
+    return directory_->commitLocked(*entry_, DirectoryOperation::Getm, requester, expected, next);
+}
+
+TransitionResult MesiDirectory::LockedLine::commitUpgrade(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                          const DirectorySnapshot &next) {
+    requireLock();
+    return directory_->commitLocked(*entry_, DirectoryOperation::Upgrade, requester, expected, next);
+}
+
+TransitionResult MesiDirectory::LockedLine::commitPuts(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                       const DirectorySnapshot &next) {
+    requireLock();
+    return directory_->commitLocked(*entry_, DirectoryOperation::Puts, requester, expected, next);
+}
+
+TransitionResult MesiDirectory::LockedLine::commitPutm(std::uint16_t requester, const DirectorySnapshot &expected,
+                                                       const DirectorySnapshot &next) {
+    requireLock();
+    return directory_->commitLocked(*entry_, DirectoryOperation::Putm, requester, expected, next);
 }
 
 bool MesiDirectory::aligned(std::uint64_t line_address) noexcept { return (line_address & (kLineSize - 1)) == 0; }
 
 bool MesiDirectory::validHost(std::uint16_t host_id) noexcept { return host_id < kMaximumHosts; }
 
-bool MesiDirectory::validOperation(DirectoryOperation operation) noexcept {
+std::uint64_t MesiDirectory::holderBit(std::uint16_t host_id) noexcept { return std::uint64_t{1} << host_id; }
+
+bool MesiDirectory::hasSharer(const DirectorySnapshot &snapshot, std::uint16_t host_id) noexcept {
+    return (snapshot.sharers & holderBit(host_id)) != 0;
+}
+
+bool MesiDirectory::validTransition(DirectoryOperation operation, std::uint16_t requester,
+                                    const DirectorySnapshot &current, const DirectorySnapshot &next) noexcept {
     switch (operation) {
     case DirectoryOperation::Gets:
+        return validGetsTransition(requester, current, next);
     case DirectoryOperation::Getm:
+        return validGetmTransition(requester, current, next);
     case DirectoryOperation::Upgrade:
+        return validUpgradeTransition(requester, current, next);
     case DirectoryOperation::Puts:
+        return validPutsTransition(requester, current, next);
     case DirectoryOperation::Putm:
-        return true;
+        return validPutmTransition(requester, current, next);
     }
     return false;
 }
 
-std::uint64_t MesiDirectory::holderBit(std::uint16_t host_id) noexcept { return std::uint64_t{1} << host_id; }
+bool MesiDirectory::validGetsTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                        const DirectorySnapshot &next) noexcept {
+    const auto requester_bit = holderBit(requester);
+    switch (current.state) {
+    case MesiState::I:
+        return next.state == MesiState::E && next.owner == requester;
+    case MesiState::S:
+        return next.state == MesiState::S && next.sharers == (current.sharers | requester_bit);
+    case MesiState::E:
+    case MesiState::M: {
+        if (current.owner == requester)
+            return false;
+        if (metadataEqual(current, next))
+            return true;
+        const auto old_owner_bit = holderBit(*current.owner);
+        return next.state == MesiState::S &&
+               (next.sharers == old_owner_bit || next.sharers == (old_owner_bit | requester_bit));
+    }
+    }
+    return false;
+}
+
+bool MesiDirectory::validGetmTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                        const DirectorySnapshot &next) noexcept {
+    switch (current.state) {
+    case MesiState::I:
+        return next.state == MesiState::M && next.owner == requester;
+    case MesiState::S:
+        if (hasSharer(current, requester))
+            return false;
+        if (next.state == MesiState::M)
+            return next.owner == requester;
+        if (next.state == MesiState::I)
+            return true;
+        return next.state == MesiState::S && (next.sharers & ~current.sharers) == 0;
+    case MesiState::E:
+    case MesiState::M:
+        if (current.owner == requester)
+            return false;
+        return metadataEqual(current, next) || next.state == MesiState::I ||
+               (next.state == MesiState::M && next.owner == requester);
+    }
+    return false;
+}
+
+bool MesiDirectory::validUpgradeTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                           const DirectorySnapshot &next) noexcept {
+    if (current.state == MesiState::E && current.owner == requester)
+        return metadataEqual(current, next) || (next.state == MesiState::M && next.owner == requester);
+    if (current.state != MesiState::S || !hasSharer(current, requester))
+        return false;
+    if (next.state == MesiState::M)
+        return next.owner == requester;
+    return next.state == MesiState::S && (next.sharers & ~current.sharers) == 0 && hasSharer(next, requester);
+}
+
+bool MesiDirectory::validPutsTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                        const DirectorySnapshot &next) noexcept {
+    if (current.state == MesiState::E)
+        return current.owner == requester && next.state == MesiState::I;
+    if (current.state != MesiState::S || !hasSharer(current, requester))
+        return false;
+    const auto remaining = current.sharers & ~holderBit(requester);
+    return next.sharers == remaining && next.state == (remaining == 0 ? MesiState::I : MesiState::S);
+}
+
+bool MesiDirectory::validPutmTransition(std::uint16_t requester, const DirectorySnapshot &current,
+                                        const DirectorySnapshot &next) noexcept {
+    return current.state == MesiState::M && current.owner == requester && next.state == MesiState::I;
+}
 
 std::optional<std::size_t> MesiDirectory::shardIndexFor(std::uint64_t line_address) const noexcept {
     if (!aligned(line_address))
@@ -231,13 +335,18 @@ std::uint64_t &MesiDirectory::diagnosticFor(DirectoryEntry &entry, DirectoryOper
 }
 
 TransitionResult MesiDirectory::commitLocked(DirectoryEntry &entry, DirectoryOperation operation,
-                                             const DirectorySnapshot &expected, DirectorySnapshot next) {
+                                             std::uint16_t requester, const DirectorySnapshot &expected,
+                                             DirectorySnapshot next) {
     const auto current = snapshotOf(entry);
     validateSnapshot(current);
-    if (!validOperation(operation) || !isValidSnapshot(current) || !isValidSnapshot(expected) || !isValidSnapshot(next))
+    if (!validHost(requester))
+        return rejected(TransitionStatus::InvalidHost, current);
+    if (!isValidSnapshot(current) || !isValidSnapshot(expected) || !isValidSnapshot(next))
         return rejected(TransitionStatus::InvalidState, current);
     if (!snapshotsEqual(current, expected) || next.epoch != expected.epoch)
         return rejected(TransitionStatus::StaleMetadata, current);
+    if (!validTransition(operation, requester, current, next))
+        return rejected(TransitionStatus::InvalidState, current);
     if (metadataEqual(current, next))
         return rejected(TransitionStatus::NoChange, current);
 
@@ -264,17 +373,17 @@ TransitionResult MesiDirectory::gets(std::uint64_t line_address, std::uint16_t r
 
     switch (current.state) {
     case MesiState::I:
-        return locked->commit(DirectoryOperation::Gets, current, {MesiState::E, requester, 0, current.epoch, true});
+        return locked->commitGets(requester, current, {MesiState::E, requester, 0, current.epoch, true});
     case MesiState::S: {
         const auto requester_bit = holderBit(requester);
-        return locked->commit(DirectoryOperation::Gets, current,
-                              {MesiState::S, std::nullopt, current.sharers | requester_bit, current.epoch, true});
+        return locked->commitGets(requester, current,
+                                  {MesiState::S, std::nullopt, current.sharers | requester_bit, current.epoch, true});
     }
     case MesiState::E:
         if (current.owner == requester)
             return rejected(TransitionStatus::InvalidState, current);
-        return locked->commit(
-            DirectoryOperation::Gets, current,
+        return locked->commitGets(
+            requester, current,
             {MesiState::S, std::nullopt, holderBit(*current.owner) | holderBit(requester), current.epoch, true});
     case MesiState::M:
         return rejected(TransitionStatus::InvalidState, current);
@@ -294,11 +403,11 @@ TransitionResult MesiDirectory::getm(std::uint64_t line_address, std::uint16_t r
     switch (current.state) {
     case MesiState::I:
     case MesiState::S:
-        return locked->commit(DirectoryOperation::Getm, current, {MesiState::M, requester, 0, current.epoch, false});
+        return locked->commitGetm(requester, current, {MesiState::M, requester, 0, current.epoch, false});
     case MesiState::E:
         if (current.owner == requester)
             return rejected(TransitionStatus::InvalidState, current);
-        return locked->commit(DirectoryOperation::Getm, current, {MesiState::M, requester, 0, current.epoch, false});
+        return locked->commitGetm(requester, current, {MesiState::M, requester, 0, current.epoch, false});
     case MesiState::M:
         return rejected(TransitionStatus::InvalidState, current);
     }
@@ -315,7 +424,7 @@ TransitionResult MesiDirectory::upgrade(std::uint64_t line_address, std::uint16_
     const auto current = locked->snapshot();
     if (current.state != MesiState::E || current.owner != requester)
         return rejected(TransitionStatus::InvalidState, current);
-    return locked->commit(DirectoryOperation::Upgrade, current, {MesiState::M, requester, 0, current.epoch, false});
+    return locked->commitUpgrade(requester, current, {MesiState::M, requester, 0, current.epoch, false});
 }
 
 TransitionResult MesiDirectory::puts(std::uint64_t line_address, std::uint16_t requester) {
@@ -328,7 +437,7 @@ TransitionResult MesiDirectory::puts(std::uint64_t line_address, std::uint16_t r
     const auto current = locked->snapshot();
 
     if (current.state == MesiState::E && current.owner == requester)
-        return locked->commit(DirectoryOperation::Puts, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
+        return locked->commitPuts(requester, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
 
     if (current.state == MesiState::S) {
         const auto requester_bit = holderBit(requester);
@@ -336,8 +445,7 @@ TransitionResult MesiDirectory::puts(std::uint64_t line_address, std::uint16_t r
             return rejected(TransitionStatus::InvalidState, current);
         const auto remaining = current.sharers & ~requester_bit;
         const auto next_state = remaining == 0 ? MesiState::I : MesiState::S;
-        return locked->commit(DirectoryOperation::Puts, current,
-                              {next_state, std::nullopt, remaining, current.epoch, true});
+        return locked->commitPuts(requester, current, {next_state, std::nullopt, remaining, current.epoch, true});
     }
 
     return rejected(TransitionStatus::InvalidState, current);
@@ -353,7 +461,7 @@ TransitionResult MesiDirectory::putm(std::uint64_t line_address, std::uint16_t r
     const auto current = locked->snapshot();
     if (current.state != MesiState::M || current.owner != requester)
         return rejected(TransitionStatus::InvalidState, current);
-    return locked->commit(DirectoryOperation::Putm, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
+    return locked->commitPutm(requester, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
 }
 
 TransitionCounters MesiDirectory::transitionCounters() const noexcept {
