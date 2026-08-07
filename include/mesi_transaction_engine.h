@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -46,6 +47,7 @@ enum class AdministrativeStatus : std::uint8_t {
     DataLoss,
     StaleSession,
     InvalidHost,
+    AuditFailure,
 };
 
 struct EvictionResult {
@@ -90,12 +92,23 @@ public:
     using TimePoint = Clock::time_point;
     using Duration = Clock::duration;
 
+    // Forced dirty loss is permitted only after this synchronous sink accepts the exact High-severity record. Returning
+    // true promises durable acceptance. The callback may synchronously reenter registry/engine APIs; it runs without
+    // lifecycle, operation-wait, transport, audit, or directory locks. The sink is caller-owned and must outlive the
+    // engine.
+    class AuditSink {
+    public:
+        virtual ~AuditSink() = default;
+        virtual bool accept(const CoherenceAuditRecord &record) = 0;
+    };
+
     // first_snoop_id seeds the never-reused monotonic allocator. Zero means
     // the identifier space is already exhausted and transactions fail closed.
     explicit MesiTransactionEngine(MesiDirectory &directory, Duration snoop_timeout = std::chrono::milliseconds(1000),
                                    std::uint64_t first_snoop_id = 1);
     MesiTransactionEngine(MesiDirectory &directory, CoherenceMemoryBackend &memory, CoherenceTransport &transport,
-                          Duration snoop_timeout = std::chrono::milliseconds(1000), std::uint64_t first_snoop_id = 1);
+                          Duration snoop_timeout = std::chrono::milliseconds(1000), std::uint64_t first_snoop_id = 1,
+                          AuditSink *audit_sink = nullptr, std::size_t audit_capacity = 256);
     ~MesiTransactionEngine();
 
     MesiTransactionEngine(const MesiTransactionEngine &) = delete;
@@ -115,10 +128,9 @@ public:
     TransactionResult gets(std::uint64_t line_address, TransactionRequest request);
     TransactionResult getm(std::uint64_t line_address, TransactionRequest request);
     TransactionResult upgrade(std::uint64_t line_address, TransactionRequest request);
-    // PUTS/PUTM validate the exact live session while holding the line transaction lock. PUTM writes all 64 bytes
-    // before its typed metadata commit; backend callbacks are synchronous and may reenter unrelated engine/registry
-    // APIs, but must not recursively acquire the same line. A failed write or stale session/epoch leaves ownership
-    // unchanged.
+    // PUTS/PUTM acquire an exact-generation operation lease before the line transaction. PUTM admission is its
+    // lifecycle linearization point: a disconnect that wins first performs no write; once admitted, PUTM completes its
+    // synchronous data-before-typed-metadata sequence despite later fencing. No lifecycle lock crosses the callback.
     TransactionResult puts(std::uint64_t line_address, TransactionRequest request, std::uint64_t installed_epoch);
     TransactionResult putm(std::uint64_t line_address, TransactionRequest request, std::uint64_t installed_epoch,
                            std::span<const std::byte, 64> data);
@@ -141,21 +153,45 @@ public:
                                           SessionId session_id, BindingId binding_id,
                                           const protocol_v2::CoherenceFrame &unregister_request);
 
-    // RequireFenceAck authorizes clean removal only when matching_host_fence_ack is true. AssertProcessStopped is the
-    // caller's explicit assertion that the endpoint can no longer access clean bytes. Neither may discard M.
-    // ForceDataLoss is the sole dirty-discard path and returns DataLoss even when cleanup succeeds; it is always
-    // counted and recorded at High severity.
+    // RequireFenceAck sends HOST_FENCE through the configured transport after blocking application admission. Only a
+    // one-shot contextual ACK delivered through handleControlFrame() authorizes cleanup; timeout, send failure,
+    // disconnect, malformed ACK, or generation mismatch fails closed. AssertProcessStopped is a separate caller
+    // precondition that the process cannot access cache bytes. Neither policy may discard M. ForceDataLoss is the sole
+    // dirty-discard path and requires durable AuditSink acceptance before each irreversible M -> I commit.
     EvictionResult evictHost(EndpointSessionRegistry &registry, std::uint16_t host_id, SessionId session_id,
-                             BindingId binding_id, HostFailurePolicy policy, bool matching_host_fence_ack = false);
+                             BindingId binding_id, HostFailurePolicy policy);
 
     CoherenceAuditCounters auditCounters() const noexcept;
     std::vector<CoherenceAuditRecord> auditRecords() const;
 
     AckDisposition handleSnoopAck(const protocol_v2::CoherenceFrame &ack);
+    // Contextual ACK route used by fenced transports. Registry validation pins the exact live binding generation; the
+    // engine then validates host/session/snoop/opcode-derived state/strength and consumes the pending token once.
+    AckDisposition handleControlFrame(EndpointSessionRegistry &registry, SessionId session_id, BindingId binding_id,
+                                      const protocol_v2::CoherenceFrame &frame);
     std::size_t progress(TimePoint now = Clock::now());
     std::size_t notifyDisconnect(std::uint16_t host_id, std::uint64_t session_id);
 
 private:
+    struct EngineSession;
+    struct OperationLease {
+        MesiTransactionEngine *engine{};
+        std::shared_ptr<EngineSession> session;
+        bool admitted{};
+        OperationLease() = default;
+        OperationLease(MesiTransactionEngine *owner, std::shared_ptr<EngineSession> state)
+            : engine(owner), session(std::move(state)), admitted(true) {}
+        OperationLease(OperationLease &&other) noexcept
+            : engine(other.engine), session(std::move(other.session)), admitted(other.admitted) {
+            other.engine = nullptr;
+            other.admitted = false;
+        }
+        OperationLease &operator=(OperationLease &&other) noexcept;
+        OperationLease(const OperationLease &) = delete;
+        OperationLease &operator=(const OperationLease &) = delete;
+        ~OperationLease();
+        explicit operator bool() const noexcept { return admitted; }
+    };
     struct AtomicArguments {
         std::size_t offset{};
         std::uint64_t operand{};
@@ -166,7 +202,8 @@ private:
     TransactionResult direct(MesiDirectory::LockedLine &line, TransactionRequest request, Operation operation,
                              const DirectorySnapshot &current,
                              const std::shared_ptr<const TransactionDependencies> &dependencies,
-                             std::optional<AtomicArguments> atomic);
+                             std::optional<AtomicArguments> atomic,
+                             const std::shared_ptr<EngineSession> &admitted_session);
     TransactionResult transact(MesiDirectory::LockedLine &line, TransactionRequest request, Operation operation,
                                const DirectorySnapshot &current,
                                const std::shared_ptr<const TransactionDependencies> &dependencies,
@@ -179,10 +216,16 @@ private:
     void unregisterPending(const std::shared_ptr<PendingTransaction> &pending);
     bool pendingSessionsCurrent(const PendingTransaction &pending) const;
     std::size_t interruptHost(std::uint16_t host_id, std::uint64_t session_id, bool remove_binding);
+    OperationLease admitOperation(const TransactionRequest &request, bool fenced_drain);
+    void releaseOperation(const std::shared_ptr<EngineSession> &session) noexcept;
+    bool fenceEngineSession(std::uint16_t host_id, std::uint64_t session_id);
+    bool sealEngineSession(std::uint16_t host_id, std::uint64_t session_id);
+    bool waitEngineQuiescent(std::uint16_t host_id, std::uint64_t session_id);
     std::shared_ptr<const TransactionDependencies> dependencySnapshot() const;
     static protocol_v2::Status statusFor(TransitionStatus status) noexcept;
     void recordAudit(AuditEventKind kind, AuditSeverity severity, std::uint16_t host_id, std::uint64_t session_id,
-                     std::uint64_t line_address, std::uint64_t epoch);
+                     std::uint64_t line_address, std::uint64_t epoch) noexcept;
+    bool acceptForcedLoss(const CoherenceAuditRecord &record) noexcept;
 
     MesiDirectory &directory_;
     mutable std::mutex dependencies_mutex_;
@@ -190,11 +233,14 @@ private:
     std::atomic<std::uint64_t> next_snoop_id_{1};
 
     mutable std::mutex sessions_mutex_;
-    std::unordered_map<std::uint16_t, std::uint64_t> sessions_;
+    std::condition_variable sessions_changed_;
+    std::unordered_map<std::uint16_t, std::shared_ptr<EngineSession>> sessions_;
 
     mutable std::mutex active_mutex_;
     std::unordered_map<std::uint64_t, std::weak_ptr<PendingTransaction>> active_by_snoop_;
     std::unordered_map<std::uint64_t, std::weak_ptr<PendingTransaction>> active_by_line_;
+    struct PendingHostFence;
+    std::unordered_map<std::uint64_t, std::shared_ptr<PendingHostFence>> active_host_fences_;
 
     std::atomic<std::uint64_t> timeout_events_{};
     std::atomic<std::uint64_t> partial_ack_events_{};
@@ -204,6 +250,8 @@ private:
     std::atomic<std::uint64_t> invalid_ownership_events_{};
     mutable std::mutex audit_mutex_;
     std::vector<CoherenceAuditRecord> audit_records_;
+    AuditSink *audit_sink_{};
+    std::size_t audit_capacity_{256};
 };
 
 } // namespace cxlmemsim::mesi_v2

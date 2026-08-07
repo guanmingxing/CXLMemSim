@@ -277,14 +277,16 @@ void testFreshRegistrationAndValidation() {
 void testDisconnectResumeAndReplay() {
     EndpointSessionRegistry registry;
     const auto original = registry.registerEndpoint(request(7));
-    CHECK(registry.addCleanHolder(original.session_id, 0x1000));
-    CHECK(registry.addModifiedHolder(original.session_id, 0x2000));
+    CHECK(registry.addCleanHolder(original.session_id, original.binding_id, 0x1000));
+    CHECK(registry.addModifiedHolder(original.session_id, original.binding_id, 0x2000));
     CHECK(pinHeartbeat(registry, original.session_id, 1, 7) == PinResponseResult::Pinned);
     CHECK(pinHeartbeat(registry, original.session_id, 2, 7) == PinResponseResult::Pinned);
     CHECK(registry.disconnectAbruptly(7, original.session_id, activeBinding(registry, original.session_id)));
     CHECK(registry.inspect(original.session_id)->state == SessionState::OfflineRetained);
-    CHECK(registry.cleanHolders(original.session_id) == std::vector<std::uint64_t>{0x1000});
-    CHECK(registry.modifiedHolders(original.session_id) == std::vector<std::uint64_t>{0x2000});
+    const auto offline_generation = registry.captureGeneration(7, original.session_id, BindingId{});
+    CHECK(offline_generation.has_value());
+    CHECK(registry.holderSnapshot(*offline_generation).clean == std::vector<std::uint64_t>{0x1000});
+    CHECK(registry.holderSnapshot(*offline_generation).modified == std::vector<std::uint64_t>{0x2000});
     CHECK(registry.pinnedResponseIds(original.session_id) == (std::vector<std::uint64_t>{1, 2}));
 
     auto stale = request(7);
@@ -1269,34 +1271,34 @@ void testPinResponseCorrelationAndConflict() {
 void testHolderIndexesAndGracefulClose() {
     EndpointSessionRegistry registry;
     const auto registered = registry.registerEndpoint(request(6, "tcp", [](const CoherenceFrame &) { return true; }));
-    CHECK(!registry.addCleanHolder(registered.session_id, 0x1001));
-    CHECK(registry.addCleanHolder(registered.session_id, 0x1000));
-    CHECK(!registry.addModifiedHolder(registered.session_id, 0x1000));
-    CHECK(registry.removeCleanHolder(registered.session_id, 0x1000));
-    CHECK(registry.addModifiedHolder(registered.session_id, 0x1000));
-    CHECK(!registry.addCleanHolder(registered.session_id, 0x1000));
-    CHECK(registry.addCleanHolder(registered.session_id, 0x2000));
+    CHECK(!registry.addCleanHolder(registered.session_id, registered.binding_id, 0x1001));
+    CHECK(registry.addCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(!registry.addModifiedHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(registry.removeCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(registry.addModifiedHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(!registry.addCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(registry.addCleanHolder(registered.session_id, registered.binding_id, 0x2000));
     CHECK(pinHeartbeat(registry, registered.session_id, 1, 6) == PinResponseResult::Pinned);
     CHECK(closeSession(registry, 6, registered.session_id, 2) == Status::InvalidState);
-    CHECK(registry.removeModifiedHolder(registered.session_id, 0x1000));
+    CHECK(registry.removeModifiedHolder(registered.session_id, registered.binding_id, 0x1000));
     CHECK(registry.gracefulClose(7, registered.session_id, activeBinding(registry, registered.session_id),
                                  protocolRequest(Opcode::Unregister, 2, registered.session_id, 6)) ==
           Status::StaleSession);
     CHECK(registry.gracefulClose(6, registered.session_id, activeBinding(registry, registered.session_id),
                                  protocolRequest(Opcode::Unregister, 2, registered.session_id, 6)) ==
           Status::InvalidState);
-    CHECK(registry.cleanHolders(registered.session_id) == std::vector<std::uint64_t>{0x2000});
-    const auto clean_snapshot = registry.cleanHolders(registered.session_id);
+    CHECK(registry.cleanHolders(registered.session_id, registered.binding_id) == std::vector<std::uint64_t>{0x2000});
+    const auto clean_snapshot = registry.cleanHolders(registered.session_id, registered.binding_id);
     for (const auto line : clean_snapshot)
-        CHECK(registry.removeCleanHolder(registered.session_id, line));
+        CHECK(registry.removeCleanHolder(registered.session_id, registered.binding_id, line));
     const auto unregister_request = protocolRequest(Opcode::Unregister, 2, registered.session_id, 6);
     CHECK(registry.gracefulClose(6, registered.session_id, activeBinding(registry, registered.session_id),
                                  unregister_request) == Status::Ok);
     CHECK(registry.inspect(registered.session_id)->state == SessionState::Closed);
     CHECK(!registry.inspect(registered.session_id)->closed_final_response_pinned);
     CHECK(registry.registerEndpoint(request(6)).status == Status::DuplicateHost);
-    CHECK(registry.cleanHolders(registered.session_id).empty());
-    CHECK(registry.modifiedHolders(registered.session_id).empty());
+    CHECK(registry.cleanHolders(registered.session_id, registered.binding_id).empty());
+    CHECK(registry.modifiedHolders(registered.session_id, registered.binding_id).empty());
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
     CHECK(registry.inspect(registered.session_id)->has_sender);
     CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
@@ -1309,8 +1311,8 @@ void testHolderIndexesAndGracefulClose() {
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
     CHECK(!registry.inspect(registered.session_id)->has_sender);
     CHECK(registry.inspect(registered.session_id)->transport_name.empty());
-    CHECK(!registry.addCleanHolder(registered.session_id, 0x3000));
-    CHECK(!registry.removeCleanHolder(registered.session_id, 0x2000));
+    CHECK(!registry.addCleanHolder(registered.session_id, registered.binding_id, 0x3000));
+    CHECK(!registry.removeCleanHolder(registered.session_id, registered.binding_id, 0x2000));
     auto closed_resume = request(6);
     closed_resume.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(closed_resume).status == Status::StaleSession);
@@ -1544,14 +1546,16 @@ void testRequestSpecificCloseAndHolderBound() {
     one_line.cache_capacity = 64;
     one_line.cache_ways = 1;
     const auto registered = registry.registerEndpoint(one_line);
-    CHECK(registry.addCleanHolder(registered.session_id, 0x1000));
-    CHECK(registry.addCleanHolder(registered.session_id, 0x1000));
-    CHECK(!registry.addModifiedHolder(registered.session_id, 0x2000));
-    CHECK(registry.removeCleanHolder(registered.session_id, 0x1000));
-    CHECK(registry.addModifiedHolder(registered.session_id, 0x2000));
+    CHECK(registry.addCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(registry.addCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(!registry.addModifiedHolder(registered.session_id, registered.binding_id, 0x2000));
+    CHECK(registry.removeCleanHolder(registered.session_id, registered.binding_id, 0x1000));
+    CHECK(registry.addModifiedHolder(registered.session_id, registered.binding_id, 0x2000));
     CHECK(registry.disconnectAbruptly(26, registered.session_id, activeBinding(registry, registered.session_id)));
-    CHECK(!registry.addCleanHolder(registered.session_id, 0x3000));
-    CHECK(registry.removeModifiedHolder(registered.session_id, 0x2000));
+    CHECK(!registry.addCleanHolder(registered.session_id, registered.binding_id, 0x3000));
+    const auto offline = registry.captureGeneration(26, registered.session_id, BindingId{});
+    CHECK(offline.has_value());
+    CHECK(registry.removeModifiedHolder(*offline, 0x2000));
     auto resume = one_line;
     resume.requested_session_id = registered.session_id;
     CHECK(registry.registerEndpoint(resume).status == Status::Ok);

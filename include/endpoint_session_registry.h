@@ -35,6 +35,19 @@ private:
     friend class EndpointSessionRegistry;
 };
 
+class SessionGenerationToken {
+public:
+    constexpr SessionGenerationToken() noexcept = default;
+    constexpr explicit operator bool() const noexcept { return session_id_ != 0; }
+
+private:
+    constexpr SessionGenerationToken(SessionId session_id, std::uint64_t generation) noexcept
+        : session_id_(session_id), generation_(generation) {}
+    SessionId session_id_{};
+    std::uint64_t generation_{};
+    friend class EndpointSessionRegistry;
+};
+
 #ifdef CXLMEMSIM_ENDPOINT_SESSION_REGISTRY_TESTING
 namespace endpoint_session_registry_test {
 enum class FailurePoint {
@@ -138,6 +151,10 @@ public:
     // share a wait mutex.
     bool completeOperation(SessionId session_id, BindingId binding_id, std::uint64_t request_id);
     bool waitForOperationsBefore(SessionId session_id, BindingId binding_id, std::uint64_t request_id) const;
+    // Waits through an already captured admission watermark. A zero watermark is immediately complete. The wait is
+    // generation exact, releases all registry locks, and wakes false when that binding retires.
+    bool waitForOperationsThrough(SessionId session_id, BindingId binding_id, std::uint64_t request_id) const;
+    bool waitForOperationsThrough(SessionGenerationToken generation, std::uint64_t request_id) const;
     std::uint64_t operationCompletionWatermark(SessionId session_id) const;
     // Lifecycle handlers use these read-only checks before any external mutation. They compare under the registry lock
     // and neither retain that lock nor invoke callbacks.
@@ -156,16 +173,46 @@ public:
     // has revalidated and removed every reverse-index holding, completeEviction() retires callbacks and releases the
     // host identity for a new generation. Neither method invokes a sender callback or acquires a directory lock.
     protocol_v2::Status fenceSession(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    // Captures the immutable current binding generation for administrative work. Empty BindingId is accepted only for
+    // the current retained-offline or fenced generation. Disconnect retires an unpinned token and wakes its waits.
+    std::optional<SessionGenerationToken> captureGeneration(std::uint16_t host_id, SessionId session_id,
+                                                            BindingId binding_id) const;
+    // sealFencedSession closes the bounded PUTM/FENCE/heartbeat drain and returns the final admitted watermark. Neither
+    // method waits or invokes callbacks. controlFrameAdmissible is the transport-neutral route for contextual SNOOP_ACK
+    // frames and validates only the exact still-live fenced binding; the engine performs opcode-specific validation.
+    std::optional<std::uint64_t> sealFencedSession(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    std::optional<std::uint64_t> sealFencedSession(SessionGenerationToken generation);
+    // After the sealed operation barrier completes, exactly one administrative cleanup may pin the generation. A
+    // subsequent transport disconnect retires only BindingId callbacks, not this token. abortFencedCleanup releases a
+    // failed attempt without reopening ordinary admission. These methods neither wait nor invoke callbacks.
+    bool freezeFencedGenerationForCleanup(SessionGenerationToken generation);
+    void abortFencedCleanup(SessionGenerationToken generation) noexcept;
+    bool controlFrameAdmissible(SessionId session_id, BindingId binding_id,
+                                const protocol_v2::CoherenceFrame &frame) const;
     bool completeEviction(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
+    bool completeEviction(std::uint16_t host_id, SessionGenerationToken generation);
     bool drainOpcodeAdmissible(protocol_v2::Opcode opcode) const noexcept;
 
-    bool addCleanHolder(SessionId session_id, std::uint64_t line_address);
-    bool removeCleanHolder(SessionId session_id, std::uint64_t line_address);
-    bool addModifiedHolder(SessionId session_id, std::uint64_t line_address);
-    bool removeModifiedHolder(SessionId session_id, std::uint64_t line_address);
-    std::vector<std::uint64_t> cleanHolders(SessionId session_id) const;
-    std::vector<std::uint64_t> modifiedHolders(SessionId session_id) const;
-    HolderSnapshot holderSnapshot(SessionId session_id) const;
+    // Reverse-index mutation is exact to the immutable live binding. After sealing, callers may publish only effects
+    // from requests admitted before the returned seal watermark; the administrative waiter establishes that barrier
+    // before snapshot. No callback from a retired binding can mutate a resumed binding's index.
+    bool addCleanHolder(SessionId session_id, BindingId binding_id, std::uint64_t line_address);
+    bool removeCleanHolder(SessionId session_id, BindingId binding_id, std::uint64_t line_address);
+    bool addModifiedHolder(SessionId session_id, BindingId binding_id, std::uint64_t line_address);
+    bool removeModifiedHolder(SessionId session_id, BindingId binding_id, std::uint64_t line_address);
+    std::vector<std::uint64_t> cleanHolders(SessionId session_id, BindingId binding_id) const;
+    std::vector<std::uint64_t> modifiedHolders(SessionId session_id, BindingId binding_id) const;
+    HolderSnapshot holderSnapshot(SessionId session_id, BindingId binding_id) const;
+    bool removeCleanHolder(SessionGenerationToken generation, std::uint64_t line_address);
+    bool removeModifiedHolder(SessionGenerationToken generation, std::uint64_t line_address);
+    HolderSnapshot holderSnapshot(SessionGenerationToken generation) const;
+
+    // UNREGISTER is already the terminal admitted ordinary command. Freezing after its earlier-operation wait prevents
+    // binding retirement during the preflight/commit interval; abortUnregister releases that pin without changing any
+    // directory or holder metadata.
+    bool freezeUnregister(SessionId session_id, BindingId binding_id,
+                          const protocol_v2::CoherenceFrame &unregister_request);
+    void abortUnregister(SessionId session_id, BindingId binding_id) noexcept;
 
     std::optional<SessionSnapshot> inspect(SessionId session_id) const;
 
@@ -202,6 +249,9 @@ private:
         std::map<std::uint64_t, protocol_v2::CoherenceFrame> admitted_requests;
         std::map<std::uint64_t, PinnedResponse> pinned_responses;
         std::optional<std::uint64_t> unregister_request_id;
+        bool unregister_frozen{};
+        bool drain_sealed{};
+        bool cleanup_frozen{};
         std::uint64_t next_request_id{1};
         std::uint64_t publication_cursor{1};
         bool publishing{};
@@ -225,7 +275,8 @@ private:
         std::shared_ptr<HolderDrainState> holder_drain{std::make_shared<HolderDrainState>()};
     };
 
-    bool validHolderSession(const Session &session) const noexcept;
+    bool validHolderSession(const Session &session, BindingId binding_id) const noexcept;
+    static bool validGeneration(const Session &session, SessionGenerationToken generation) noexcept;
     bool validOrdinaryRequest(const Session &session, const protocol_v2::CoherenceFrame &request) const noexcept;
     bool beginDrainLocked(Session &session, std::uint64_t &generation, StoredResponseSender &sender,
                           StoredResponseSender &&staged_sender);

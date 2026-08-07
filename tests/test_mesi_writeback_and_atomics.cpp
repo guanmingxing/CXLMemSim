@@ -113,6 +113,11 @@ public:
         changed_.notify_all();
     }
 
+    void throwWrites(bool enabled = true) {
+        std::lock_guard lock(mutex_);
+        throw_writes_ = enabled;
+    }
+
     std::size_t reads() const {
         std::lock_guard lock(mutex_);
         return reads_;
@@ -147,12 +152,20 @@ public:
         }
         if (callback)
             callback(host, frame);
-        return true;
+        if (throw_on_send_)
+            throw std::runtime_error("injected transport failure");
+        return send_result_;
     }
 
     void onSend(std::function<void(std::uint16_t, const CoherenceFrame &)> callback) {
         std::lock_guard lock(mutex_);
         callback_ = std::move(callback);
+    }
+
+    void failSends(bool throws = false) {
+        std::lock_guard lock(mutex_);
+        send_result_ = false;
+        throw_on_send_ = throws;
     }
 
     std::vector<std::pair<std::uint16_t, CoherenceFrame>> waitFor(std::size_t count) const {
@@ -174,6 +187,17 @@ private:
     mutable std::condition_variable changed_;
     std::vector<std::pair<std::uint16_t, CoherenceFrame>> sent_;
     std::function<void(std::uint16_t, const CoherenceFrame &)> callback_;
+    bool send_result_{true};
+    bool throw_on_send_{};
+};
+
+class AcceptingAuditSink final : public MesiTransactionEngine::AuditSink {
+public:
+    bool accept(const CoherenceAuditRecord &record) override {
+        records.push_back(record);
+        return true;
+    }
+    std::vector<CoherenceAuditRecord> records;
 };
 
 CoherenceFrame ackFor(const CoherenceFrame &snoop, const std::array<std::byte, 64> &dirty = {}) {
@@ -330,7 +354,7 @@ struct EvictionObservation {
 
 template <typename Engine>
 EvictionObservation task5Evict(Engine &engine, EndpointSessionRegistry &registry, std::uint16_t host, SessionId session,
-                               BindingId binding, TestFailurePolicy policy, bool matching_ack) {
+                               BindingId binding, TestFailurePolicy policy) {
     if constexpr (requires { typename Engine::HostFailurePolicy; }) {
         using Policy = typename Engine::HostFailurePolicy;
         Policy selected = Policy::RequireFenceAck;
@@ -338,7 +362,7 @@ EvictionObservation task5Evict(Engine &engine, EndpointSessionRegistry &registry
             selected = Policy::AssertProcessStopped;
         else if (policy == TestFailurePolicy::ForceDataLoss)
             selected = Policy::ForceDataLoss;
-        const auto result = engine.evictHost(registry, host, session, binding, selected, matching_ack);
+        const auto result = engine.evictHost(registry, host, session, binding, selected);
         EvictionObservation observed;
         using StatusType = std::remove_cvref_t<decltype(result.status)>;
         if (result.status == StatusType::Ok)
@@ -358,6 +382,54 @@ EvictionObservation task5Evict(Engine &engine, EndpointSessionRegistry &registry
         return observed;
     }
     return {};
+}
+
+template <typename Engine>
+AckDisposition task5ControlFrame(Engine &engine, EndpointSessionRegistry &registry, SessionId session,
+                                 BindingId binding, const CoherenceFrame &frame) {
+    if constexpr (requires { engine.handleControlFrame(registry, session, binding, frame); })
+        return engine.handleControlFrame(registry, session, binding, frame);
+    return AckDisposition::Invalid;
+}
+
+template <typename Registry>
+bool task5AddClean(Registry &registry, SessionId session, BindingId binding, std::uint64_t address) {
+    if constexpr (requires { registry.addCleanHolder(session, binding, address); })
+        return registry.addCleanHolder(session, binding, address);
+    else
+        return registry.addCleanHolder(session, address);
+}
+
+template <typename Registry>
+bool task5RemoveClean(Registry &registry, SessionId session, BindingId binding, std::uint64_t address) {
+    if constexpr (requires { registry.removeCleanHolder(session, binding, address); })
+        return registry.removeCleanHolder(session, binding, address);
+    else
+        return registry.removeCleanHolder(session, address);
+}
+
+template <typename Registry>
+bool task5AddModified(Registry &registry, SessionId session, BindingId binding, std::uint64_t address) {
+    if constexpr (requires { registry.addModifiedHolder(session, binding, address); })
+        return registry.addModifiedHolder(session, binding, address);
+    else
+        return registry.addModifiedHolder(session, address);
+}
+
+template <typename Registry>
+bool task5RemoveModified(Registry &registry, SessionId session, BindingId binding, std::uint64_t address) {
+    if constexpr (requires { registry.removeModifiedHolder(session, binding, address); })
+        return registry.removeModifiedHolder(session, binding, address);
+    else
+        return registry.removeModifiedHolder(session, address);
+}
+
+template <typename Registry>
+std::vector<std::uint64_t> task5CleanHolders(Registry &registry, SessionId session, BindingId binding) {
+    if constexpr (requires { registry.cleanHolders(session, binding); })
+        return registry.cleanHolders(session, binding);
+    else
+        return registry.cleanHolders(session);
 }
 
 struct AuditObservation {
@@ -569,7 +641,7 @@ void testFenceWaitsOnlyForEarlierSameSessionWorkAndModifiedDrain() {
     CHECK(registry.admitRequest(first.session_id, first.binding_id, earlier) == RequestAdmissionResult::Accepted);
     CHECK(registry.admitRequest(first.session_id, first.binding_id, fence) == RequestAdmissionResult::Accepted);
     CHECK(registry.admitRequest(other.session_id, other.binding_id, other_fence) == RequestAdmissionResult::Accepted);
-    CHECK(registry.addModifiedHolder(first.session_id, kLineA));
+    CHECK(task5AddModified(registry, first.session_id, first.binding_id, kLineA));
 
     std::promise<void> started;
     auto started_future = started.get_future();
@@ -583,7 +655,7 @@ void testFenceWaitsOnlyForEarlierSameSessionWorkAndModifiedDrain() {
     CHECK(task5Fence(engine, registry, other.session_id, other.binding_id, 1) == Status::Ok);
     CHECK(task5Complete(registry, first.session_id, first.binding_id, 1));
     CHECK(blocked.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
-    CHECK(registry.removeModifiedHolder(first.session_id, kLineA));
+    CHECK(task5RemoveModified(registry, first.session_id, first.binding_id, kLineA));
     CHECK(ready(blocked, "same-session fence drain") == Status::Ok);
     CHECK(task5Fence(engine, registry, first.session_id, first.binding_id, 1) == Status::InvalidState);
 
@@ -624,20 +696,20 @@ void testGracefulUnregisterRevalidatesCleanCandidatesAndRejectsModifiedOwner() {
     EndpointSessionRegistry registry;
     const auto clean = registry.registerEndpoint(registration(8));
     CHECK(clean.status == Status::Ok);
-    CHECK(registry.addCleanHolder(clean.session_id, kLineA));
-    CHECK(registry.addCleanHolder(clean.session_id, kLineB));
+    CHECK(task5AddClean(registry, clean.session_id, clean.binding_id, kLineA));
+    CHECK(task5AddClean(registry, clean.session_id, clean.binding_id, kLineB));
     const auto unregister = requestFrame(Opcode::Unregister, 1, clean.session_id, 8);
     CHECK(registry.admitRequest(clean.session_id, clean.binding_id, unregister) == RequestAdmissionResult::Accepted);
     CHECK(task5Unregister(engine, registry, 8, clean.session_id, clean.binding_id, unregister) == Status::Ok);
     checkState(directory, kLineA, MesiState::S, std::nullopt, holder(9), 3, true);
     checkState(directory, kLineB, MesiState::I, std::nullopt, 0, 2, true);
-    CHECK(registry.cleanHolders(clean.session_id).empty());
+    CHECK(task5CleanHolders(registry, clean.session_id, clean.binding_id).empty());
     CHECK(registry.inspect(clean.session_id)->state == SessionState::Closed);
 
     CHECK(directory.getm(kLineC, 10).committed());
     const auto dirty = registry.registerEndpoint(registration(10));
     CHECK(dirty.status == Status::Ok);
-    CHECK(registry.addModifiedHolder(dirty.session_id, kLineC));
+    CHECK(task5AddModified(registry, dirty.session_id, dirty.binding_id, kLineC));
     const auto dirty_unregister = requestFrame(Opcode::Unregister, 1, dirty.session_id, 10);
     CHECK(registry.admitRequest(dirty.session_id, dirty.binding_id, dirty_unregister) ==
           RequestAdmissionResult::Accepted);
@@ -650,7 +722,7 @@ void testGracefulUnregisterRevalidatesCleanCandidatesAndRejectsModifiedOwner() {
     EndpointSessionRegistry forged_registry;
     const auto forged_session = forged_registry.registerEndpoint(registration(19));
     CHECK(forged_session.status == Status::Ok);
-    CHECK(forged_registry.addCleanHolder(forged_session.session_id, kLineB));
+    CHECK(task5AddClean(forged_registry, forged_session.session_id, forged_session.binding_id, kLineB));
     const auto admitted_unregister = requestFrame(Opcode::Unregister, 1, forged_session.session_id, 19);
     CHECK(forged_registry.admitRequest(forged_session.session_id, forged_session.binding_id, admitted_unregister) ==
           RequestAdmissionResult::Accepted);
@@ -658,7 +730,8 @@ void testGracefulUnregisterRevalidatesCleanCandidatesAndRejectsModifiedOwner() {
     setSrcHost(forged_unregister, 20);
     CHECK(task5Unregister(engine, forged_registry, 20, forged_session.session_id, forged_session.binding_id,
                           forged_unregister) == Status::InvalidState);
-    CHECK(forged_registry.cleanHolders(forged_session.session_id) == std::vector<std::uint64_t>{kLineB});
+    CHECK(task5CleanHolders(forged_registry, forged_session.session_id, forged_session.binding_id) ==
+          std::vector<std::uint64_t>{kLineB});
     checkState(directory, kLineB, MesiState::E, 19, 0, 3, true);
 }
 
@@ -672,23 +745,28 @@ void testHostFenceAckAndStoppedAssertionGateCleanRemoval() {
     EndpointSessionRegistry registry;
     const auto fenced = registry.registerEndpoint(registration(11));
     const auto stopped = registry.registerEndpoint(registration(12));
-    CHECK(registry.addCleanHolder(fenced.session_id, kLineA));
-    CHECK(registry.addCleanHolder(stopped.session_id, kLineB));
+    CHECK(task5AddClean(registry, fenced.session_id, fenced.binding_id, kLineA));
+    CHECK(task5AddClean(registry, stopped.session_id, stopped.binding_id, kLineB));
 
-    const auto missing_ack = task5Evict(engine, registry, 11, fenced.session_id, fenced.binding_id,
-                                        TestFailurePolicy::RequireFenceAck, false);
+    const auto missing_ack =
+        task5Evict(engine, registry, 11, fenced.session_id, fenced.binding_id, TestFailurePolicy::RequireFenceAck);
     CHECK(missing_ack.status == TestAdministrativeStatus::FenceAckRequired);
     checkState(directory, kLineA, MesiState::E, 11, 0, 1, true);
     CHECK(registry.inspect(fenced.session_id)->state == SessionState::Fenced);
 
-    const auto acknowledged = task5Evict(engine, registry, 11, fenced.session_id, fenced.binding_id,
-                                         TestFailurePolicy::RequireFenceAck, true);
+    transport.onSend([&](std::uint16_t, const CoherenceFrame &snoop) {
+        CHECK(opcode(snoop) == Opcode::HostFence);
+        CHECK(task5ControlFrame(engine, registry, fenced.session_id, fenced.binding_id, ackFor(snoop)) ==
+              AckDisposition::Accepted);
+    });
+    const auto acknowledged =
+        task5Evict(engine, registry, 11, fenced.session_id, fenced.binding_id, TestFailurePolicy::RequireFenceAck);
     CHECK(acknowledged.status == TestAdministrativeStatus::Ok);
     CHECK(acknowledged.clean_removed == 1);
     checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
 
     const auto asserted = task5Evict(engine, registry, 12, stopped.session_id, stopped.binding_id,
-                                     TestFailurePolicy::AssertProcessStopped, false);
+                                     TestFailurePolicy::AssertProcessStopped);
     CHECK(asserted.status == TestAdministrativeStatus::Ok);
     CHECK(asserted.clean_removed == 1);
     checkState(directory, kLineB, MesiState::I, std::nullopt, 0, 2, true);
@@ -703,21 +781,22 @@ void testForcedDirtyLossIsExplicitRecordedAndNeverCoherentSuccess() {
     memory.seed(kLineA, bytes(0x31));
     memory.seed(kLineB, bytes(0x42));
     TestTransport transport;
-    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    AcceptingAuditSink audit_sink;
+    MesiTransactionEngine engine(directory, memory, transport, kWait, 1, &audit_sink);
     EndpointSessionRegistry registry;
     const auto normal = registry.registerEndpoint(registration(13));
     const auto forced = registry.registerEndpoint(registration(14));
-    CHECK(registry.addModifiedHolder(normal.session_id, kLineA));
-    CHECK(registry.addModifiedHolder(forced.session_id, kLineB));
+    CHECK(task5AddModified(registry, normal.session_id, normal.binding_id, kLineA));
+    CHECK(task5AddModified(registry, forced.session_id, forced.binding_id, kLineB));
 
-    const auto rejected = task5Evict(engine, registry, 13, normal.session_id, normal.binding_id,
-                                     TestFailurePolicy::AssertProcessStopped, false);
+    const auto rejected =
+        task5Evict(engine, registry, 13, normal.session_id, normal.binding_id, TestFailurePolicy::AssertProcessStopped);
     CHECK(rejected.status == TestAdministrativeStatus::DirtyDataPresent);
     checkState(directory, kLineA, MesiState::M, 13, 0, 1, false);
 
     CHECK(registry.disconnectAbruptly(14, forced.session_id, forced.binding_id));
     const auto lost =
-        task5Evict(engine, registry, 14, forced.session_id, BindingId{}, TestFailurePolicy::ForceDataLoss, false);
+        task5Evict(engine, registry, 14, forced.session_id, BindingId{}, TestFailurePolicy::ForceDataLoss);
     CHECK(lost.status == TestAdministrativeStatus::DataLoss);
     CHECK(lost.status != TestAdministrativeStatus::Ok);
     CHECK(lost.dirty_lost == 1);
@@ -745,12 +824,12 @@ void testHostFenceWakesTransactionsWaitingOnThatHost() {
     CHECK(engine.bindSession(20, failed.session_id));
     CHECK(engine.bindSession(21, 121));
     CHECK(engine.bindSession(22, 122));
-    CHECK(registry.addCleanHolder(failed.session_id, kLineA));
+    CHECK(task5AddClean(registry, failed.session_id, failed.binding_id, kLineA));
 
     auto transaction = std::async(std::launch::async, [&] { return engine.getm(kLineA, {22, 122, 1}); });
     CHECK(transport.waitFor(2).size() == 2);
-    const auto eviction = task5Evict(engine, registry, 20, failed.session_id, failed.binding_id,
-                                     TestFailurePolicy::RequireFenceAck, false);
+    const auto eviction =
+        task5Evict(engine, registry, 20, failed.session_id, failed.binding_id, TestFailurePolicy::RequireFenceAck);
     CHECK(eviction.status == TestAdministrativeStatus::FenceAckRequired);
     const auto promptly_woken = transaction.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
     CHECK(promptly_woken);
@@ -786,6 +865,408 @@ void testTimeoutPartialAckStaleAckAndInvalidOwnershipAreAudited() {
     CHECK(audit.records >= 3);
 }
 
+void testHostFenceAuthorizationIsContextualOneShotAndFailClosed() {
+    const auto run = [](auto mutate_ack, bool send_failure = false) {
+        MesiDirectory directory;
+        CHECK(directory.gets(kLineA, 23).committed());
+        TestMemory memory;
+        TestTransport transport;
+        MesiTransactionEngine engine(directory, memory, transport, std::chrono::milliseconds(20));
+        EndpointSessionRegistry registry;
+        const auto registered = registry.registerEndpoint(registration(23));
+        CHECK(registered.status == Status::Ok);
+        CHECK(engine.bindSession(23, registered.session_id));
+        CHECK(task5AddClean(registry, registered.session_id, registered.binding_id, kLineA));
+        if (send_failure)
+            transport.failSends();
+        transport.onSend([&](std::uint16_t host, const CoherenceFrame &fence) {
+            CHECK(host == 23);
+            CHECK(opcode(fence) == Opcode::HostFence);
+            CHECK(snoopId(fence) != 0);
+            auto ack = ackFor(fence);
+            mutate_ack(ack);
+            (void)task5ControlFrame(engine, registry, registered.session_id, registered.binding_id, ack);
+        });
+        const auto result = task5Evict(engine, registry, 23, registered.session_id, registered.binding_id,
+                                       TestFailurePolicy::RequireFenceAck);
+        if (result.status != TestAdministrativeStatus::Ok) {
+            checkState(directory, kLineA, MesiState::E, 23, 0, 1, true);
+            CHECK(task5CleanHolders(registry, registered.session_id, registered.binding_id) ==
+                  std::vector<std::uint64_t>{kLineA});
+        }
+        return std::pair{result, transport.sent()};
+    };
+
+    const auto missing = run([](CoherenceFrame &ack) { setSnoopId(ack, snoopId(ack) + 1); });
+    CHECK(missing.first.status != TestAdministrativeStatus::Ok);
+    CHECK(missing.second.size() == 1);
+    CHECK(run([](CoherenceFrame &ack) { setSrcHost(ack, 24); }).first.status != TestAdministrativeStatus::Ok);
+    CHECK(run([](CoherenceFrame &ack) { setSessionId(ack, sessionId(ack) + 1); }).first.status !=
+          TestAdministrativeStatus::Ok);
+    CHECK(run([](CoherenceFrame &ack) { setAckStrength(ack, AckStrength::NONE); }).first.status !=
+          TestAdministrativeStatus::Ok);
+    CHECK(run([](CoherenceFrame &) {}, true).first.status != TestAdministrativeStatus::Ok);
+
+    {
+        MesiDirectory disconnected_directory;
+        CHECK(disconnected_directory.gets(kLineA, 23).committed());
+        TestMemory disconnected_memory;
+        TestTransport disconnected_transport;
+        MesiTransactionEngine disconnected_engine(disconnected_directory, disconnected_memory, disconnected_transport,
+                                                  std::chrono::milliseconds(20));
+        EndpointSessionRegistry disconnected_registry;
+        const auto disconnected = disconnected_registry.registerEndpoint(registration(23));
+        CHECK(disconnected_engine.bindSession(23, disconnected.session_id));
+        CHECK(task5AddClean(disconnected_registry, disconnected.session_id, disconnected.binding_id, kLineA));
+        disconnected_transport.onSend([&](std::uint16_t, const CoherenceFrame &fence) {
+            CHECK(opcode(fence) == Opcode::HostFence);
+            CHECK(disconnected_registry.disconnectAbruptly(23, disconnected.session_id, disconnected.binding_id));
+            CHECK(task5ControlFrame(disconnected_engine, disconnected_registry, disconnected.session_id,
+                                    disconnected.binding_id, ackFor(fence)) != AckDisposition::Accepted);
+        });
+        CHECK(task5Evict(disconnected_engine, disconnected_registry, 23, disconnected.session_id,
+                         disconnected.binding_id, TestFailurePolicy::RequireFenceAck)
+                  .status != TestAdministrativeStatus::Ok);
+        checkState(disconnected_directory, kLineA, MesiState::E, 23, 0, 1, true);
+    }
+
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineB, 24).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(24));
+    CHECK(engine.bindSession(24, live.session_id));
+    CHECK(task5AddClean(registry, live.session_id, live.binding_id, kLineB));
+    CoherenceFrame accepted_ack{};
+    transport.onSend([&](std::uint16_t, const CoherenceFrame &fence) {
+        accepted_ack = ackFor(fence);
+        CHECK(task5ControlFrame(engine, registry, live.session_id, live.binding_id, accepted_ack) ==
+              AckDisposition::Accepted);
+        const auto stale_before = engine.auditCounters().stale_ack;
+        CHECK(task5ControlFrame(engine, registry, live.session_id, live.binding_id, accepted_ack) ==
+              AckDisposition::Stale);
+        CHECK(engine.auditCounters().stale_ack == stale_before + 1);
+    });
+    CHECK(
+        task5Evict(engine, registry, 24, live.session_id, live.binding_id, TestFailurePolicy::RequireFenceAck).status ==
+        TestAdministrativeStatus::Ok);
+    CHECK(task5ControlFrame(engine, registry, live.session_id, live.binding_id, accepted_ack) !=
+          AckDisposition::Accepted);
+}
+
+void testFencedOrdinaryAdmissionIsBoundedAndControlUsesContext() {
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(25));
+    CHECK(live.status == Status::Ok);
+    CHECK(registry.fenceSession(25, live.session_id, live.binding_id) == Status::Ok);
+
+    auto putm = requestFrame(Opcode::Putm, 1, live.session_id, 25);
+    setAddress(putm, kLineA);
+    setEpoch(putm, 1);
+    setLineState(putm, LineState::M);
+    setPayloadLength(putm, kLineSize);
+    putm.data.fill(0x5a);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, putm) == RequestAdmissionResult::Accepted);
+    CHECK(
+        registry.admitRequest(live.session_id, live.binding_id, requestFrame(Opcode::Fence, 2, live.session_id, 25)) ==
+        RequestAdmissionResult::Accepted);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id,
+                                requestFrame(Opcode::Heartbeat, 3, live.session_id, 25)) ==
+          RequestAdmissionResult::Accepted);
+    for (const auto opcode_value : {Opcode::Gets, Opcode::Getm, Opcode::Upgrade, Opcode::AtomicFaa, Opcode::AtomicCas,
+                                    Opcode::Puts, Opcode::Unregister}) {
+        auto rejected = requestFrame(opcode_value, 4, live.session_id, 25);
+        if (opcode_value == Opcode::Gets || opcode_value == Opcode::Getm || opcode_value == Opcode::Upgrade ||
+            opcode_value == Opcode::Puts)
+            setAddress(rejected, kLineA);
+        if (opcode_value == Opcode::AtomicFaa || opcode_value == Opcode::AtomicCas) {
+            setAddress(rejected, kLineA);
+            setSize(rejected, 8);
+            setValue(rejected, 1);
+        }
+        CHECK(registry.admitRequest(live.session_id, live.binding_id, rejected) ==
+              RequestAdmissionResult::InvalidRequest);
+    }
+    auto ordinary_ack = initializeFrame(Opcode::SnoopAck);
+    setSrcHost(ordinary_ack, 25);
+    setDstHost(ordinary_ack, kServerHost);
+    setSessionId(ordinary_ack, live.session_id);
+    setSnoopId(ordinary_ack, 7);
+    setAckStrength(ordinary_ack, AckStrength::MODEL);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, ordinary_ack) ==
+          RequestAdmissionResult::InvalidRequest);
+    CHECK(registry.sealFencedSession(25, live.session_id, live.binding_id).has_value());
+    CHECK(registry.fenceSession(25, live.session_id, live.binding_id) == Status::Ok);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id,
+                                requestFrame(Opcode::Heartbeat, 4, live.session_id, 25)) ==
+          RequestAdmissionResult::InvalidRequest);
+
+    EndpointSessionRegistry prebarrier_registry;
+    const auto prebarrier = prebarrier_registry.registerEndpoint(registration(37));
+    CHECK(task5AddClean(prebarrier_registry, prebarrier.session_id, prebarrier.binding_id, kLineB));
+    CHECK(prebarrier_registry.fenceSession(37, prebarrier.session_id, prebarrier.binding_id) == Status::Ok);
+    const auto prebarrier_generation =
+        prebarrier_registry.captureGeneration(37, prebarrier.session_id, prebarrier.binding_id);
+    CHECK(prebarrier_generation.has_value());
+    CHECK(prebarrier_registry.sealFencedSession(*prebarrier_generation).has_value());
+    CHECK(prebarrier_registry.disconnectAbruptly(37, prebarrier.session_id, prebarrier.binding_id));
+    CHECK(!prebarrier_registry.removeCleanHolder(*prebarrier_generation, kLineB));
+
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 33).committed());
+    TestMemory memory;
+    memory.seed(kLineA, bytes(0x6a));
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry control_registry;
+    const auto target = control_registry.registerEndpoint(registration(33));
+    CHECK(engine.bindSession(33, target.session_id));
+    CHECK(engine.bindSession(34, 134));
+    auto transaction = std::async(std::launch::async, [&] { return engine.getm(kLineA, {34, 134, 1}); });
+    const auto snoop = transport.waitFor(1).front().second;
+    CHECK(control_registry.fenceSession(33, target.session_id, target.binding_id) == Status::Ok);
+    CHECK(task5ControlFrame(engine, control_registry, target.session_id, target.binding_id, ackFor(snoop)) ==
+          AckDisposition::Accepted);
+    CHECK(ready(transaction, "fenced contextual line ACK").status == Status::Ok);
+}
+
+void testEvictionWaitsForAdmittedAtomicHolderPublicationAndFencesNewWork() {
+    MesiDirectory directory;
+    TestMemory memory;
+    auto initial = bytes(0x10);
+    storeScalar(initial, 0, 4);
+    memory.seed(kLineA, initial);
+    memory.blockWrites();
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(26));
+    CHECK(engine.bindSession(26, live.session_id));
+    auto admitted = requestFrame(Opcode::AtomicFaa, 1, live.session_id, 26);
+    setAddress(admitted, kLineA);
+    setSize(admitted, 8);
+    setValue(admitted, 3);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, admitted) == RequestAdmissionResult::Accepted);
+
+    auto atomic = std::async(std::launch::async,
+                             [&] { return engine.fetchAdd(kLineA, {26, live.session_id, 1}, std::uint64_t{3}); });
+    memory.waitForWrite();
+    auto eviction = std::async(std::launch::async, [&] {
+        return task5Evict(engine, registry, 26, live.session_id, live.binding_id,
+                          TestFailurePolicy::AssertProcessStopped);
+    });
+    for (int i = 0; i != 100 && registry.inspect(live.session_id) &&
+                    registry.inspect(live.session_id)->state != SessionState::Fenced;
+         ++i)
+        std::this_thread::yield();
+    CHECK(eviction.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+    const auto writes_before = memory.writes();
+    const auto fenced = engine.fetchAdd(kLineB, {26, live.session_id, 2}, 1);
+    CHECK(fenced.status == Status::HostFenced);
+    CHECK(memory.writes() == writes_before);
+
+    memory.releaseWrites();
+    const auto completed = ready(atomic, "admitted atomic");
+    CHECK(completed.status == Status::Ok);
+    CHECK(task5AddModified(registry, live.session_id, live.binding_id, kLineA));
+    CHECK(task5Complete(registry, live.session_id, live.binding_id, 1));
+    const auto result = ready(eviction, "eviction lifecycle barrier");
+    CHECK(result.status == TestAdministrativeStatus::DirtyDataPresent);
+    checkState(directory, kLineA, MesiState::M, 26, 0, 1, false);
+    CHECK(registry.inspect(live.session_id).has_value());
+}
+
+void testPutmAdmissionSurvivesLaterDisconnectAndFailedWritesPreserveM() {
+    MesiDirectory directory;
+    CHECK(directory.getm(kLineA, 27).committed());
+    TestMemory memory;
+    const auto before = bytes(0x11);
+    const auto after = bytes(0x22);
+    memory.seed(kLineA, before);
+    memory.blockWrites();
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    CHECK(engine.bindSession(27, 127));
+    auto writeback = std::async(std::launch::async, [&] { return engine.putm(kLineA, {27, 127, 1}, 1, after); });
+    memory.waitForWrite();
+    CHECK(engine.notifyDisconnect(27, 127) == 0);
+    memory.releaseWrites();
+    const auto committed = ready(writeback, "admitted PUTM after disconnect");
+    CHECK(committed.status == Status::Ok);
+    CHECK(memory.line(kLineA) == after);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+
+    CHECK(directory.getm(kLineB, 28).committed());
+    CHECK(engine.bindSession(28, 128));
+    engine.notifyDisconnect(28, 128);
+    const auto writes_before = memory.writes();
+    CHECK(engine.putm(kLineB, {28, 128, 1}, 1, bytes(0x33)).status == Status::StaleSession);
+    CHECK(memory.writes() == writes_before);
+    checkState(directory, kLineB, MesiState::M, 28, 0, 1, false);
+
+    CHECK(directory.getm(kLineC, 29).committed());
+    CHECK(engine.bindSession(29, 129));
+    const auto original = bytes(0x44);
+    memory.seed(kLineC, original);
+    memory.throwWrites();
+    CHECK(engine.putm(kLineC, {29, 129, 1}, 1, bytes(0x55)).status == Status::IoError);
+    CHECK(memory.line(kLineC) == original);
+    checkState(directory, kLineC, MesiState::M, 29, 0, 1, false);
+}
+
+void testHolderIndexRejectsRetiredBindingAfterResume() {
+    EndpointSessionRegistry registry;
+    const auto first = registry.registerEndpoint(registration(30));
+    CHECK(task5AddClean(registry, first.session_id, first.binding_id, kLineA));
+    CHECK(registry.disconnectAbruptly(30, first.session_id, first.binding_id));
+    const auto retired_generation = registry.captureGeneration(30, first.session_id, BindingId{});
+    CHECK(retired_generation.has_value());
+    auto resume = registration(30);
+    resume.requested_session_id = first.session_id;
+    const auto second = registry.registerEndpoint(resume);
+    CHECK(second.status == Status::Ok);
+    CHECK(!task5AddClean(registry, first.session_id, first.binding_id, kLineB));
+    CHECK(!task5RemoveClean(registry, first.session_id, first.binding_id, kLineA));
+    CHECK(!registry.removeCleanHolder(*retired_generation, kLineA));
+    CHECK(task5AddClean(registry, second.session_id, second.binding_id, kLineB));
+    CHECK(task5CleanHolders(registry, second.session_id, second.binding_id) ==
+          (std::vector<std::uint64_t>{kLineA, kLineB}));
+}
+
+void testUnregisterPreflightsAllCandidatesBeforeFirstRemoval() {
+    MesiDirectory directory;
+    CHECK(directory.gets(kLineA, 31).committed());
+    CHECK(directory.getm(kLineB, 31).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(31));
+    CHECK(task5AddClean(registry, live.session_id, live.binding_id, kLineA));
+    CHECK(task5AddClean(registry, live.session_id, live.binding_id, kLineB));
+    const auto unregister = requestFrame(Opcode::Unregister, 1, live.session_id, 31);
+    CHECK(registry.admitRequest(live.session_id, live.binding_id, unregister) == RequestAdmissionResult::Accepted);
+    CHECK(engine.unregisterSession(registry, 31, live.session_id, live.binding_id, unregister) == Status::InvalidState);
+    checkState(directory, kLineA, MesiState::E, 31, 0, 1, true);
+    checkState(directory, kLineB, MesiState::M, 31, 0, 1, false);
+    CHECK(task5CleanHolders(registry, live.session_id, live.binding_id) ==
+          (std::vector<std::uint64_t>{kLineA, kLineB}));
+
+    MesiDirectory race_directory;
+    CHECK(race_directory.gets(kLineC, 35).committed());
+    MesiTransactionEngine race_engine(race_directory, memory, transport, kWait);
+    EndpointSessionRegistry race_registry;
+    const auto race = race_registry.registerEndpoint(registration(35));
+    CHECK(task5AddClean(race_registry, race.session_id, race.binding_id, kLineC));
+    const auto earlier = requestFrame(Opcode::Heartbeat, 1, race.session_id, 35);
+    const auto close = requestFrame(Opcode::Unregister, 2, race.session_id, 35);
+    CHECK(race_registry.admitRequest(race.session_id, race.binding_id, earlier) == RequestAdmissionResult::Accepted);
+    CHECK(race_registry.admitRequest(race.session_id, race.binding_id, close) == RequestAdmissionResult::Accepted);
+    auto closing = std::async(std::launch::async, [&] {
+        return race_engine.unregisterSession(race_registry, 35, race.session_id, race.binding_id, close);
+    });
+    CHECK(closing.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+    CHECK(race_registry.disconnectAbruptly(35, race.session_id, race.binding_id));
+    CHECK(ready(closing, "UNREGISTER binding loss") != Status::Ok);
+    checkState(race_directory, kLineC, MesiState::E, 35, 0, 1, true);
+    const auto offline = race_registry.captureGeneration(35, race.session_id, BindingId{});
+    CHECK(offline.has_value());
+    CHECK(race_registry.holderSnapshot(*offline).clean == std::vector<std::uint64_t>{kLineC});
+}
+
+template <typename Engine> bool exerciseDurableBoundedAuditContract() {
+    if constexpr (requires { typename Engine::AuditSink; }) {
+        class RejectingSink final : public Engine::AuditSink {
+        public:
+            bool accept(const CoherenceAuditRecord &) noexcept override { return false; }
+        } rejecting;
+        MesiDirectory rejected_directory;
+        CHECK(rejected_directory.getm(kLineA, 32).committed());
+        TestMemory rejected_memory;
+        TestTransport rejected_transport;
+        Engine rejected_engine(rejected_directory, rejected_memory, rejected_transport, kWait, 1, &rejecting, 2);
+        EndpointSessionRegistry rejected_registry;
+        const auto rejected = rejected_registry.registerEndpoint(registration(32));
+        CHECK(task5AddModified(rejected_registry, rejected.session_id, rejected.binding_id, kLineA));
+        CHECK(rejected_registry.disconnectAbruptly(32, rejected.session_id, rejected.binding_id));
+        const auto failed = task5Evict(rejected_engine, rejected_registry, 32, rejected.session_id, BindingId{},
+                                       TestFailurePolicy::ForceDataLoss);
+        CHECK(failed.status != TestAdministrativeStatus::DataLoss);
+        CHECK(failed.dirty_lost == 0);
+        checkState(rejected_directory, kLineA, MesiState::M, 32, 0, 1, false);
+        CHECK(rejected_engine.auditCounters().forced_dirty_loss == 0);
+
+        class AcceptingSink final : public Engine::AuditSink {
+        public:
+            bool accept(const CoherenceAuditRecord &record) noexcept override {
+                records.push_back(record);
+                return true;
+            }
+            std::vector<CoherenceAuditRecord> records;
+        } accepting;
+        MesiDirectory bounded_directory;
+        TestMemory bounded_memory;
+        TestTransport bounded_transport;
+        Engine bounded_engine(bounded_directory, bounded_memory, bounded_transport, kWait, 1, &accepting, 2);
+        for (std::uint64_t snoop = 1; snoop != 5; ++snoop) {
+            auto stale = initializeFrame(Opcode::SnoopAck);
+            setSrcHost(stale, 1);
+            setDstHost(stale, kServerHost);
+            setSessionId(stale, 1);
+            setSnoopId(stale, snoop);
+            setAckStrength(stale, AckStrength::MODEL);
+            CHECK(bounded_engine.handleSnoopAck(stale) == AckDisposition::Stale);
+        }
+        CHECK(bounded_engine.auditRecords().size() == 2);
+        return true;
+    }
+    return false;
+}
+
+void testForcedLossRequiresDurableAuditAndDiagnosticStorageIsBounded() {
+    CHECK(exerciseDurableBoundedAuditContract<MesiTransactionEngine>());
+}
+
+void testForcedLossKeepsSealedGenerationAcrossReentrantDisconnect() {
+    class DisconnectingSink final : public MesiTransactionEngine::AuditSink {
+    public:
+        bool accept(const CoherenceAuditRecord &) override {
+            disconnected = registry->disconnectAbruptly(host_id, session_id, binding_id);
+            return true;
+        }
+
+        EndpointSessionRegistry *registry{};
+        std::uint16_t host_id{};
+        SessionId session_id{};
+        BindingId binding_id{};
+        bool disconnected{};
+    } sink;
+
+    MesiDirectory directory;
+    CHECK(directory.getm(kLineA, 36).committed());
+    TestMemory memory;
+    TestTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kWait, 1, &sink, 2);
+    EndpointSessionRegistry registry;
+    const auto live = registry.registerEndpoint(registration(36));
+    CHECK(task5AddModified(registry, live.session_id, live.binding_id, kLineA));
+    sink.registry = &registry;
+    sink.host_id = 36;
+    sink.session_id = live.session_id;
+    sink.binding_id = live.binding_id;
+
+    const auto result =
+        task5Evict(engine, registry, 36, live.session_id, live.binding_id, TestFailurePolicy::ForceDataLoss);
+    CHECK(sink.disconnected);
+    CHECK(result.status == TestAdministrativeStatus::DataLoss);
+    CHECK(result.dirty_lost == 1);
+    CHECK(engine.auditCounters().forced_dirty_loss == 1);
+    checkState(directory, kLineA, MesiState::I, std::nullopt, 0, 2, true);
+    CHECK(!registry.inspect(live.session_id).has_value());
+}
+
 } // namespace
 
 int main() {
@@ -799,6 +1280,14 @@ int main() {
     testForcedDirtyLossIsExplicitRecordedAndNeverCoherentSuccess();
     testHostFenceWakesTransactionsWaitingOnThatHost();
     testTimeoutPartialAckStaleAckAndInvalidOwnershipAreAudited();
+    testHostFenceAuthorizationIsContextualOneShotAndFailClosed();
+    testFencedOrdinaryAdmissionIsBoundedAndControlUsesContext();
+    testEvictionWaitsForAdmittedAtomicHolderPublicationAndFencesNewWork();
+    testPutmAdmissionSurvivesLaterDisconnectAndFailedWritesPreserveM();
+    testHolderIndexRejectsRetiredBindingAfterResume();
+    testUnregisterPreflightsAllCandidatesBeforeFirstRemoval();
+    testForcedLossRequiresDurableAuditAndDiagnosticStorageIsBounded();
+    testForcedLossKeepsSealedGenerationAcrossReentrantDisconnect();
 
     const auto count = failures.load(std::memory_order_relaxed);
     if (count != 0) {

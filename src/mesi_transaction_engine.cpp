@@ -37,6 +37,23 @@ bool isAtomicOperation(MesiTransactionEngine::Operation operation) noexcept {
            operation == MesiTransactionEngine::Operation::AtomicCas;
 }
 
+class FencedCleanupLease {
+public:
+    FencedCleanupLease(EndpointSessionRegistry &registry, SessionGenerationToken generation)
+        : registry_(&registry), generation_(generation) {}
+    FencedCleanupLease(const FencedCleanupLease &) = delete;
+    FencedCleanupLease &operator=(const FencedCleanupLease &) = delete;
+    ~FencedCleanupLease() {
+        if (registry_)
+            registry_->abortFencedCleanup(generation_);
+    }
+    void release() noexcept { registry_ = nullptr; }
+
+private:
+    EndpointSessionRegistry *registry_;
+    SessionGenerationToken generation_;
+};
+
 } // namespace
 
 struct TransactionDependencies {
@@ -69,18 +86,43 @@ struct PendingTransaction {
     std::uint64_t atomic_old_value{};
 };
 
+struct MesiTransactionEngine::EngineSession {
+    enum class State : std::uint8_t { Active, Fenced, Retired };
+    std::uint16_t host_id{};
+    std::uint64_t session_id{};
+    State state{State::Active};
+    bool drain_sealed{};
+    std::size_t in_flight{};
+    std::atomic<bool> retired{};
+};
+
+struct MesiTransactionEngine::PendingHostFence {
+    mutable std::mutex mutex;
+    std::condition_variable changed;
+    protocol_v2::CoherenceFrame request;
+    TimePoint deadline;
+    bool dispatched{};
+    bool accepted{};
+    bool failed{};
+};
+
 MesiTransactionEngine::MesiTransactionEngine(MesiDirectory &directory, Duration snoop_timeout,
                                              std::uint64_t first_snoop_id)
     : directory_(directory), next_snoop_id_(first_snoop_id) {
     if (snoop_timeout <= Duration::zero())
         snoop_timeout = std::chrono::nanoseconds(1);
     dependencies_ = std::make_shared<TransactionDependencies>(TransactionDependencies{nullptr, nullptr, snoop_timeout});
+    audit_records_.reserve(audit_capacity_);
 }
 
 MesiTransactionEngine::MesiTransactionEngine(MesiDirectory &directory, CoherenceMemoryBackend &memory,
                                              CoherenceTransport &transport, Duration snoop_timeout,
-                                             std::uint64_t first_snoop_id)
+                                             std::uint64_t first_snoop_id, AuditSink *audit_sink,
+                                             std::size_t audit_capacity)
     : MesiTransactionEngine(directory, snoop_timeout, first_snoop_id) {
+    audit_sink_ = audit_sink;
+    audit_capacity_ = std::max<std::size_t>(1, audit_capacity);
+    audit_records_.reserve(audit_capacity_);
     configure(memory, transport, snoop_timeout);
 }
 
@@ -105,14 +147,113 @@ bool MesiTransactionEngine::bindSession(std::uint16_t host_id, std::uint64_t ses
     if (host_id >= MesiDirectory::kMaximumHosts || session_id == 0)
         return false;
     std::lock_guard lock(sessions_mutex_);
-    const auto [found, inserted] = sessions_.try_emplace(host_id, session_id);
-    return inserted || found->second == session_id;
+    const auto found = sessions_.find(host_id);
+    if (found == sessions_.end()) {
+        auto session = std::make_shared<EngineSession>();
+        session->host_id = host_id;
+        session->session_id = session_id;
+        sessions_.emplace(host_id, std::move(session));
+        return true;
+    }
+    if (found->second->state == EngineSession::State::Retired && found->second->in_flight == 0) {
+        auto session = std::make_shared<EngineSession>();
+        session->host_id = host_id;
+        session->session_id = session_id;
+        found->second = std::move(session);
+        return true;
+    }
+    return found->second->session_id == session_id && found->second->state != EngineSession::State::Retired;
 }
 
 std::uint64_t MesiTransactionEngine::sessionFor(std::uint16_t host_id) const {
     std::lock_guard lock(sessions_mutex_);
     const auto found = sessions_.find(host_id);
-    return found == sessions_.end() ? 0 : found->second;
+    return found == sessions_.end() || found->second->state == EngineSession::State::Retired
+               ? 0
+               : found->second->session_id;
+}
+
+MesiTransactionEngine::OperationLease::~OperationLease() {
+    if (engine && session)
+        engine->releaseOperation(session);
+}
+
+MesiTransactionEngine::OperationLease &
+MesiTransactionEngine::OperationLease::operator=(OperationLease &&other) noexcept {
+    if (this == &other)
+        return *this;
+    if (engine && session)
+        engine->releaseOperation(session);
+    engine = other.engine;
+    session = std::move(other.session);
+    admitted = other.admitted;
+    other.engine = nullptr;
+    other.admitted = false;
+    return *this;
+}
+
+MesiTransactionEngine::OperationLease MesiTransactionEngine::admitOperation(const TransactionRequest &request,
+                                                                            bool fenced_drain) {
+    if (request.session_id == 0)
+        return OperationLease{this, {}};
+    std::lock_guard lock(sessions_mutex_);
+    const auto found = sessions_.find(request.host_id);
+    if (found == sessions_.end() || found->second->session_id != request.session_id ||
+        found->second->state == EngineSession::State::Retired)
+        return {};
+    const bool active = found->second->state == EngineSession::State::Active;
+    const bool drain =
+        found->second->state == EngineSession::State::Fenced && !found->second->drain_sealed && fenced_drain;
+    if (!active && !drain)
+        return {};
+    ++found->second->in_flight;
+    return OperationLease{this, found->second};
+}
+
+void MesiTransactionEngine::releaseOperation(const std::shared_ptr<EngineSession> &session) noexcept {
+    std::lock_guard lock(sessions_mutex_);
+    if (session->in_flight != 0)
+        --session->in_flight;
+    if (session->in_flight == 0 && session->state == EngineSession::State::Retired) {
+        const auto found = sessions_.find(session->host_id);
+        if (found != sessions_.end() && found->second == session)
+            sessions_.erase(found);
+    }
+    sessions_changed_.notify_all();
+}
+
+bool MesiTransactionEngine::fenceEngineSession(std::uint16_t host_id, std::uint64_t session_id) {
+    std::lock_guard lock(sessions_mutex_);
+    const auto found = sessions_.find(host_id);
+    if (found == sessions_.end() || found->second->session_id != session_id ||
+        found->second->state == EngineSession::State::Retired)
+        return false;
+    const bool already_fenced = found->second->state == EngineSession::State::Fenced;
+    found->second->state = EngineSession::State::Fenced;
+    if (!already_fenced)
+        found->second->drain_sealed = false;
+    return true;
+}
+
+bool MesiTransactionEngine::sealEngineSession(std::uint16_t host_id, std::uint64_t session_id) {
+    std::lock_guard lock(sessions_mutex_);
+    const auto found = sessions_.find(host_id);
+    if (found == sessions_.end() || found->second->session_id != session_id ||
+        found->second->state != EngineSession::State::Fenced)
+        return false;
+    found->second->drain_sealed = true;
+    return true;
+}
+
+bool MesiTransactionEngine::waitEngineQuiescent(std::uint16_t host_id, std::uint64_t session_id) {
+    std::unique_lock lock(sessions_mutex_);
+    const auto found = sessions_.find(host_id);
+    if (found == sessions_.end() || found->second->session_id != session_id)
+        return false;
+    const auto session = found->second;
+    sessions_changed_.wait(lock,
+                           [&] { return session->in_flight == 0 || session->state == EngineSession::State::Retired; });
+    return session->state != EngineSession::State::Retired;
 }
 
 protocol_v2::Status
@@ -178,6 +319,13 @@ TransactionResult MesiTransactionEngine::puts(std::uint64_t line_address, Transa
     const auto dependencies = dependencySnapshot();
     if (const auto status = validateRequest(request, dependencies); status != protocol_v2::Status::Ok)
         return {status, unchanged(TransitionStatus::InvalidHost, {}), false, {}};
+    auto operation_lease = admitOperation(request, false);
+    if (!operation_lease)
+        return {sessionFor(request.host_id) == request.session_id ? protocol_v2::Status::HostFenced
+                                                                  : protocol_v2::Status::StaleSession,
+                unchanged(TransitionStatus::InvalidHost, {}),
+                false,
+                {}};
     auto line = directory_.lockLine(line_address);
     if (!line)
         return {protocol_v2::Status::InvalidState, unchanged(TransitionStatus::UnalignedAddress, {}), false, {}};
@@ -194,7 +342,7 @@ TransactionResult MesiTransactionEngine::puts(std::uint64_t line_address, Transa
         shared_holder ? installed_epoch != 0 && installed_epoch <= current.epoch : installed_epoch == current.epoch;
     if (!epoch_valid)
         return {protocol_v2::Status::StaleEpoch, unchanged(TransitionStatus::StaleMetadata, current), false, {}};
-    if (sessionFor(request.host_id) != request.session_id)
+    if (operation_lease.session && operation_lease.session->retired.load(std::memory_order_acquire))
         return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidHost, current), false, {}};
     DirectorySnapshot next = current;
     if (shared_holder) {
@@ -213,6 +361,13 @@ TransactionResult MesiTransactionEngine::putm(std::uint64_t line_address, Transa
     const auto dependencies = dependencySnapshot();
     if (const auto status = validateRequest(request, dependencies); status != protocol_v2::Status::Ok)
         return {status, unchanged(TransitionStatus::InvalidHost, {}), false, {}};
+    auto operation_lease = admitOperation(request, true);
+    if (!operation_lease)
+        return {sessionFor(request.host_id) == request.session_id ? protocol_v2::Status::HostFenced
+                                                                  : protocol_v2::Status::StaleSession,
+                unchanged(TransitionStatus::InvalidHost, {}),
+                false,
+                {}};
     auto line = directory_.lockLine(line_address);
     if (!line)
         return {protocol_v2::Status::InvalidState, unchanged(TransitionStatus::UnalignedAddress, {}), false, {}};
@@ -232,8 +387,6 @@ TransactionResult MesiTransactionEngine::putm(std::uint64_t line_address, Transa
     } catch (...) {
         return {protocol_v2::Status::IoError, unchanged(TransitionStatus::InvalidState, current), false, {}};
     }
-    if (sessionFor(request.host_id) != request.session_id)
-        return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidHost, current), false, {}};
     const auto transition =
         line->commitPutm(request.host_id, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
     return {statusFor(transition.status), transition, false, {}};
@@ -252,6 +405,13 @@ TransactionResult MesiTransactionEngine::acquire(std::uint64_t line_address, Tra
     const auto dependencies = dependencySnapshot();
     if (const auto request_status = validateRequest(request, dependencies); request_status != protocol_v2::Status::Ok)
         return {request_status, unchanged(TransitionStatus::InvalidHost, {}), false, {}};
+    auto operation_lease = admitOperation(request, false);
+    if (!operation_lease)
+        return {sessionFor(request.host_id) == request.session_id ? protocol_v2::Status::HostFenced
+                                                                  : protocol_v2::Status::StaleSession,
+                unchanged(TransitionStatus::InvalidHost, {}),
+                false,
+                {}};
 
     auto locked = directory_.lockLine(line_address);
     if (!locked)
@@ -288,13 +448,14 @@ TransactionResult MesiTransactionEngine::acquire(std::uint64_t line_address, Tra
         break;
     }
     return needs_snoops ? transact(*locked, request, operation, current, dependencies, atomic)
-                        : direct(*locked, request, operation, current, dependencies, atomic);
+                        : direct(*locked, request, operation, current, dependencies, atomic, operation_lease.session);
 }
 
 TransactionResult MesiTransactionEngine::direct(MesiDirectory::LockedLine &line, TransactionRequest request,
                                                 Operation operation, const DirectorySnapshot &current,
                                                 const std::shared_ptr<const TransactionDependencies> &dependencies,
-                                                std::optional<AtomicArguments> atomic) {
+                                                std::optional<AtomicArguments> atomic,
+                                                const std::shared_ptr<EngineSession> &admitted_session) {
     DirectorySnapshot next = current;
     bool valid = false;
     switch (operation) {
@@ -346,16 +507,6 @@ TransactionResult MesiTransactionEngine::direct(MesiDirectory::LockedLine &line,
         }
     }
 
-    if (isAtomicOperation(operation) && request.session_id != 0) {
-        std::lock_guard lock(sessions_mutex_);
-        const auto found = sessions_.find(request.host_id);
-        if (found == sessions_.end() || found->second != request.session_id)
-            return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidState, current), false, {}};
-        // This exact-generation check is the direct atomic commit admission point. The session lock is released before
-        // the backend callback; a later disconnect is ordered after the admitted operation and cannot cancel its
-        // durable effect.
-    }
-
     std::uint64_t old_value = 0;
     if (isAtomicOperation(operation)) {
         if (!atomic || dependencies->memory == nullptr)
@@ -374,14 +525,8 @@ TransactionResult MesiTransactionEngine::direct(MesiDirectory::LockedLine &line,
         }
     }
 
-    std::unique_lock<std::mutex> session_lock;
-    if (!isAtomicOperation(operation) && request.session_id != 0) {
-        session_lock = std::unique_lock(sessions_mutex_);
-        const auto found = sessions_.find(request.host_id);
-        if (found == sessions_.end() || found->second != request.session_id) {
-            return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidState, current), false, {}};
-        }
-    }
+    if (!isAtomicOperation(operation) && admitted_session && admitted_session->retired.load(std::memory_order_acquire))
+        return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidState, current), false, {}};
 
     TransitionResult transition{TransitionStatus::InvalidState, current};
     switch (operation) {
@@ -437,7 +582,8 @@ bool MesiTransactionEngine::pendingSessionsCurrent(const PendingTransaction &pen
     std::lock_guard lock(sessions_mutex_);
     const auto matches = [&](std::uint16_t host_id, std::uint64_t session_id) {
         const auto found = sessions_.find(host_id);
-        return found != sessions_.end() && found->second == session_id;
+        return found != sessions_.end() && found->second->session_id == session_id &&
+               found->second->state != EngineSession::State::Retired;
     };
     if (pending.requester.session_id != 0 && !matches(pending.requester.host_id, pending.requester.session_id))
         return false;
@@ -946,6 +1092,46 @@ AckDisposition MesiTransactionEngine::handleSnoopAck(const protocol_v2::Coherenc
     return AckDisposition::Accepted;
 }
 
+AckDisposition MesiTransactionEngine::handleControlFrame(EndpointSessionRegistry &registry, SessionId session_id,
+                                                         BindingId binding_id,
+                                                         const protocol_v2::CoherenceFrame &frame) {
+    if (protocol_v2::opcode(frame) != protocol_v2::Opcode::SnoopAck || protocol_v2::snoopId(frame) == 0)
+        return AckDisposition::Invalid;
+    if (!registry.controlFrameAdmissible(session_id, binding_id, frame)) {
+        stale_acks_.fetch_add(1, std::memory_order_relaxed);
+        recordAudit(AuditEventKind::StaleAck, AuditSeverity::Warning, protocol_v2::srcHost(frame),
+                    protocol_v2::sessionId(frame), protocol_v2::address(frame), protocol_v2::epoch(frame));
+        return AckDisposition::Stale;
+    }
+
+    std::shared_ptr<PendingHostFence> fence;
+    {
+        std::lock_guard lock(active_mutex_);
+        const auto found = active_host_fences_.find(protocol_v2::snoopId(frame));
+        if (found != active_host_fences_.end())
+            fence = found->second;
+    }
+    if (!fence)
+        return handleSnoopAck(frame);
+
+    std::unique_lock lock(fence->mutex);
+    if (!fence->dispatched || fence->accepted || fence->failed || Clock::now() >= fence->deadline) {
+        lock.unlock();
+        stale_acks_.fetch_add(1, std::memory_order_relaxed);
+        recordAudit(AuditEventKind::StaleAck, AuditSeverity::Warning, protocol_v2::srcHost(frame),
+                    protocol_v2::sessionId(frame), protocol_v2::address(frame), protocol_v2::epoch(frame));
+        return AckDisposition::Stale;
+    }
+    if (!protocol_v2::validateSnoopAck(
+            frame, fence->request,
+            {protocol_v2::AckStrength::MODEL, protocol_v2::LineState::I, protocol_v2::LineState::I}) ||
+        protocol_v2::status(frame) != protocol_v2::Status::Ok)
+        return AckDisposition::Invalid;
+    fence->accepted = true;
+    fence->changed.notify_all();
+    return AckDisposition::Accepted;
+}
+
 std::size_t MesiTransactionEngine::progress(TimePoint now) {
     std::vector<std::shared_ptr<PendingTransaction>> active;
     {
@@ -977,8 +1163,26 @@ std::size_t MesiTransactionEngine::interruptHost(std::uint16_t host_id, std::uin
     if (remove_binding) {
         std::lock_guard lock(sessions_mutex_);
         const auto found = sessions_.find(host_id);
-        if (found != sessions_.end() && found->second == session_id)
-            sessions_.erase(found);
+        if (found != sessions_.end() && found->second->session_id == session_id) {
+            found->second->state = EngineSession::State::Retired;
+            found->second->retired.store(true, std::memory_order_release);
+            sessions_changed_.notify_all();
+            if (found->second->in_flight == 0)
+                sessions_.erase(found);
+        }
+    }
+
+    {
+        std::lock_guard lock(active_mutex_);
+        for (const auto &[snoop, fence] : active_host_fences_) {
+            (void)snoop;
+            if (protocol_v2::dstHost(fence->request) == host_id &&
+                protocol_v2::sessionId(fence->request) == session_id) {
+                std::lock_guard fence_lock(fence->mutex);
+                fence->failed = true;
+                fence->changed.notify_all();
+            }
+        }
     }
 
     std::vector<std::shared_ptr<PendingTransaction>> active;
@@ -1041,17 +1245,49 @@ protocol_v2::Status MesiTransactionEngine::unregisterSession(EndpointSessionRegi
         !registry.waitForOperationsBefore(session_id, binding_id, request_id))
         return protocol_v2::Status::InvalidState;
 
-    const auto candidates = registry.holderSnapshot(session_id);
-    if (!candidates.modified.empty())
+    if (!registry.freezeUnregister(session_id, binding_id, unregister_request))
+        return protocol_v2::Status::StaleSession;
+    const auto abort = [&] { registry.abortUnregister(session_id, binding_id); };
+    if (sessionFor(host_id) == session_id) {
+        if (!fenceEngineSession(host_id, session_id) || !sealEngineSession(host_id, session_id) ||
+            !waitEngineQuiescent(host_id, session_id)) {
+            abort();
+            return protocol_v2::Status::StaleSession;
+        }
+    }
+
+    const auto candidates = registry.holderSnapshot(session_id, binding_id);
+    if (!candidates.modified.empty()) {
+        abort();
         return protocol_v2::Status::InvalidState;
+    }
+
+    // Frozen admission means this host cannot legally gain M after preflight. Inspect every sorted candidate before the
+    // first typed commit so a dirty/stale second line cannot produce an ordinary partial-cleanup failure.
+    for (const auto address : candidates.clean) {
+        auto line = directory_.lockLine(address);
+        if (!line) {
+            abort();
+            return protocol_v2::Status::InvalidState;
+        }
+        const auto current = line->snapshot();
+        if (current.state == MesiState::M && current.owner == host_id) {
+            abort();
+            return protocol_v2::Status::InvalidState;
+        }
+    }
 
     for (const auto address : candidates.clean) {
         auto line = directory_.lockLine(address);
-        if (!line)
+        if (!line) {
+            abort();
             return protocol_v2::Status::InvalidState;
+        }
         const auto current = line->snapshot();
-        if (current.state == MesiState::M && current.owner == host_id)
+        if (current.state == MesiState::M && current.owner == host_id) {
+            abort();
             return protocol_v2::Status::InvalidState;
+        }
 
         std::optional<DirectorySnapshot> next;
         if (current.state == MesiState::S && (current.sharers & holder(host_id)) != 0) {
@@ -1063,28 +1299,94 @@ protocol_v2::Status MesiTransactionEngine::unregisterSession(EndpointSessionRegi
         }
         if (next) {
             const auto transition = line->commitAdministrativeEvict(host_id, current, *next);
-            if (!transition.succeeded())
+            if (!transition.succeeded()) {
+                abort();
                 return statusFor(transition.status);
+            }
         }
-        (void)registry.removeCleanHolder(session_id, address);
+        (void)registry.removeCleanHolder(session_id, binding_id, address);
     }
-    return registry.gracefulClose(host_id, session_id, binding_id, unregister_request);
+    const auto status = registry.gracefulClose(host_id, session_id, binding_id, unregister_request);
+    if (status != protocol_v2::Status::Ok)
+        abort();
+    return status;
 }
 
 EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registry, std::uint16_t host_id,
-                                                SessionId session_id, BindingId binding_id, HostFailurePolicy policy,
-                                                bool matching_host_fence_ack) {
+                                                SessionId session_id, BindingId binding_id, HostFailurePolicy policy) {
     if (host_id >= MesiDirectory::kMaximumHosts)
         return {AdministrativeStatus::InvalidHost, 0, 0};
     if (registry.fenceSession(host_id, session_id, binding_id) != protocol_v2::Status::Ok)
         return {AdministrativeStatus::StaleSession, 0, 0};
-    // Fencing preserves the immutable engine binding so bounded drain operations remain admissible, but transactions
-    // already waiting on this endpoint must observe the lifecycle boundary immediately.
+    const auto generation = registry.captureGeneration(host_id, session_id, binding_id);
+    if (!generation)
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    if (binding_id && sessionFor(host_id) == 0 && !bindSession(host_id, session_id))
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    if (sessionFor(host_id) == session_id && !fenceEngineSession(host_id, session_id))
+        return {AdministrativeStatus::StaleSession, 0, 0};
     (void)interruptHost(host_id, session_id, false);
-    if (policy == HostFailurePolicy::RequireFenceAck && !matching_host_fence_ack)
-        return {AdministrativeStatus::FenceAckRequired, 0, 0};
 
-    auto candidates = registry.holderSnapshot(session_id);
+    if (policy == HostFailurePolicy::RequireFenceAck) {
+        const auto dependencies = dependencySnapshot();
+        const auto snoop_id = allocateSnoopId();
+        if (!binding_id || dependencies->transport == nullptr || !snoop_id)
+            return {AdministrativeStatus::FenceAckRequired, 0, 0};
+        auto pending = std::make_shared<PendingHostFence>();
+        pending->request = protocol_v2::initializeFrame(protocol_v2::Opcode::HostFence);
+        protocol_v2::setSrcHost(pending->request, protocol_v2::kServerHost);
+        protocol_v2::setDstHost(pending->request, host_id);
+        protocol_v2::setSessionId(pending->request, session_id);
+        protocol_v2::setSnoopId(pending->request, *snoop_id);
+        pending->deadline = Clock::now() + dependencies->snoop_timeout;
+        {
+            std::lock_guard lock(active_mutex_);
+            active_host_fences_.emplace(*snoop_id, pending);
+        }
+        {
+            std::lock_guard lock(pending->mutex);
+            pending->dispatched = true;
+        }
+        bool sent = false;
+        try {
+            sent = dependencies->transport->sendToHost(host_id, pending->request);
+        } catch (...) {
+            sent = false;
+        }
+        {
+            std::unique_lock lock(pending->mutex);
+            if (!sent)
+                pending->failed = true;
+            pending->changed.wait_until(lock, pending->deadline, [&] { return pending->accepted || pending->failed; });
+            if (sent && !pending->accepted && !pending->failed) {
+                timeout_events_.fetch_add(1, std::memory_order_relaxed);
+                recordAudit(AuditEventKind::Timeout, AuditSeverity::Warning, host_id, session_id, 0, 0);
+            }
+        }
+        {
+            std::lock_guard lock(active_mutex_);
+            const auto found = active_host_fences_.find(*snoop_id);
+            if (found != active_host_fences_.end() && found->second == pending)
+                active_host_fences_.erase(found);
+        }
+        std::lock_guard lock(pending->mutex);
+        if (!pending->accepted || pending->failed)
+            return {AdministrativeStatus::FenceAckRequired, 0, 0};
+    }
+
+    const auto cutoff = registry.sealFencedSession(*generation);
+    if (!cutoff)
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    if (sessionFor(host_id) == session_id &&
+        (!sealEngineSession(host_id, session_id) || !waitEngineQuiescent(host_id, session_id)))
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    if (!registry.waitForOperationsThrough(*generation, *cutoff))
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    if (!registry.freezeFencedGenerationForCleanup(*generation))
+        return {AdministrativeStatus::StaleSession, 0, 0};
+    FencedCleanupLease cleanup_lease(registry, *generation);
+
+    auto candidates = registry.holderSnapshot(*generation);
     if (policy != HostFailurePolicy::ForceDataLoss) {
         for (const auto address : candidates.modified) {
             auto line = directory_.lockLine(address);
@@ -1100,6 +1402,22 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
     addresses.insert(addresses.end(), candidates.modified.begin(), candidates.modified.end());
     std::sort(addresses.begin(), addresses.end());
     addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+
+    if (policy == HostFailurePolicy::ForceDataLoss) {
+        for (const auto address : addresses) {
+            auto line = directory_.lockLine(address);
+            if (!line)
+                return {AdministrativeStatus::InvalidHost, 0, 0};
+            const auto current = line->snapshot();
+            if (current.state != MesiState::M || current.owner != host_id)
+                continue;
+            const CoherenceAuditRecord intent{
+                AuditEventKind::ForcedDirtyLoss, AuditSeverity::High, host_id, session_id, address, current.epoch + 1};
+            line.reset();
+            if (!acceptForcedLoss(intent))
+                return {AdministrativeStatus::AuditFailure, 0, 0};
+        }
+    }
 
     EvictionResult result{AdministrativeStatus::Ok, 0, 0};
     for (const auto address : addresses) {
@@ -1118,7 +1436,7 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
                 line->commitAdministrativeEvict(host_id, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
             if (!transition.succeeded())
                 return {AdministrativeStatus::InvalidHost, result.clean_removed, result.dirty_lost};
-            (void)registry.removeModifiedHolder(session_id, address);
+            (void)registry.removeModifiedHolder(*generation, address);
             ++result.dirty_lost;
             forced_dirty_losses_.fetch_add(1, std::memory_order_relaxed);
             recordAudit(AuditEventKind::ForcedDirtyLoss, AuditSeverity::High, host_id, session_id, address,
@@ -1138,20 +1456,24 @@ EvictionResult MesiTransactionEngine::evictHost(EndpointSessionRegistry &registr
             const auto transition = line->commitAdministrativeEvict(host_id, current, next);
             if (!transition.succeeded())
                 return {AdministrativeStatus::InvalidHost, result.clean_removed, result.dirty_lost};
-            (void)registry.removeCleanHolder(session_id, address);
+            (void)registry.removeCleanHolder(*generation, address);
             ++result.clean_removed;
             forced_clean_removals_.fetch_add(1, std::memory_order_relaxed);
             recordAudit(AuditEventKind::ForcedCleanRemoval, AuditSeverity::Warning, host_id, session_id, address,
                         transition.snapshot.epoch);
         } else {
-            (void)registry.removeCleanHolder(session_id, address);
-            (void)registry.removeModifiedHolder(session_id, address);
+            (void)registry.removeCleanHolder(*generation, address);
+            (void)registry.removeModifiedHolder(*generation, address);
         }
     }
     if (result.dirty_lost != 0)
         result.status = AdministrativeStatus::DataLoss;
-    if (!registry.completeEviction(host_id, session_id, binding_id))
+    if (!registry.completeEviction(host_id, *generation)) {
+        if (result.dirty_lost != 0)
+            return result;
         return {AdministrativeStatus::StaleSession, result.clean_removed, result.dirty_lost};
+    }
+    cleanup_lease.release();
     (void)interruptHost(host_id, session_id, true);
     return result;
 }
@@ -1171,9 +1493,22 @@ std::vector<CoherenceAuditRecord> MesiTransactionEngine::auditRecords() const {
 }
 
 void MesiTransactionEngine::recordAudit(AuditEventKind kind, AuditSeverity severity, std::uint16_t host_id,
-                                        std::uint64_t session_id, std::uint64_t line_address, std::uint64_t epoch) {
+                                        std::uint64_t session_id, std::uint64_t line_address,
+                                        std::uint64_t epoch) noexcept {
     std::lock_guard lock(audit_mutex_);
+    if (audit_records_.size() == audit_capacity_)
+        audit_records_.erase(audit_records_.begin());
     audit_records_.push_back({kind, severity, host_id, session_id, line_address, epoch});
+}
+
+bool MesiTransactionEngine::acceptForcedLoss(const CoherenceAuditRecord &record) noexcept {
+    if (audit_sink_ == nullptr)
+        return false;
+    try {
+        return audit_sink_->accept(record);
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace cxlmemsim::mesi_v2
