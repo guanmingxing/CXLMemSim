@@ -14,6 +14,7 @@
 #define CXLMEMSIM_COHERENCY_ENGINE_H
 
 #include "mesi_directory.h"
+#include "mesi_transaction_engine.h"
 
 #include <atomic>
 #include <cstdint>
@@ -121,6 +122,15 @@ public:
     cxlmemsim::mesi_v2::TransitionResult strictV2Puts(uint64_t line_address, std::uint16_t requester);
     cxlmemsim::mesi_v2::TransitionResult strictV2Putm(uint64_t line_address, std::uint16_t requester);
     cxlmemsim::mesi_v2::TransitionCounters strictV2TransitionCounters() const noexcept;
+    void configureStrictV2(cxlmemsim::CoherenceMemoryBackend &memory, cxlmemsim::CoherenceTransport &transport,
+                           cxlmemsim::mesi_v2::MesiTransactionEngine::Duration snoop_timeout);
+    cxlmemsim::mesi_v2::MesiTransactionEngine &strictV2TransactionEngine() noexcept {
+        return *strict_v2_transaction_engine_;
+    }
+    cxlmemsim::mesi_v2::AckDisposition strictV2HandleSnoopAck(const cxlmemsim::protocol_v2::CoherenceFrame &ack);
+    std::size_t strictV2Progress(cxlmemsim::mesi_v2::MesiTransactionEngine::TimePoint now =
+                                     cxlmemsim::mesi_v2::MesiTransactionEngine::Clock::now());
+    std::size_t strictV2NotifyDisconnect(std::uint16_t host_id, std::uint64_t session_id);
 
     uint32_t get_local_node_id() const { return local_node_id_; }
 
@@ -135,6 +145,7 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<DirectoryEntry>> directory_;
     mutable std::shared_mutex directory_mutex_;
     cxlmemsim::mesi_v2::MesiDirectory strict_v2_directory_;
+    std::unique_ptr<cxlmemsim::mesi_v2::MesiTransactionEngine> strict_v2_transaction_engine_;
     std::unordered_map<uint32_t, FabricLink *> fabric_links_;
     std::vector<MHSLDHeadState> heads_;
 
