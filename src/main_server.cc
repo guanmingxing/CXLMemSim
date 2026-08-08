@@ -899,7 +899,16 @@ int main(int argc, char *argv[]) {
                     SPDLOG_INFO("Connecting to {} RDMA peer(s)...", tcp_peers.size());
                     for (const auto &peer : tcp_peers) {
                         // RDMA port is TCP port + 1000 by convention
-                        if (dist_server.connect_rdma_node(peer.node_id, peer.addr, peer.port + 1000)) {
+                        bool connected = false;
+                        for (int attempt = 1; attempt <= 20 && !connected; ++attempt) {
+                            connected = dist_server.connect_rdma_node(peer.node_id, peer.addr, peer.port + 1000);
+                            if (!connected && attempt < 20) {
+                                SPDLOG_WARN("RDMA peer node {} not ready (attempt {}/20); retrying", peer.node_id,
+                                            attempt);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            }
+                        }
+                        if (connected) {
                             SPDLOG_INFO("Connected to RDMA peer node {} at {}:{}", peer.node_id, peer.addr,
                                         peer.port + 1000);
                         } else {

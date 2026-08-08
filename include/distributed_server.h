@@ -402,6 +402,8 @@ struct RDMACalibrationResult {
 /* Per-node RDMA connection state */
 struct RDMANodeConnection {
     std::unique_ptr<RDMAClient> client;
+    std::string endpoint_addr;
+    uint16_t endpoint_port;
     // Outgoing RDMA connection
     uint64_t remote_addr;
     // Remote base address
@@ -412,7 +414,7 @@ struct RDMANodeConnection {
     RDMACalibrationResult calibration;
     // Per-node calibration data
 
-    RDMANodeConnection() : remote_addr(0), remote_buffer_size(0), connected(false) {}
+    RDMANodeConnection() : endpoint_port(0), remote_addr(0), remote_buffer_size(0), connected(false) {}
 };
 
 /* Message handler callback type */
@@ -646,6 +648,9 @@ private:
     // RDMA server for incoming connections
     std::unique_ptr<RDMAServer> server_;
     std::thread accept_thread_;
+    std::vector<std::shared_ptr<RDMAConnection>> incoming_connections_;
+    std::vector<std::thread> incoming_threads_;
+    std::mutex incoming_mutex_;
     std::atomic<bool> running_;
 
     // Calibration results per node
@@ -660,8 +665,18 @@ public:
     bool initialize();
     void shutdown();
 
+    // Route incoming two-sided RDMA requests to the distributed server's
+    // local-memory implementation. Without this, RDMAServer's default
+    // handler only returns a synthetic success response.
+    void set_message_handler(RDMAConnection::MessageHandler handler) {
+        if (server_) {
+            server_->set_message_handler(handler);
+        }
+    }
+
     // Connection management
-    bool connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port);
+    bool connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port, uint64_t remote_addr,
+                         size_t remote_buffer_size);
     void disconnect_node(uint32_t node_id);
     bool is_connected(uint32_t node_id) const;
     std::vector<uint32_t> get_connected_nodes() const;

@@ -557,8 +557,11 @@ bool DistributedMemoryServer::initialize() {
 
     // Initialize message manager
     msg_manager_ = std::make_unique<DistributedMessageManager>(shm_name_, node_id_);
-    bool is_first_node = (node_id_ == 0);
-    if (!msg_manager_->initialize(is_first_node)) {
+    // POSIX SHM is host-local. Only SHM transport can join node 0's control
+    // segment directly; physical TCP/RDMA nodes need an independent local
+    // control segment and exchange data over their selected transport.
+    bool create_local_control = (node_id_ == 0 || transport_mode_ != DistTransportMode::SHM);
+    if (!msg_manager_->initialize(create_local_control)) {
         SPDLOG_ERROR("Failed to initialize message manager");
         return false;
     }
@@ -1957,9 +1960,24 @@ void DistributedRDMATransport::shutdown() {
         server_->stop();
     }
 
+    {
+        std::lock_guard<std::mutex> incoming_lock(incoming_mutex_);
+        for (auto &client : incoming_connections_) {
+            if (client)
+                client->disconnect();
+        }
+    }
+
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+
+    for (auto &thread : incoming_threads_) {
+        if (thread.joinable())
+            thread.join();
+    }
+    incoming_threads_.clear();
+    incoming_connections_.clear();
 
     std::lock_guard<std::mutex> lock(connections_mutex_);
     for (auto &[node_id, conn] : connections_) {
@@ -1971,7 +1989,8 @@ void DistributedRDMATransport::shutdown() {
     connections_.clear();
 }
 
-bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port) {
+bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port,
+                                              uint64_t remote_addr, size_t remote_buffer_size) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
 
     auto it = connections_.find(node_id);
@@ -1987,6 +2006,10 @@ bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::stri
 
     RDMANodeConnection conn;
     conn.client = std::move(client);
+    conn.endpoint_addr = addr;
+    conn.endpoint_port = port;
+    conn.remote_addr = remote_addr;
+    conn.remote_buffer_size = remote_buffer_size;
     conn.connected = true;
     connections_[node_id] = std::move(conn);
 
@@ -2064,9 +2087,28 @@ bool DistributedRDMATransport::send_message_wait_response(uint32_t dst_node, con
     memcpy(rdma_req.data, req.payload.mem.data, std::min(sizeof(rdma_req.data), sizeof(req.payload.mem.data)));
 
     RDMAResponse rdma_resp;
-    if (it->second.client->send_request(rdma_req, rdma_resp) != 0) {
-        return false;
+    bool delivered = false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        if (it->second.client && it->second.client->send_request(rdma_req, rdma_resp) == 0) {
+            delivered = true;
+            break;
+        }
+
+        // A Soft-RoCE QP can remain nominally RTS while no completion ever
+        // arrives. Recreate that one directed connection and replay the
+        // idempotent cacheline READ/WRITE instead of wedging the whole MPI job.
+        SPDLOG_WARN("Reconnecting RDMA peer node {} after request failure (attempt {}/16)", dst_node, attempt + 1);
+        auto replacement = std::make_unique<RDMAClient>(it->second.endpoint_addr, it->second.endpoint_port);
+        if (replacement->connect() == 0) {
+            it->second.client = std::move(replacement);
+            it->second.connected = true;
+        } else {
+            it->second.connected = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
+    if (!delivered)
+        return false;
 
     // Unpack response
     memset(&resp, 0, sizeof(resp));
@@ -2150,7 +2192,10 @@ RDMACalibrationResult DistributedRDMATransport::calibrate_node(uint32_t dst_node
         RDMARequest req;
         memset(&req, 0, sizeof(req));
         req.op_type = RDMA_OP_READ;
-        req.addr = 0;
+        // Use the first valid byte of this peer's global range. Address zero is
+        // only valid on node 0 and caused every other peer to log 1000 failed
+        // backing-memory reads during calibration.
+        req.addr = it->second.remote_addr;
         req.size = 1;
 
         RDMAResponse resp;
@@ -2246,9 +2291,12 @@ RDMACalibrationResult DistributedRDMATransport::get_aggregate_calibration() cons
 
 void DistributedRDMATransport::accept_loop() {
     while (running_) {
-        if (server_->accept_connection() == 0) {
+        auto client = server_->accept_connection();
+        if (client) {
             SPDLOG_INFO("RDMA transport accepted incoming connection");
-            server_->handle_client();
+            std::lock_guard<std::mutex> lock(incoming_mutex_);
+            incoming_connections_.push_back(client);
+            incoming_threads_.emplace_back([this, client]() { server_->handle_client(client); });
         }
     }
 }
@@ -2270,6 +2318,46 @@ bool DistributedMemoryServer::initialize_rdma_transport() {
         rdma_transport_.reset();
         return false;
     }
+
+    // RDMAServer's fallback callback returns a synthetic success response.
+    // Distributed mode needs incoming READ/WRITE requests to operate on this
+    // node's local backing memory so that remote data is actually persistent.
+    rdma_transport_->set_message_handler([this](const RDMAMessage &request, RDMAMessage &response) {
+        memset(&response, 0, sizeof(response));
+
+        const RDMARequest &req = request.request;
+        RDMAResponse &resp = response.response;
+        const size_t size = std::min<size_t>(req.size, RDMA_CACHELINE_SIZE);
+
+        if (size == 0 || req.size > RDMA_CACHELINE_SIZE) {
+            resp.status = 1;
+            return;
+        }
+
+        switch (req.op_type) {
+        case RDMA_OP_READ:
+            if (local_memory_->read_cacheline(req.addr, resp.data, size)) {
+                resp.status = 0;
+                resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency);
+                local_reads_++;
+            } else {
+                resp.status = 1;
+            }
+            break;
+        case RDMA_OP_WRITE:
+            if (local_memory_->write_cacheline(req.addr, req.data, size)) {
+                resp.status = 0;
+                resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency) + 50;
+                local_writes_++;
+            } else {
+                resp.status = 1;
+            }
+            break;
+        default:
+            resp.status = 1;
+            break;
+        }
+    });
 
     SPDLOG_INFO("RDMA transport initialized on {}:{}", tcp_addr_, tcp_transport_port_ + 1000);
 
@@ -2310,13 +2398,6 @@ bool DistributedMemoryServer::connect_rdma_node(uint32_t node_id, const std::str
         return false;
     }
 
-    if (!rdma_transport_->connect_to_node(node_id, addr, port)) {
-        SPDLOG_ERROR("Failed to connect RDMA to node {} at {}:{}", node_id, addr, port);
-        return false;
-    }
-
-    SPDLOG_INFO("RDMA connected to node {} at {}:{}", node_id, addr, port);
-
     // Create virtual endpoint for the remote node
     uint64_t peer_capacity = memory_capacity_mb_ * 1024ULL * 1024ULL;
     uint64_t peer_base_addr = node_id * peer_capacity;
@@ -2329,6 +2410,13 @@ bool DistributedMemoryServer::connect_rdma_node(uint32_t node_id, const std::str
             peer_capacity = it->second.memory_size;
         }
     }
+
+    if (!rdma_transport_->connect_to_node(node_id, addr, port, peer_base_addr, peer_capacity)) {
+        SPDLOG_ERROR("Failed to connect RDMA to node {} at {}:{}", node_id, addr, port);
+        return false;
+    }
+
+    SPDLOG_INFO("RDMA connected to node {} at {}:{}", node_id, addr, port);
 
     FabricLinkConfig link_cfg{50.0, 50.0, 64}; // 50ns hop, 50GB/s, 64 credits (RDMA advantage)
     auto *remote = controller_->add_remote_endpoint(node_id, peer_base_addr, peer_capacity, link_cfg);
