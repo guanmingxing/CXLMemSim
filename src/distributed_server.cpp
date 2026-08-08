@@ -60,7 +60,10 @@ static constexpr uint8_t DIST_OP_LSA_WRITE = 7;
 static constexpr uint8_t DIST_OP_BULK_READ = 8;
 static constexpr uint8_t DIST_OP_BULK_WRITE = 9;
 static constexpr uint64_t DIST_MAX_BULK_SIZE = 64ULL * 1024 * 1024;
-static constexpr uint64_t DIST_MAX_LSA_SIZE = 64ULL * 1024 * 1024;
+// A vLLM worker may address the full configured per-rank offload pool (255 MiB
+// in the 70B benchmark). Keep a finite guard against hostile sparse writes,
+// while leaving headroom for legitimate distributed-memory workloads.
+static constexpr uint64_t DIST_MAX_LSA_SIZE = 1ULL * 1024 * 1024 * 1024;
 
 namespace {
 
