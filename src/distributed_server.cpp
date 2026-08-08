@@ -60,6 +60,7 @@ static constexpr uint8_t DIST_OP_LSA_WRITE = 7;
 static constexpr uint8_t DIST_OP_BULK_READ = 8;
 static constexpr uint8_t DIST_OP_BULK_WRITE = 9;
 static constexpr uint64_t DIST_MAX_BULK_SIZE = 64ULL * 1024 * 1024;
+static constexpr uint64_t DIST_MAX_LSA_SIZE = 64ULL * 1024 * 1024;
 
 namespace {
 
@@ -1324,7 +1325,7 @@ void DistributedMemoryServer::fence() {
 
 int DistributedMemoryServer::lsa_read(uint64_t offset, void *data, size_t size) {
     std::lock_guard<std::mutex> lock(lsa_mutex_);
-    if (offset + size > lsa_size_) {
+    if (!data || size == 0 || offset > lsa_size_ || size > lsa_size_ - offset) {
         SPDLOG_ERROR("Node {} LSA read out of bounds: offset=0x{:x} size={} lsa_size={}", node_id_, offset, size,
                      lsa_size_);
         return -1;
@@ -1335,12 +1336,17 @@ int DistributedMemoryServer::lsa_read(uint64_t offset, void *data, size_t size) 
 
 int DistributedMemoryServer::lsa_write(uint64_t offset, const void *data, size_t size) {
     std::lock_guard<std::mutex> lock(lsa_mutex_);
-    if (offset + size > lsa_size_) {
+    if (!data || size == 0 || offset > DIST_MAX_LSA_SIZE || size > DIST_MAX_LSA_SIZE - offset) {
+        SPDLOG_WARN("Node {} rejected LSA write: offset=0x{:x} size={} max={}", node_id_, offset, size,
+                    DIST_MAX_LSA_SIZE);
+        return -1;
+    }
+    const size_t required_size = static_cast<size_t>(offset + size);
+    if (required_size > lsa_size_) {
         /* Auto-grow LSA if needed */
-        size_t new_size = offset + size;
-        SPDLOG_INFO("Node {} growing LSA from {} to {} bytes", node_id_, lsa_size_, new_size);
-        lsa_data_.resize(new_size, 0);
-        lsa_size_ = new_size;
+        SPDLOG_INFO("Node {} growing LSA from {} to {} bytes", node_id_, lsa_size_, required_size);
+        lsa_data_.resize(required_size, 0);
+        lsa_size_ = required_size;
     }
     memcpy(lsa_data_.data() + offset, data, size);
     return 0;
