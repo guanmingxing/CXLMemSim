@@ -7,12 +7,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <utility>
@@ -421,6 +423,16 @@ bool SsdStreamingBackend::submit_io_uring_rw(uint8_t opcode, uint8_t *buffer, of
 }
 
 bool SsdStreamingBackend::read_page(uint8_t *dst, off_t offset) {
+    if (config_.backing_latency_ns) {
+        /*
+         * Model async backing-store read latency: sleep rather than spin so the
+         * CPU is released for compute during the transfer, as a real io_uring
+         * DMA / CXL backing read would be. The metadata mutex is already dropped
+         * by the caller, so a concurrent prefetch overlaps foreground compute.
+         */
+        std::this_thread::sleep_for(
+            std::chrono::nanoseconds(config_.backing_latency_ns));
+    }
 #ifdef __linux__
     if (io_uring_enabled_) {
         std::lock_guard<std::mutex> io_lock(io_mutex_);
@@ -740,6 +752,17 @@ bool SsdStreamingBackend::read(uint64_t addr, uint8_t *dst, size_t size) {
         PagePtr page = pages_.at(page_no);
         memcpy(dst + copied, page->data.get() + offset, chunk);
         copied += chunk;
+
+        /*
+         * Scan-resistant streaming: a set_streaming()-hinted page is a
+         * use-once weight-scan page, so drop it immediately after it is
+         * served instead of letting it linger and evict hot/reused pages
+         * (KV cache, shared weights). Only clean, unreferenced pages.
+         */
+        if (page->streaming && !page->dirty && page->refcnt == 0 &&
+            page->state == SsdPageState::ResidentClean) {
+            evict_page_locked(page_no, lock);
+        }
     }
 
     stats_.reads++;
