@@ -57,8 +57,39 @@ static constexpr uint8_t DIST_OP_ATOMIC_CAS = 4;
 static constexpr uint8_t DIST_OP_FENCE = 5;
 static constexpr uint8_t DIST_OP_LSA_READ = 6;
 static constexpr uint8_t DIST_OP_LSA_WRITE = 7;
+static constexpr uint8_t DIST_OP_BULK_READ = 8;
+static constexpr uint8_t DIST_OP_BULK_WRITE = 9;
+static constexpr uint64_t DIST_MAX_BULK_SIZE = 64ULL * 1024 * 1024;
 
 namespace {
+
+bool recv_full_fd(int fd, void *buffer, size_t size) {
+    auto *cursor = static_cast<uint8_t *>(buffer);
+    while (size > 0) {
+        ssize_t received = recv(fd, cursor, size, 0);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
+            return false;
+        cursor += received;
+        size -= static_cast<size_t>(received);
+    }
+    return true;
+}
+
+bool send_full_fd(int fd, const void *buffer, size_t size) {
+    const auto *cursor = static_cast<const uint8_t *>(buffer);
+    while (size > 0) {
+        ssize_t sent = send(fd, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent <= 0)
+            return false;
+        cursor += sent;
+        size -= static_cast<size_t>(sent);
+    }
+    return true;
+}
 
 std::string expand_node_backing_path(std::string path, uint32_t node_id) {
     constexpr const char *kNodeToken = "{node}";
@@ -905,7 +936,7 @@ void DistributedMemoryServer::handle_atomic_request(const dist_message_t &req, d
         ok = local_memory_->atomic_fetch_add_uint64(addr, req.payload.mem.value, &old_value);
     } else {
         ok = local_memory_->atomic_compare_exchange_uint64(addr, req.payload.mem.expected, req.payload.mem.value,
-                                                          &old_value);
+                                                           &old_value);
     }
 
     if (!ok) {
@@ -1079,6 +1110,72 @@ int DistributedMemoryServer::write(uint64_t addr, const void *data, size_t size,
         return forward_write_tcp(target_node, addr, data, size, latency_ns);
     }
     return forward_write(target_node, addr, data, size, latency_ns);
+}
+
+int DistributedMemoryServer::read_bulk(uint64_t addr, void *data, size_t size, uint64_t *latency_ns) {
+    if (!data || size == 0 || addr > UINT64_MAX - (size - 1))
+        return -1;
+    const uint32_t target_node = get_node_for_address(addr);
+    if (get_node_for_address(addr + size - 1) != target_node)
+        return -1;
+
+    if (target_node == node_id_ || target_node == UINT32_MAX) {
+        if (!local_memory_->read_range(addr, static_cast<uint8_t *>(data), size))
+            return -1;
+        local_reads_++;
+        *latency_ns = static_cast<uint64_t>(controller_->dramlatency);
+        return 0;
+    }
+    if (transport_mode_ != DistTransportMode::RDMA || !rdma_transport_ || !rdma_transport_->is_connected(target_node))
+        return -1;
+
+    auto *cursor = static_cast<uint8_t *>(data);
+    uint64_t total_latency = 0;
+    for (size_t offset = 0; offset < size; offset += RDMA_BUFFER_SIZE) {
+        const size_t chunk = std::min<size_t>(RDMA_BUFFER_SIZE, size - offset);
+        const auto start = std::chrono::steady_clock::now();
+        if (!rdma_transport_->rdma_read(target_node, addr + offset, cursor + offset, chunk))
+            return -1;
+        total_latency +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        remote_reads_++;
+        forwarded_requests_++;
+    }
+    *latency_ns = total_latency;
+    return 0;
+}
+
+int DistributedMemoryServer::write_bulk(uint64_t addr, const void *data, size_t size, uint64_t *latency_ns) {
+    if (!data || size == 0 || addr > UINT64_MAX - (size - 1))
+        return -1;
+    const uint32_t target_node = get_node_for_address(addr);
+    if (get_node_for_address(addr + size - 1) != target_node)
+        return -1;
+
+    if (target_node == node_id_ || target_node == UINT32_MAX) {
+        if (!local_memory_->write_range(addr, static_cast<const uint8_t *>(data), size))
+            return -1;
+        local_writes_++;
+        *latency_ns = static_cast<uint64_t>(controller_->dramlatency) + 50;
+        return 0;
+    }
+    if (transport_mode_ != DistTransportMode::RDMA || !rdma_transport_ || !rdma_transport_->is_connected(target_node))
+        return -1;
+
+    const auto *cursor = static_cast<const uint8_t *>(data);
+    uint64_t total_latency = 0;
+    for (size_t offset = 0; offset < size; offset += RDMA_BUFFER_SIZE) {
+        const size_t chunk = std::min<size_t>(RDMA_BUFFER_SIZE, size - offset);
+        const auto start = std::chrono::steady_clock::now();
+        if (!rdma_transport_->rdma_write(target_node, addr + offset, cursor + offset, chunk))
+            return -1;
+        total_latency +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        remote_writes_++;
+        forwarded_requests_++;
+    }
+    *latency_ns = total_latency;
+    return 0;
 }
 
 int DistributedMemoryServer::forward_read(uint32_t target_node, uint64_t addr, void *data, size_t size,
@@ -1990,7 +2087,7 @@ void DistributedRDMATransport::shutdown() {
 }
 
 bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port,
-                                              uint64_t remote_addr, size_t remote_buffer_size) {
+                                               uint64_t remote_addr, size_t remote_buffer_size) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
 
     auto it = connections_.find(node_id);
@@ -2327,16 +2424,16 @@ bool DistributedMemoryServer::initialize_rdma_transport() {
 
         const RDMARequest &req = request.request;
         RDMAResponse &resp = response.response;
-        const size_t size = std::min<size_t>(req.size, RDMA_CACHELINE_SIZE);
+        const size_t size = std::min<size_t>(req.size, RDMA_BUFFER_SIZE);
 
-        if (size == 0 || req.size > RDMA_CACHELINE_SIZE) {
+        if (size == 0 || req.size > RDMA_BUFFER_SIZE) {
             resp.status = 1;
             return;
         }
 
         switch (req.op_type) {
         case RDMA_OP_READ:
-            if (local_memory_->read_cacheline(req.addr, resp.data, size)) {
+            if (local_memory_->read_range(req.addr, resp.data, size)) {
                 resp.status = 0;
                 resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency);
                 local_reads_++;
@@ -2345,7 +2442,7 @@ bool DistributedMemoryServer::initialize_rdma_transport() {
             }
             break;
         case RDMA_OP_WRITE:
-            if (local_memory_->write_cacheline(req.addr, req.data, size)) {
+            if (local_memory_->write_range(req.addr, req.data, size)) {
                 resp.status = 0;
                 resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency) + 50;
                 local_writes_++;
@@ -2926,6 +3023,7 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
 
         DistServerResponse resp;
         memset(&resp, 0, sizeof(resp));
+        std::vector<uint8_t> bulk_response;
 
         // Handle the request using distributed read/write (with proper forwarding)
         switch (req.op_type) {
@@ -2989,6 +3087,38 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
             break;
         }
 
+        case DIST_OP_BULK_READ: {
+            if (req.size == 0 || req.size > DIST_MAX_BULK_SIZE || req.addr > UINT64_MAX - (req.size - 1)) {
+                resp.status = 1;
+                break;
+            }
+            bulk_response.resize(static_cast<size_t>(req.size));
+            uint64_t latency_ns = 0;
+            int ret = read_bulk(req.addr, bulk_response.data(), bulk_response.size(), &latency_ns);
+            resp.status = ret == 0 ? 0 : 1;
+            resp.latency_ns = latency_ns;
+            if (ret != 0)
+                bulk_response.clear();
+            break;
+        }
+
+        case DIST_OP_BULK_WRITE: {
+            if (req.size == 0 || req.size > DIST_MAX_BULK_SIZE || req.addr > UINT64_MAX - (req.size - 1)) {
+                resp.status = 1;
+                break;
+            }
+            std::vector<uint8_t> payload(static_cast<size_t>(req.size));
+            if (!recv_full_fd(client_fd, payload.data(), payload.size())) {
+                resp.status = 1;
+                break;
+            }
+            uint64_t latency_ns = 0;
+            int ret = write_bulk(req.addr, payload.data(), payload.size(), &latency_ns);
+            resp.status = ret == 0 ? 0 : 1;
+            resp.latency_ns = latency_ns;
+            break;
+        }
+
         case DIST_OP_GET_SHM_INFO: {
             // Return shared memory info
             auto shm_info = local_memory_->get_shm_info();
@@ -3007,7 +3137,8 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
         }
 
         // Send response
-        if (send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL) != sizeof(resp)) {
+        if (!send_full_fd(client_fd, &resp, sizeof(resp)) ||
+            (!bulk_response.empty() && !send_full_fd(client_fd, bulk_response.data(), bulk_response.size()))) {
             if (running_) {
                 SPDLOG_ERROR("Node {} client {}: Failed to send response: {}", node_id_, client_id, strerror(errno));
             }

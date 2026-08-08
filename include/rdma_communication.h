@@ -13,7 +13,7 @@
 #include <rdma/rdma_cma.h>
 #endif
 
-#define RDMA_BUFFER_SIZE 4096
+#define RDMA_BUFFER_SIZE (64 * 1024)
 #define RDMA_CQ_SIZE 1024
 #define RDMA_MAX_WR 512
 #define RDMA_CACHELINE_SIZE 64
@@ -27,14 +27,14 @@ struct RDMARequest {
     uint64_t timestamp;
     uint8_t host_id;
     uint64_t virtual_addr;
-    uint8_t data[RDMA_CACHELINE_SIZE];
+    uint8_t data[RDMA_BUFFER_SIZE];
 } __attribute__((packed));
 
 struct RDMAResponse {
     uint8_t status;
     uint64_t latency_ns;
     uint8_t cache_state;
-    uint8_t data[RDMA_CACHELINE_SIZE];
+    uint8_t data[RDMA_BUFFER_SIZE];
 } __attribute__((packed));
 
 struct RDMAMessage {

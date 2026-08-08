@@ -316,8 +316,8 @@ typedef struct {
 #include <unordered_map>
 
 /* TCP transport support */
-#include "tcp_communication.h"
 #include "shared_memory_manager.h"
+#include "tcp_communication.h"
 
 /* RDMA transport support */
 #include "rdma_communication.h"
@@ -776,6 +776,8 @@ public:
     /* Memory operations (may be forwarded to remote nodes) */
     int read(uint64_t addr, void *data, size_t size, uint64_t *latency_ns);
     int write(uint64_t addr, const void *data, size_t size, uint64_t *latency_ns);
+    int read_bulk(uint64_t addr, void *data, size_t size, uint64_t *latency_ns);
+    int write_bulk(uint64_t addr, const void *data, size_t size, uint64_t *latency_ns);
     int atomic_faa(uint64_t addr, uint64_t value, uint64_t *old_value);
     int atomic_cas(uint64_t addr, uint64_t expected, uint64_t desired, uint64_t *old_value);
     void fence();

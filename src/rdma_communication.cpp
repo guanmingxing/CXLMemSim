@@ -59,7 +59,10 @@ int RDMAConnection::setup_connection_resources() {
 }
 
 int RDMAConnection::register_memory_region() {
-    conn_info_.buffer_size = RDMA_BUFFER_SIZE * sizeof(RDMAMessage);
+    // Requests are serialized and use one send plus one receive buffer.  The
+    // old allocation multiplied the message size by RDMA_BUFFER_SIZE even
+    // though only two slots were ever addressed.
+    conn_info_.buffer_size = 2 * sizeof(RDMAMessage);
     conn_info_.buffer = malloc(conn_info_.buffer_size);
     if (!conn_info_.buffer) {
         std::cerr << "Failed to allocate buffer" << std::endl;

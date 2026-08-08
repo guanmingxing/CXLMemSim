@@ -11,10 +11,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdexcept>
-#include <type_traits>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <type_traits>
 #include <unistd.h>
 
 #ifdef CXLMEMSIM_HAS_SSD_STREAMING_BACKEND
@@ -224,9 +224,9 @@ bool SharedMemoryManager::create_ssd_streaming_backend() {
 
         SPDLOG_INFO("SSD streaming backend initialized: path={} capacity={} page={} chunk={} cache_pages={} "
                     "read_ahead_pages={} io_uring={} odirect={}",
-                    ssd_config.backing_path, ssd_config.capacity_bytes, ssd_config.page_size,
-                    ssd_config.io_chunk_size, ssd_config.cache_pages, ssd_config.read_ahead_pages,
-                    ssd_config.use_io_uring, ssd_config.use_odirect);
+                    ssd_config.backing_path, ssd_config.capacity_bytes, ssd_config.page_size, ssd_config.io_chunk_size,
+                    ssd_config.cache_pages, ssd_config.read_ahead_pages, ssd_config.use_io_uring,
+                    ssd_config.use_odirect);
         return true;
     } catch (const std::exception &e) {
         SPDLOG_ERROR("Exception while initializing SSD streaming backend: {}", e.what());
@@ -607,6 +607,55 @@ bool SharedMemoryManager::write_cacheline(uint64_t addr, const uint8_t *data, si
     return true;
 }
 
+bool SharedMemoryManager::read_range(uint64_t addr, uint8_t *buffer, size_t size) {
+    if (!header || !buffer || size == 0)
+        return false;
+    const uint64_t capacity = header->num_cachelines * SHM_CACHELINE_SIZE;
+    const uint64_t base = header->base_addr;
+    if (capacity == 0 || (base != 0 && addr < base))
+        return false;
+    const uint64_t offset = base == 0 ? addr % capacity : addr - base;
+    if (offset > capacity || size > capacity - offset)
+        return false;
+
+    if (backing_mode == BackingMode::SsdStream) {
+#ifdef CXLMEMSIM_HAS_SSD_STREAMING_BACKEND
+        return ssd_backend && call_backend_bool([&]() { return ssd_backend->read(offset, buffer, size); });
+#else
+        return false;
+#endif
+    }
+    if (!data_area)
+        return false;
+    memcpy(buffer, data_area + offset, size);
+    return true;
+}
+
+bool SharedMemoryManager::write_range(uint64_t addr, const uint8_t *data, size_t size) {
+    if (!header || !data || size == 0)
+        return false;
+    const uint64_t capacity = header->num_cachelines * SHM_CACHELINE_SIZE;
+    const uint64_t base = header->base_addr;
+    if (capacity == 0 || (base != 0 && addr < base))
+        return false;
+    const uint64_t offset = base == 0 ? addr % capacity : addr - base;
+    if (offset > capacity || size > capacity - offset)
+        return false;
+
+    if (backing_mode == BackingMode::SsdStream) {
+#ifdef CXLMEMSIM_HAS_SSD_STREAMING_BACKEND
+        return ssd_backend && call_backend_bool([&]() { return ssd_backend->write(offset, data, size); });
+#else
+        return false;
+#endif
+    }
+    if (!data_area)
+        return false;
+    memcpy(data_area + offset, data, size);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return true;
+}
+
 bool SharedMemoryManager::atomic_fetch_add_uint64(uint64_t addr, uint64_t value, uint64_t *old_value) {
     if (!old_value) {
         return false;
@@ -640,7 +689,7 @@ bool SharedMemoryManager::atomic_fetch_add_uint64(uint64_t addr, uint64_t value,
 }
 
 bool SharedMemoryManager::atomic_compare_exchange_uint64(uint64_t addr, uint64_t expected, uint64_t desired,
-                                                        uint64_t *old_value) {
+                                                         uint64_t *old_value) {
     if (!old_value) {
         return false;
     }
