@@ -143,6 +143,8 @@ public:
     uint8_t *get_cacheline_data(uint64_t cacheline_addr);
     bool read_cacheline(uint64_t addr, uint8_t *buffer, size_t size);
     bool write_cacheline(uint64_t addr, const uint8_t *data, size_t size);
+    bool read_range(uint64_t addr, uint8_t *buffer, size_t size);
+    bool write_range(uint64_t addr, const uint8_t *data, size_t size);
     bool atomic_fetch_add_uint64(uint64_t addr, uint64_t value, uint64_t *old_value);
     bool atomic_compare_exchange_uint64(uint64_t addr, uint64_t expected, uint64_t desired, uint64_t *old_value);
     bool flush();

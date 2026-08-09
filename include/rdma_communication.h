@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -12,7 +13,7 @@
 #include <rdma/rdma_cma.h>
 #endif
 
-#define RDMA_BUFFER_SIZE 4096
+#define RDMA_BUFFER_SIZE (64 * 1024)
 #define RDMA_CQ_SIZE 1024
 #define RDMA_MAX_WR 512
 #define RDMA_CACHELINE_SIZE 64
@@ -26,14 +27,14 @@ struct RDMARequest {
     uint64_t timestamp;
     uint8_t host_id;
     uint64_t virtual_addr;
-    uint8_t data[RDMA_CACHELINE_SIZE];
+    uint8_t data[RDMA_BUFFER_SIZE];
 } __attribute__((packed));
 
 struct RDMAResponse {
     uint8_t status;
     uint64_t latency_ns;
     uint8_t cache_state;
-    uint8_t data[RDMA_CACHELINE_SIZE];
+    uint8_t data[RDMA_BUFFER_SIZE];
 } __attribute__((packed));
 
 struct RDMAMessage {
@@ -83,9 +84,13 @@ public:
     RDMAConnection();
     virtual ~RDMAConnection();
 
+#ifdef HAS_RDMA
+    int accept_cm_id(struct rdma_cm_id *id);
+#endif
+    void mark_connected();
     void set_message_handler(MessageHandler handler) { message_handler_ = handler; }
     int send_message(const RDMAMessage &msg);
-    int receive_message(RDMAMessage &msg);
+    int receive_message(RDMAMessage &msg, int timeout_ms = -1);
     bool is_connected() const { return connected_.load(); }
     void disconnect();
 };
@@ -96,6 +101,7 @@ private:
     uint16_t port_;
 #ifdef HAS_RDMA
     struct rdma_cm_id *listen_id_;
+    std::map<struct rdma_cm_id *, std::shared_ptr<RDMAConnection>> pending_connections_;
 #endif
 
 public:
@@ -103,8 +109,8 @@ public:
     ~RDMAServer();
 
     int start();
-    int accept_connection();
-    void handle_client();
+    std::shared_ptr<RDMAConnection> accept_connection();
+    void handle_client(const std::shared_ptr<RDMAConnection> &client);
     void stop();
 };
 

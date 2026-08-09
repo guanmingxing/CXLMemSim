@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <poll.h>
 #include <thread>
 #include <unistd.h>
 
@@ -58,7 +59,10 @@ int RDMAConnection::setup_connection_resources() {
 }
 
 int RDMAConnection::register_memory_region() {
-    conn_info_.buffer_size = RDMA_BUFFER_SIZE * sizeof(RDMAMessage);
+    // Requests are serialized and use one send plus one receive buffer.  The
+    // old allocation multiplied the message size by RDMA_BUFFER_SIZE even
+    // though only two slots were ever addressed.
+    conn_info_.buffer_size = 2 * sizeof(RDMAMessage);
     conn_info_.buffer = malloc(conn_info_.buffer_size);
     if (!conn_info_.buffer) {
         std::cerr << "Failed to allocate buffer" << std::endl;
@@ -97,13 +101,17 @@ int RDMAConnection::setup_qp_parameters(struct ibv_qp_init_attr &qp_attr) {
 int RDMAConnection::post_receive() {
     struct ibv_recv_wr wr, *bad_wr = nullptr;
     struct ibv_sge sge;
+    // Keep receive storage disjoint from the send WR. Reusing a buffer that is
+    // still owned by the receive queue eventually drives Soft-RoCE QPs into
+    // WR_FLUSH_ERR/RETRY_EXC_ERR under a sustained request stream.
+    void *recv_buffer = static_cast<char *>(conn_info_.buffer) + sizeof(RDMAMessage);
 
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = reinterpret_cast<uintptr_t>(conn_info_.buffer);
+    wr.wr_id = reinterpret_cast<uintptr_t>(recv_buffer);
     wr.sg_list = &sge;
     wr.num_sge = 1;
 
-    sge.addr = reinterpret_cast<uintptr_t>(conn_info_.buffer);
+    sge.addr = reinterpret_cast<uintptr_t>(recv_buffer);
     sge.length = sizeof(RDMAMessage);
     sge.lkey = conn_info_.mr->lkey;
 
@@ -118,17 +126,18 @@ int RDMAConnection::post_receive() {
 int RDMAConnection::post_send(const RDMAMessage *msg) {
     struct ibv_send_wr wr, *bad_wr = nullptr;
     struct ibv_sge sge;
+    void *send_buffer = conn_info_.buffer;
 
-    memcpy(conn_info_.buffer, msg, sizeof(RDMAMessage));
+    memcpy(send_buffer, msg, sizeof(RDMAMessage));
 
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = reinterpret_cast<uintptr_t>(conn_info_.buffer);
+    wr.wr_id = reinterpret_cast<uintptr_t>(send_buffer);
     wr.opcode = IBV_WR_SEND;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.send_flags = IBV_SEND_SIGNALED;
 
-    sge.addr = reinterpret_cast<uintptr_t>(conn_info_.buffer);
+    sge.addr = reinterpret_cast<uintptr_t>(send_buffer);
     sge.length = sizeof(RDMAMessage);
     sge.lkey = conn_info_.mr->lkey;
 
@@ -139,8 +148,18 @@ int RDMAConnection::post_send(const RDMAMessage *msg) {
 
     struct ibv_wc wc;
     int ne;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
+        if (!connected_)
+            return -1;
         ne = ibv_poll_cq(conn_info_.send_cq, 1, &wc);
+        if (ne == 0)
+            std::this_thread::yield();
+        if (ne == 0 && std::chrono::steady_clock::now() >= deadline) {
+            std::cerr << "Send completion timed out" << std::endl;
+            disconnect();
+            return -1;
+        }
     } while (ne == 0);
 
     if (ne < 0 || wc.status != IBV_WC_SUCCESS) {
@@ -211,16 +230,47 @@ int RDMAConnection::send_message(const RDMAMessage &msg) {
 #endif
 }
 
-int RDMAConnection::receive_message(RDMAMessage &msg) {
+int RDMAConnection::receive_message(RDMAMessage &msg, int timeout_ms) {
     if (!connected_)
         return -1;
 #ifdef HAS_RDMA
     struct ibv_wc wc;
     int ne;
+    const auto deadline = timeout_ms < 0 ? std::chrono::steady_clock::time_point::max()
+                                         : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-    do {
+    while (connected_) {
         ne = ibv_poll_cq(conn_info_.recv_cq, 1, &wc);
-    } while (ne == 0);
+        if (ne != 0)
+            break;
+
+        // Wait for a completion-channel event rather than burning one CPU per
+        // idle inbound peer. The bounded poll also lets disconnect() stop the
+        // handler promptly during shutdown.
+        struct pollfd pfd;
+        pfd.fd = conn_info_.comp_channel->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ready = poll(&pfd, 1, 100);
+        if (!connected_)
+            return -1;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::cerr << "Receive completion timed out" << std::endl;
+            disconnect();
+            return -1;
+        }
+        if (ready > 0) {
+            struct ibv_cq *event_cq = nullptr;
+            void *event_context = nullptr;
+            if (ibv_get_cq_event(conn_info_.comp_channel, &event_cq, &event_context) == 0) {
+                ibv_ack_cq_events(event_cq, 1);
+                if (ibv_req_notify_cq(event_cq, 0))
+                    return -1;
+            }
+        } else if (ready < 0) {
+            return -1;
+        }
+    }
 
     if (ne < 0 || wc.status != IBV_WC_SUCCESS) {
         std::cerr << "Receive failed with status: " << wc.status << std::endl;
@@ -244,6 +294,52 @@ void RDMAConnection::disconnect() {
         rdma_disconnect(cm_id_);
     }
 #endif
+}
+
+#ifdef HAS_RDMA
+int RDMAConnection::accept_cm_id(struct rdma_cm_id *id) {
+    cm_id_ = id;
+    conn_info_.context = cm_id_->verbs;
+
+    if (setup_connection_resources() < 0)
+        return -1;
+
+    struct ibv_qp_init_attr qp_attr;
+    setup_qp_parameters(qp_attr);
+    if (rdma_create_qp(cm_id_, conn_info_.pd, &qp_attr)) {
+        std::cerr << "Failed to create accepted QP" << std::endl;
+        return -1;
+    }
+    conn_info_.qp = cm_id_->qp;
+
+    // Requests are strictly serialized per connection. One posted receive is
+    // sufficient and receive_message() reposts it after each completion.
+    if (post_receive() < 0)
+        return -1;
+
+    struct rdma_conn_param conn_param;
+    memset(&conn_param, 0, sizeof(conn_param));
+    conn_param.initiator_depth = 1;
+    conn_param.responder_resources = 1;
+    // Soft-RoCE runs RC over UDP/IP and can see transient packet loss or an
+    // RNR window under synchronized load. Zero (the memset default) makes the
+    // QP fatal on the first retry; use the maximum retry budget instead.
+    conn_param.retry_count = 7;
+    conn_param.rnr_retry_count = 7;
+    if (rdma_accept(cm_id_, &conn_param)) {
+        std::cerr << "Failed to accept connection" << std::endl;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+void RDMAConnection::mark_connected() {
+#ifdef HAS_RDMA
+    conn_info_.connected = true;
+#endif
+    connected_ = true;
+    running_ = true;
 }
 
 // ---- RDMAServer ----
@@ -293,7 +389,9 @@ int RDMAServer::start() {
         return -1;
     }
 
-    if (rdma_listen(listen_id_, 10)) {
+    // A 16-node full mesh creates 15 simultaneous inbound connections per
+    // server. Leave headroom for connection bursts and reconnects.
+    if (rdma_listen(listen_id_, 64)) {
         std::cerr << "Failed to listen on RDMA" << std::endl;
         return -1;
     }
@@ -307,79 +405,71 @@ int RDMAServer::start() {
 #endif
 }
 
-int RDMAServer::accept_connection() {
+std::shared_ptr<RDMAConnection> RDMAServer::accept_connection() {
 #ifdef HAS_RDMA
-    struct rdma_cm_event *event = nullptr;
-
-    if (rdma_get_cm_event(event_channel_, &event)) {
-        std::cerr << "Failed to get CM event" << std::endl;
-        return -1;
-    }
-
-    if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-        cm_id_ = event->id;
-        conn_info_.context = cm_id_->verbs;
-
-        if (setup_connection_resources() < 0) {
-            rdma_ack_cm_event(event);
-            return -1;
+    while (running_) {
+        struct pollfd pfd;
+        pfd.fd = event_channel_->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ready = poll(&pfd, 1, 200);
+        if (ready == 0)
+            return nullptr;
+        if (ready < 0) {
+            if (running_)
+                std::cerr << "Failed to poll RDMA CM event channel" << std::endl;
+            return nullptr;
         }
 
-        struct ibv_qp_init_attr qp_attr;
-        setup_qp_parameters(qp_attr);
-
-        if (rdma_create_qp(cm_id_, conn_info_.pd, &qp_attr)) {
-            std::cerr << "Failed to create QP" << std::endl;
-            rdma_ack_cm_event(event);
-            return -1;
+        struct rdma_cm_event *event = nullptr;
+        if (rdma_get_cm_event(event_channel_, &event)) {
+            if (running_)
+                std::cerr << "Failed to get CM event" << std::endl;
+            return nullptr;
         }
 
-        conn_info_.qp = cm_id_->qp;
+        const auto event_type = event->event;
+        struct rdma_cm_id *event_id = event->id;
 
-        for (int i = 0; i < RDMA_MAX_WR; i++) {
-            if (post_receive() < 0) {
-                break;
+        if (event_type == RDMA_CM_EVENT_CONNECT_REQUEST) {
+            auto client = std::make_shared<RDMAConnection>();
+            client->set_message_handler(message_handler_);
+            if (client->accept_cm_id(event_id) == 0)
+                pending_connections_[event_id] = client;
+            rdma_ack_cm_event(event);
+            continue;
+        }
+
+        if (event_type == RDMA_CM_EVENT_ESTABLISHED) {
+            auto it = pending_connections_.find(event_id);
+            if (it != pending_connections_.end()) {
+                auto client = it->second;
+                pending_connections_.erase(it);
+                client->mark_connected();
+                rdma_ack_cm_event(event);
+                std::cout << "RDMA connection established" << std::endl;
+                return client;
             }
         }
 
-        struct rdma_conn_param conn_param;
-        memset(&conn_param, 0, sizeof(conn_param));
-        conn_param.initiator_depth = 1;
-        conn_param.responder_resources = 1;
+        if (event_type == RDMA_CM_EVENT_REJECTED || event_type == RDMA_CM_EVENT_DISCONNECTED ||
+            event_type == RDMA_CM_EVENT_CONNECT_ERROR)
+            pending_connections_.erase(event_id);
 
-        if (rdma_accept(cm_id_, &conn_param)) {
-            std::cerr << "Failed to accept connection" << std::endl;
-            rdma_ack_cm_event(event);
-            return -1;
-        }
+        rdma_ack_cm_event(event);
     }
-
-    rdma_ack_cm_event(event);
-
-    if (rdma_get_cm_event(event_channel_, &event)) {
-        return -1;
-    }
-
-    if (event->event == RDMA_CM_EVENT_ESTABLISHED) {
-        conn_info_.connected = true;
-        connected_ = true;
-        std::cout << "RDMA connection established" << std::endl;
-    }
-
-    rdma_ack_cm_event(event);
-    return 0;
+    return nullptr;
 #else
-    return -1;
+    return nullptr;
 #endif
 }
 
-void RDMAServer::handle_client() {
-    while (running_ && connected_) {
+void RDMAServer::handle_client(const std::shared_ptr<RDMAConnection> &client) {
+    while (running_ && client && client->is_connected()) {
         RDMAMessage recv_msg, send_msg;
 
-        if (receive_message(recv_msg) < 0) {
+        if (client->receive_message(recv_msg) < 0)
             break;
-        }
 
         if (message_handler_) {
             message_handler_(recv_msg, send_msg);
@@ -388,12 +478,12 @@ void RDMAServer::handle_client() {
             send_msg.response.latency_ns = 100;
         }
 
-        if (send_message(send_msg) < 0) {
+        if (client->send_message(send_msg) < 0)
             break;
-        }
     }
 
-    connected_ = false;
+    if (client)
+        client->disconnect();
 }
 
 void RDMAServer::stop() {
@@ -461,11 +551,11 @@ int RDMAClient::connect() {
 
     conn_info_.qp = cm_id_->qp;
 
-    for (int i = 0; i < RDMA_MAX_WR; i++) {
-        if (post_receive() < 0) {
-            break;
-        }
-    }
+    // Requests are serialized per peer, and every completion reposts the
+    // receive. Posting the same buffer hundreds of times is invalid and can
+    // race a response send against another receive completion.
+    if (post_receive() < 0)
+        return -1;
 
     if (rdma_resolve_route(cm_id_, 2000)) {
         std::cerr << "Failed to resolve route" << std::endl;
@@ -488,6 +578,8 @@ int RDMAClient::connect() {
     memset(&conn_param, 0, sizeof(conn_param));
     conn_param.initiator_depth = 1;
     conn_param.responder_resources = 1;
+    conn_param.retry_count = 7;
+    conn_param.rnr_retry_count = 7;
 
     if (rdma_connect(cm_id_, &conn_param)) {
         std::cerr << "Failed to connect" << std::endl;
@@ -530,7 +622,7 @@ int RDMAClient::send_request(const RDMARequest &req, RDMAResponse &resp) {
         return -1;
     }
 
-    if (receive_message(msg) < 0) {
+    if (receive_message(msg, 5000) < 0) {
         return -1;
     }
 

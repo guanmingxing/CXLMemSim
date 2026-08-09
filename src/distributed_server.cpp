@@ -57,8 +57,43 @@ static constexpr uint8_t DIST_OP_ATOMIC_CAS = 4;
 static constexpr uint8_t DIST_OP_FENCE = 5;
 static constexpr uint8_t DIST_OP_LSA_READ = 6;
 static constexpr uint8_t DIST_OP_LSA_WRITE = 7;
+static constexpr uint8_t DIST_OP_BULK_READ = 8;
+static constexpr uint8_t DIST_OP_BULK_WRITE = 9;
+static constexpr uint64_t DIST_MAX_BULK_SIZE = 64ULL * 1024 * 1024;
+// A vLLM worker may address the full configured per-rank offload pool (255 MiB
+// in the 70B benchmark). Keep a finite guard against hostile sparse writes,
+// while leaving headroom for legitimate distributed-memory workloads.
+static constexpr uint64_t DIST_MAX_LSA_SIZE = 1ULL * 1024 * 1024 * 1024;
 
 namespace {
+
+bool recv_full_fd(int fd, void *buffer, size_t size) {
+    auto *cursor = static_cast<uint8_t *>(buffer);
+    while (size > 0) {
+        ssize_t received = recv(fd, cursor, size, 0);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
+            return false;
+        cursor += received;
+        size -= static_cast<size_t>(received);
+    }
+    return true;
+}
+
+bool send_full_fd(int fd, const void *buffer, size_t size) {
+    const auto *cursor = static_cast<const uint8_t *>(buffer);
+    while (size > 0) {
+        ssize_t sent = send(fd, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent <= 0)
+            return false;
+        cursor += sent;
+        size -= static_cast<size_t>(sent);
+    }
+    return true;
+}
 
 std::string expand_node_backing_path(std::string path, uint32_t node_id) {
     constexpr const char *kNodeToken = "{node}";
@@ -557,8 +592,11 @@ bool DistributedMemoryServer::initialize() {
 
     // Initialize message manager
     msg_manager_ = std::make_unique<DistributedMessageManager>(shm_name_, node_id_);
-    bool is_first_node = (node_id_ == 0);
-    if (!msg_manager_->initialize(is_first_node)) {
+    // POSIX SHM is host-local. Only SHM transport can join node 0's control
+    // segment directly; physical TCP/RDMA nodes need an independent local
+    // control segment and exchange data over their selected transport.
+    bool create_local_control = (node_id_ == 0 || transport_mode_ != DistTransportMode::SHM);
+    if (!msg_manager_->initialize(create_local_control)) {
         SPDLOG_ERROR("Failed to initialize message manager");
         return false;
     }
@@ -902,7 +940,7 @@ void DistributedMemoryServer::handle_atomic_request(const dist_message_t &req, d
         ok = local_memory_->atomic_fetch_add_uint64(addr, req.payload.mem.value, &old_value);
     } else {
         ok = local_memory_->atomic_compare_exchange_uint64(addr, req.payload.mem.expected, req.payload.mem.value,
-                                                          &old_value);
+                                                           &old_value);
     }
 
     if (!ok) {
@@ -1078,6 +1116,72 @@ int DistributedMemoryServer::write(uint64_t addr, const void *data, size_t size,
     return forward_write(target_node, addr, data, size, latency_ns);
 }
 
+int DistributedMemoryServer::read_bulk(uint64_t addr, void *data, size_t size, uint64_t *latency_ns) {
+    if (!data || size == 0 || addr > UINT64_MAX - (size - 1))
+        return -1;
+    const uint32_t target_node = get_node_for_address(addr);
+    if (get_node_for_address(addr + size - 1) != target_node)
+        return -1;
+
+    if (target_node == node_id_ || target_node == UINT32_MAX) {
+        if (!local_memory_->read_range(addr, static_cast<uint8_t *>(data), size))
+            return -1;
+        local_reads_++;
+        *latency_ns = static_cast<uint64_t>(controller_->dramlatency);
+        return 0;
+    }
+    if (transport_mode_ != DistTransportMode::RDMA || !rdma_transport_ || !rdma_transport_->is_connected(target_node))
+        return -1;
+
+    auto *cursor = static_cast<uint8_t *>(data);
+    uint64_t total_latency = 0;
+    for (size_t offset = 0; offset < size; offset += RDMA_BUFFER_SIZE) {
+        const size_t chunk = std::min<size_t>(RDMA_BUFFER_SIZE, size - offset);
+        const auto start = std::chrono::steady_clock::now();
+        if (!rdma_transport_->rdma_read(target_node, addr + offset, cursor + offset, chunk))
+            return -1;
+        total_latency +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        remote_reads_++;
+        forwarded_requests_++;
+    }
+    *latency_ns = total_latency;
+    return 0;
+}
+
+int DistributedMemoryServer::write_bulk(uint64_t addr, const void *data, size_t size, uint64_t *latency_ns) {
+    if (!data || size == 0 || addr > UINT64_MAX - (size - 1))
+        return -1;
+    const uint32_t target_node = get_node_for_address(addr);
+    if (get_node_for_address(addr + size - 1) != target_node)
+        return -1;
+
+    if (target_node == node_id_ || target_node == UINT32_MAX) {
+        if (!local_memory_->write_range(addr, static_cast<const uint8_t *>(data), size))
+            return -1;
+        local_writes_++;
+        *latency_ns = static_cast<uint64_t>(controller_->dramlatency) + 50;
+        return 0;
+    }
+    if (transport_mode_ != DistTransportMode::RDMA || !rdma_transport_ || !rdma_transport_->is_connected(target_node))
+        return -1;
+
+    const auto *cursor = static_cast<const uint8_t *>(data);
+    uint64_t total_latency = 0;
+    for (size_t offset = 0; offset < size; offset += RDMA_BUFFER_SIZE) {
+        const size_t chunk = std::min<size_t>(RDMA_BUFFER_SIZE, size - offset);
+        const auto start = std::chrono::steady_clock::now();
+        if (!rdma_transport_->rdma_write(target_node, addr + offset, cursor + offset, chunk))
+            return -1;
+        total_latency +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        remote_writes_++;
+        forwarded_requests_++;
+    }
+    *latency_ns = total_latency;
+    return 0;
+}
+
 int DistributedMemoryServer::forward_read(uint32_t target_node, uint64_t addr, void *data, size_t size,
                                           uint64_t *latency_ns) {
     forwarded_requests_++;
@@ -1224,7 +1328,7 @@ void DistributedMemoryServer::fence() {
 
 int DistributedMemoryServer::lsa_read(uint64_t offset, void *data, size_t size) {
     std::lock_guard<std::mutex> lock(lsa_mutex_);
-    if (offset + size > lsa_size_) {
+    if (!data || size == 0 || offset > lsa_size_ || size > lsa_size_ - offset) {
         SPDLOG_ERROR("Node {} LSA read out of bounds: offset=0x{:x} size={} lsa_size={}", node_id_, offset, size,
                      lsa_size_);
         return -1;
@@ -1235,12 +1339,17 @@ int DistributedMemoryServer::lsa_read(uint64_t offset, void *data, size_t size) 
 
 int DistributedMemoryServer::lsa_write(uint64_t offset, const void *data, size_t size) {
     std::lock_guard<std::mutex> lock(lsa_mutex_);
-    if (offset + size > lsa_size_) {
+    if (!data || size == 0 || offset > DIST_MAX_LSA_SIZE || size > DIST_MAX_LSA_SIZE - offset) {
+        SPDLOG_WARN("Node {} rejected LSA write: offset=0x{:x} size={} max={}", node_id_, offset, size,
+                    DIST_MAX_LSA_SIZE);
+        return -1;
+    }
+    const size_t required_size = static_cast<size_t>(offset + size);
+    if (required_size > lsa_size_) {
         /* Auto-grow LSA if needed */
-        size_t new_size = offset + size;
-        SPDLOG_INFO("Node {} growing LSA from {} to {} bytes", node_id_, lsa_size_, new_size);
-        lsa_data_.resize(new_size, 0);
-        lsa_size_ = new_size;
+        SPDLOG_INFO("Node {} growing LSA from {} to {} bytes", node_id_, lsa_size_, required_size);
+        lsa_data_.resize(required_size, 0);
+        lsa_size_ = required_size;
     }
     memcpy(lsa_data_.data() + offset, data, size);
     return 0;
@@ -1957,9 +2066,24 @@ void DistributedRDMATransport::shutdown() {
         server_->stop();
     }
 
+    {
+        std::lock_guard<std::mutex> incoming_lock(incoming_mutex_);
+        for (auto &client : incoming_connections_) {
+            if (client)
+                client->disconnect();
+        }
+    }
+
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+
+    for (auto &thread : incoming_threads_) {
+        if (thread.joinable())
+            thread.join();
+    }
+    incoming_threads_.clear();
+    incoming_connections_.clear();
 
     std::lock_guard<std::mutex> lock(connections_mutex_);
     for (auto &[node_id, conn] : connections_) {
@@ -1971,7 +2095,8 @@ void DistributedRDMATransport::shutdown() {
     connections_.clear();
 }
 
-bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port) {
+bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::string &addr, uint16_t port,
+                                               uint64_t remote_addr, size_t remote_buffer_size) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
 
     auto it = connections_.find(node_id);
@@ -1987,6 +2112,10 @@ bool DistributedRDMATransport::connect_to_node(uint32_t node_id, const std::stri
 
     RDMANodeConnection conn;
     conn.client = std::move(client);
+    conn.endpoint_addr = addr;
+    conn.endpoint_port = port;
+    conn.remote_addr = remote_addr;
+    conn.remote_buffer_size = remote_buffer_size;
     conn.connected = true;
     connections_[node_id] = std::move(conn);
 
@@ -2064,9 +2193,28 @@ bool DistributedRDMATransport::send_message_wait_response(uint32_t dst_node, con
     memcpy(rdma_req.data, req.payload.mem.data, std::min(sizeof(rdma_req.data), sizeof(req.payload.mem.data)));
 
     RDMAResponse rdma_resp;
-    if (it->second.client->send_request(rdma_req, rdma_resp) != 0) {
-        return false;
+    bool delivered = false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        if (it->second.client && it->second.client->send_request(rdma_req, rdma_resp) == 0) {
+            delivered = true;
+            break;
+        }
+
+        // A Soft-RoCE QP can remain nominally RTS while no completion ever
+        // arrives. Recreate that one directed connection and replay the
+        // idempotent cacheline READ/WRITE instead of wedging the whole MPI job.
+        SPDLOG_WARN("Reconnecting RDMA peer node {} after request failure (attempt {}/16)", dst_node, attempt + 1);
+        auto replacement = std::make_unique<RDMAClient>(it->second.endpoint_addr, it->second.endpoint_port);
+        if (replacement->connect() == 0) {
+            it->second.client = std::move(replacement);
+            it->second.connected = true;
+        } else {
+            it->second.connected = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
+    if (!delivered)
+        return false;
 
     // Unpack response
     memset(&resp, 0, sizeof(resp));
@@ -2150,7 +2298,10 @@ RDMACalibrationResult DistributedRDMATransport::calibrate_node(uint32_t dst_node
         RDMARequest req;
         memset(&req, 0, sizeof(req));
         req.op_type = RDMA_OP_READ;
-        req.addr = 0;
+        // Use the first valid byte of this peer's global range. Address zero is
+        // only valid on node 0 and caused every other peer to log 1000 failed
+        // backing-memory reads during calibration.
+        req.addr = it->second.remote_addr;
         req.size = 1;
 
         RDMAResponse resp;
@@ -2246,9 +2397,12 @@ RDMACalibrationResult DistributedRDMATransport::get_aggregate_calibration() cons
 
 void DistributedRDMATransport::accept_loop() {
     while (running_) {
-        if (server_->accept_connection() == 0) {
+        auto client = server_->accept_connection();
+        if (client) {
             SPDLOG_INFO("RDMA transport accepted incoming connection");
-            server_->handle_client();
+            std::lock_guard<std::mutex> lock(incoming_mutex_);
+            incoming_connections_.push_back(client);
+            incoming_threads_.emplace_back([this, client]() { server_->handle_client(client); });
         }
     }
 }
@@ -2270,6 +2424,46 @@ bool DistributedMemoryServer::initialize_rdma_transport() {
         rdma_transport_.reset();
         return false;
     }
+
+    // RDMAServer's fallback callback returns a synthetic success response.
+    // Distributed mode needs incoming READ/WRITE requests to operate on this
+    // node's local backing memory so that remote data is actually persistent.
+    rdma_transport_->set_message_handler([this](const RDMAMessage &request, RDMAMessage &response) {
+        memset(&response, 0, sizeof(response));
+
+        const RDMARequest &req = request.request;
+        RDMAResponse &resp = response.response;
+        const size_t size = std::min<size_t>(req.size, RDMA_BUFFER_SIZE);
+
+        if (size == 0 || req.size > RDMA_BUFFER_SIZE) {
+            resp.status = 1;
+            return;
+        }
+
+        switch (req.op_type) {
+        case RDMA_OP_READ:
+            if (local_memory_->read_range(req.addr, resp.data, size)) {
+                resp.status = 0;
+                resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency);
+                local_reads_++;
+            } else {
+                resp.status = 1;
+            }
+            break;
+        case RDMA_OP_WRITE:
+            if (local_memory_->write_range(req.addr, req.data, size)) {
+                resp.status = 0;
+                resp.latency_ns = static_cast<uint64_t>(controller_->dramlatency) + 50;
+                local_writes_++;
+            } else {
+                resp.status = 1;
+            }
+            break;
+        default:
+            resp.status = 1;
+            break;
+        }
+    });
 
     SPDLOG_INFO("RDMA transport initialized on {}:{}", tcp_addr_, tcp_transport_port_ + 1000);
 
@@ -2310,13 +2504,6 @@ bool DistributedMemoryServer::connect_rdma_node(uint32_t node_id, const std::str
         return false;
     }
 
-    if (!rdma_transport_->connect_to_node(node_id, addr, port)) {
-        SPDLOG_ERROR("Failed to connect RDMA to node {} at {}:{}", node_id, addr, port);
-        return false;
-    }
-
-    SPDLOG_INFO("RDMA connected to node {} at {}:{}", node_id, addr, port);
-
     // Create virtual endpoint for the remote node
     uint64_t peer_capacity = memory_capacity_mb_ * 1024ULL * 1024ULL;
     uint64_t peer_base_addr = node_id * peer_capacity;
@@ -2329,6 +2516,13 @@ bool DistributedMemoryServer::connect_rdma_node(uint32_t node_id, const std::str
             peer_capacity = it->second.memory_size;
         }
     }
+
+    if (!rdma_transport_->connect_to_node(node_id, addr, port, peer_base_addr, peer_capacity)) {
+        SPDLOG_ERROR("Failed to connect RDMA to node {} at {}:{}", node_id, addr, port);
+        return false;
+    }
+
+    SPDLOG_INFO("RDMA connected to node {} at {}:{}", node_id, addr, port);
 
     FabricLinkConfig link_cfg{50.0, 50.0, 64}; // 50ns hop, 50GB/s, 64 credits (RDMA advantage)
     auto *remote = controller_->add_remote_endpoint(node_id, peer_base_addr, peer_capacity, link_cfg);
@@ -2838,6 +3032,7 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
 
         DistServerResponse resp;
         memset(&resp, 0, sizeof(resp));
+        std::vector<uint8_t> bulk_response;
 
         // Handle the request using distributed read/write (with proper forwarding)
         switch (req.op_type) {
@@ -2901,6 +3096,38 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
             break;
         }
 
+        case DIST_OP_BULK_READ: {
+            if (req.size == 0 || req.size > DIST_MAX_BULK_SIZE || req.addr > UINT64_MAX - (req.size - 1)) {
+                resp.status = 1;
+                break;
+            }
+            bulk_response.resize(static_cast<size_t>(req.size));
+            uint64_t latency_ns = 0;
+            int ret = read_bulk(req.addr, bulk_response.data(), bulk_response.size(), &latency_ns);
+            resp.status = ret == 0 ? 0 : 1;
+            resp.latency_ns = latency_ns;
+            if (ret != 0)
+                bulk_response.clear();
+            break;
+        }
+
+        case DIST_OP_BULK_WRITE: {
+            if (req.size == 0 || req.size > DIST_MAX_BULK_SIZE || req.addr > UINT64_MAX - (req.size - 1)) {
+                resp.status = 1;
+                break;
+            }
+            std::vector<uint8_t> payload(static_cast<size_t>(req.size));
+            if (!recv_full_fd(client_fd, payload.data(), payload.size())) {
+                resp.status = 1;
+                break;
+            }
+            uint64_t latency_ns = 0;
+            int ret = write_bulk(req.addr, payload.data(), payload.size(), &latency_ns);
+            resp.status = ret == 0 ? 0 : 1;
+            resp.latency_ns = latency_ns;
+            break;
+        }
+
         case DIST_OP_GET_SHM_INFO: {
             // Return shared memory info
             auto shm_info = local_memory_->get_shm_info();
@@ -2919,7 +3146,8 @@ void DistributedMemoryServer::handle_tcp_client(int client_fd, int client_id) {
         }
 
         // Send response
-        if (send(client_fd, &resp, sizeof(resp), MSG_NOSIGNAL) != sizeof(resp)) {
+        if (!send_full_fd(client_fd, &resp, sizeof(resp)) ||
+            (!bulk_response.empty() && !send_full_fd(client_fd, bulk_response.data(), bulk_response.size()))) {
             if (running_) {
                 SPDLOG_ERROR("Node {} client {}: Failed to send response: {}", node_id_, client_id, strerror(errno));
             }
