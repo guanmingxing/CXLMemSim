@@ -36,6 +36,13 @@ struct SsdStreamingConfig {
     uint32_t read_ahead_pages = 16;
     bool use_io_uring = true;
     bool use_odirect = true;
+    /*
+     * Modelled CXL/SSD backing-read latency per page fault, in nanoseconds.
+     * When non-zero read_page() adds this deterministic delay so the
+     * data-supply path can be studied independently of the noisy host disk.
+     * This is a model parameter, not a measured device latency.
+     */
+    uint64_t backing_latency_ns = 0;
 };
 
 struct SsdStreamingStats {
