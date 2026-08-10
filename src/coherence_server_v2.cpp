@@ -574,18 +574,18 @@ CoherenceServerV2::DispatchResult CoherenceServerV2::dispatch(ConnectionId conne
 }
 
 bool CoherenceServerV2::sendToHost(std::uint16_t host_id, const CoherenceFrame &frame) {
-    ResponseSender sender;
-    {
-        std::lock_guard lock(impl_->mutex);
-        const auto found = impl_->by_host.find(host_id);
-        if (found == impl_->by_host.end())
-            return false;
-        const auto connection = found->second.lock();
-        if (!connection || connection->closed || connection->session_id != protocol_v2::sessionId(frame))
-            return false;
-        sender = connection->sender;
-    }
     try {
+        ResponseSender sender;
+        {
+            std::lock_guard lock(impl_->mutex);
+            const auto found = impl_->by_host.find(host_id);
+            if (found == impl_->by_host.end())
+                return false;
+            const auto connection = found->second.lock();
+            if (!connection || connection->closed || connection->session_id != protocol_v2::sessionId(frame))
+                return false;
+            sender = connection->sender;
+        }
         return sender && sender(frame);
     } catch (...) {
         return false;
