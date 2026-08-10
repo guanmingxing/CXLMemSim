@@ -51,6 +51,17 @@ constexpr std::uint64_t kLineC = 0x3000;
 constexpr std::uint64_t kLineD = 0x4000;
 constexpr auto kSnoopTimeout = std::chrono::milliseconds(30);
 
+template <typename Tag, typename Tag::Type member> struct PrivateMemberAccess {
+    friend typename Tag::Type privateMember(Tag) { return member; }
+};
+
+struct SendToHostTag {
+    using Type = bool (CoherenceServerV2::*)(std::uint16_t, const CoherenceFrame &);
+    friend Type privateMember(SendToHostTag);
+};
+
+template struct PrivateMemberAccess<SendToHostTag, &CoherenceServerV2::sendToHost>;
+
 std::uint64_t holder(std::uint16_t host_id) { return std::uint64_t{1} << host_id; }
 
 std::array<std::byte, kLineSize> lineBytes(std::uint8_t value) {
@@ -546,6 +557,51 @@ void testRegisterSenderCopyFailureClearsRegisteringState() {
     CHECK(validateResponse(retry_response, request));
     CHECK(sessionId(retry_response) != 0);
     CHECK(harness.engine.sessionFor(host) == sessionId(retry_response));
+}
+
+void testThrowingActiveSnoopSenderCopyFailsClosed() {
+    Harness harness;
+    constexpr ConnectionId connection = 154;
+    constexpr std::uint16_t host = 25;
+    std::atomic<std::size_t> copies{};
+    ResponseSender sender{ThrowOnNthCopySender{copies, 4}};
+    CHECK(harness.server.attachConnection(connection, "tcp", std::move(sender)));
+
+    const auto register_request = registration(host);
+    const auto registered = harness.server.dispatch(connection, register_request);
+    CHECK(registered.status == Status::Ok);
+    const auto session = sessionId(requireResponse(registered, "snoop-copy REGISTER"));
+    const auto before = harness.registry.inspect(session);
+    CHECK(before.has_value());
+    CHECK(copies.load(std::memory_order_relaxed) == 3);
+
+    auto snoop = initializeFrame(Opcode::SnpInv);
+    setSrcHost(snoop, kServerHost);
+    setDstHost(snoop, host);
+    setSessionId(snoop, session);
+    setSnoopId(snoop, 1);
+    setAddress(snoop, kLineA);
+    setEpoch(snoop, 1);
+
+    bool threw = false;
+    bool sent = true;
+    try {
+        sent = (harness.server.*privateMember(SendToHostTag{}))(host, snoop);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(!threw);
+    if (threw)
+        return;
+
+    CHECK(!sent);
+    CHECK(copies.load(std::memory_order_relaxed) == 4);
+    const auto after = harness.registry.inspect(session);
+    CHECK(after.has_value());
+    CHECK(after->state == SessionState::Active);
+    CHECK(after->binding_id == before->binding_id);
+    CHECK(after->has_sender);
+    CHECK(harness.engine.sessionFor(host) == session);
 }
 
 void testConnectionHostAndSessionAreExplicitlyBound() {
@@ -1212,6 +1268,7 @@ int main() {
     testRegisterIsRequiredAndNegotiatesModelSnoop();
     testDetachWinningConcurrentRegisterLeavesNoSessionOrSender();
     testRegisterSenderCopyFailureClearsRegisteringState();
+    testThrowingActiveSnoopSenderCopyFailsClosed();
     testConnectionHostAndSessionAreExplicitlyBound();
     testDispatchesMesiWritebackAndAtomicsWithDuplexSnoops();
     testPutsResponseIsInvalidForReleaserWhileDirectoryKeepsOtherSharer();

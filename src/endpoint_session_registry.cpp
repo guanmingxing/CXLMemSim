@@ -253,7 +253,13 @@ bool EndpointSessionRegistry::publishPendingResponses(SessionId session_id, Bind
         observed_generation = session->binding_generation;
     }
 
-    auto staged_sender = copySender(*sender_to_copy);
+    StoredResponseSender staged_sender;
+    try {
+        staged_sender = copySender(*sender_to_copy);
+    } catch (...) {
+        retireFailedBinding(session, observed_generation);
+        return false;
+    }
     StoredResponseSender sender;
     std::uint64_t generation{};
     {

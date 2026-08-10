@@ -655,6 +655,55 @@ void testResumeDrainCopyFailurePreservesOfflineBinding() {
     CHECK(*deliveries == 1);
 }
 
+void testResumedPendingResponsePublicationCopyFailureRetiresBindingAndPreservesReplay() {
+    EndpointSessionRegistry registry;
+    const auto registered = registry.registerEndpoint(request(38));
+    CHECK(pinHeartbeat(registry, registered.session_id, 1, 38) == PinResponseResult::Pinned);
+    CHECK(registry.disconnectAbruptly(38, registered.session_id, activeBinding(registry, registered.session_id)));
+
+    auto copies = std::make_shared<std::size_t>(0);
+    auto deliveries = std::make_shared<std::size_t>(0);
+    ResponseSender sender{ThrowOnNthCopySender{copies, deliveries, 2}};
+    auto resume = request(38, "deferred-copy-fails", std::move(sender));
+    resume.requested_session_id = registered.session_id;
+    resume.defer_response_replay = true;
+    const auto resumed = registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
+
+    bool threw = false;
+    bool published = true;
+    try {
+        published = registry.publishPendingResponses(registered.session_id, resumed.binding_id);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(!threw);
+    CHECK(!published);
+    CHECK(*copies == 2);
+
+    const auto failed = registry.inspect(registered.session_id);
+    CHECK(failed.has_value());
+    if (failed) {
+        CHECK(failed->state == SessionState::OfflineRetained);
+        CHECK(!failed->binding_id);
+        CHECK(!failed->has_sender);
+        CHECK(failed->transport_name.empty());
+    }
+    CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
+    CHECK(*deliveries == 0);
+
+    auto retry = request(38, "retry", [deliveries](const CoherenceFrame &) {
+        ++*deliveries;
+        return true;
+    });
+    retry.requested_session_id = registered.session_id;
+    const auto replayed = registry.registerEndpoint(retry);
+    CHECK(replayed.status == Status::Ok);
+    CHECK(*deliveries == 1);
+    CHECK(registry.acknowledgeResponses(registered.session_id, replayed.binding_id, 1));
+    CHECK(registry.pinnedResponseIds(registered.session_id).empty());
+}
+
 void testPinnedResponseSenderCopyFailureFailsClosedAndRemainsReplayable() {
     EndpointSessionRegistry registry;
     auto copies = std::make_shared<std::size_t>(0);
@@ -1994,6 +2043,7 @@ int main() {
     testReplacementSenderCopyFailurePreservesClosedSession();
     testResumeSenderCopyFailurePreservesOfflineBinding();
     testResumeDrainCopyFailurePreservesOfflineBinding();
+    testResumedPendingResponsePublicationCopyFailureRetiresBindingAndPreservesReplay();
     testPinnedResponseSenderCopyFailureFailsClosedAndRemainsReplayable();
     testDeliveryContextBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
     testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
