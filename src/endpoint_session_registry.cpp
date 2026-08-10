@@ -179,8 +179,8 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
             observed_generation = session->binding_generation;
             staged_binding_value = next_binding_id_;
             staged_publication_cursor = session->response_watermark + 1;
-            stage_drain =
-                request.sender && !session->publishing && session->pinned_responses.contains(staged_publication_cursor);
+            stage_drain = !request.defer_response_replay && request.sender && !session->publishing &&
+                          session->pinned_responses.contains(staged_publication_cursor);
         }
 
         auto staged_sender = copySender(request.sender);
@@ -201,7 +201,7 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
                 found == sessions_.end() || found->second != session || session->state != observed_state ||
                 session->binding_generation != observed_generation || next_binding_id_ != staged_binding_value ||
                 staged_publication_cursor != session->response_watermark + 1 ||
-                stage_drain != (request.sender && !session->publishing &&
+                stage_drain != (!request.defer_response_replay && request.sender && !session->publishing &&
                                 session->pinned_responses.contains(staged_publication_cursor));
             if (state_changed) {
                 retry = true;
@@ -235,6 +235,35 @@ RegistrationResult EndpointSessionRegistry::registerEndpoint(const RegistrationR
         }
         return result;
     }
+}
+
+bool EndpointSessionRegistry::publishPendingResponses(SessionId session_id, BindingId binding_id) {
+    std::shared_ptr<Session> session;
+    StoredResponseSender sender_to_copy;
+    std::uint64_t observed_generation{};
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(session_id);
+        if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+            return false;
+        session = found->second;
+        if (!session->sender || session->publishing || !session->pinned_responses.contains(session->publication_cursor))
+            return true;
+        sender_to_copy = session->sender;
+        observed_generation = session->binding_generation;
+    }
+
+    auto staged_sender = copySender(*sender_to_copy);
+    StoredResponseSender sender;
+    std::uint64_t generation{};
+    {
+        std::lock_guard lock(mutex_);
+        if (session->binding_id != binding_id || session->binding_generation != observed_generation ||
+            session->sender != sender_to_copy)
+            return false;
+        (void)beginDrainLocked(*session, generation, sender, std::move(staged_sender));
+    }
+    return !sender || drainResponses(session, generation, sender);
 }
 
 std::size_t localDeliveryCount(const EndpointSessionRegistry *registry, SessionId session_id,
@@ -540,7 +569,7 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
                 delivery_finished_.notify_all();
             }
             retireFailedBinding(session, generation);
-            throw;
+            return false;
         }
         delivery_stack.pop_back();
         StoredResponseSender retired_sender;
@@ -568,16 +597,24 @@ bool EndpointSessionRegistry::drainResponses(const std::shared_ptr<Session> &ses
 
 PinResponseResult EndpointSessionRegistry::pinResponse(SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                                        const protocol_v2::CoherenceFrame &response_frame) {
-    return pinResponseImpl(nullptr, session_id, request, response_frame);
+    return pinResponseImpl(nullptr, nullptr, session_id, request, response_frame);
 }
 
 PinResponseResult EndpointSessionRegistry::pinResponse(const OperationAuthority &authority,
                                                        const protocol_v2::CoherenceFrame &request,
                                                        const protocol_v2::CoherenceFrame &response_frame) {
-    return pinResponseImpl(&authority, authority.session_id_, request, response_frame);
+    return pinResponseImpl(&authority, nullptr, authority.session_id_, request, response_frame);
 }
 
-PinResponseResult EndpointSessionRegistry::pinResponseImpl(const OperationAuthority *authority, SessionId session_id,
+PinResponseResult EndpointSessionRegistry::pinAndCompleteOperation(OperationAuthority &authority,
+                                                                   const protocol_v2::CoherenceFrame &request,
+                                                                   const protocol_v2::CoherenceFrame &response_frame) {
+    return pinResponseImpl(&authority, &authority, authority.session_id_, request, response_frame);
+}
+
+PinResponseResult EndpointSessionRegistry::pinResponseImpl(const OperationAuthority *authority,
+                                                           OperationAuthority *completion_authority,
+                                                           SessionId session_id,
                                                            const protocol_v2::CoherenceFrame &request,
                                                            const protocol_v2::CoherenceFrame &response_frame) {
     std::shared_ptr<Session> session;
@@ -625,7 +662,18 @@ PinResponseResult EndpointSessionRegistry::pinResponseImpl(const OperationAuthor
             if (session->state == SessionState::Closed)
                 session->closed_final_response_pinned = true;
         }
-        if (authority == nullptr) {
+        if (completion_authority != nullptr) {
+            auto operation = session->operation_records.find(id);
+            abortHolderTransitionLocked(*session, operation->second);
+            {
+                std::lock_guard operation_lock(session->operations->mutex);
+                completeOperationStateLocked(*session->operations, id);
+            }
+            operation->second.terminal = true;
+            if (operation->second.response_reclaimed)
+                session->operation_records.erase(operation);
+            *completion_authority = {};
+        } else if (authority == nullptr) {
             const auto operation = session->operation_records.find(id);
             if (operation != session->operation_records.end()) {
                 std::lock_guard operation_lock(session->operations->mutex);
@@ -642,17 +690,36 @@ PinResponseResult EndpointSessionRegistry::pinResponseImpl(const OperationAuthor
         }
     }
     StoredResponseSender staged_sender;
-    if (sender_to_copy)
-        staged_sender = copySender(*sender_to_copy);
+    if (sender_to_copy) {
+        try {
+            staged_sender = copySender(*sender_to_copy);
+        } catch (...) {
+            retireFailedBinding(session, observed_generation);
+            return PinResponseResult::DeliveryFailed;
+        }
+    }
     StoredResponseSender sender;
     if (staged_sender) {
         std::lock_guard lock(mutex_);
         if (session->binding_generation == observed_generation && session->sender == sender_to_copy)
             (void)beginDrainLocked(*session, generation, sender, std::move(staged_sender));
     }
-    if (sender)
-        (void)drainResponses(session, generation, sender);
+    if (sender && !drainResponses(session, generation, sender))
+        return PinResponseResult::DeliveryFailed;
     return result;
+}
+
+std::optional<protocol_v2::CoherenceFrame>
+EndpointSessionRegistry::pinnedResponse(SessionId session_id, BindingId binding_id,
+                                        const protocol_v2::CoherenceFrame &request) const {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(session_id);
+    if (!binding_id || found == sessions_.end() || found->second->binding_id != binding_id)
+        return std::nullopt;
+    const auto response = found->second->pinned_responses.find(protocol_v2::requestId(request));
+    if (response == found->second->pinned_responses.end() || !sameFrame(response->second.request, request))
+        return std::nullopt;
+    return response->second.response;
 }
 
 bool EndpointSessionRegistry::acknowledgeResponses(SessionId session_id, BindingId binding_id, std::uint64_t consumed) {
@@ -756,6 +823,7 @@ bool EndpointSessionRegistry::completeOperation(OperationAuthority &authority) {
     if (found == sessions_.end() || !validOperationAuthority(*found->second, authority))
         return false;
     auto operation = found->second->operation_records.find(authority.request_id_);
+    abortHolderTransitionLocked(*found->second, operation->second);
     std::lock_guard operation_lock(found->second->operations->mutex);
     completeOperationStateLocked(*found->second->operations, authority.request_id_);
     operation->second.terminal = true;
@@ -1101,7 +1169,7 @@ bool EndpointSessionRegistry::addCleanHolder(SessionId id, BindingId binding_id,
     auto &session = *found->second;
     if (session.clean_holders.contains(line))
         return true;
-    if (session.clean_holders.size() + session.modified_holders.size() >=
+    if (session.clean_holders.size() + session.modified_holders.size() + session.holder_reservations.size() >=
         session.cache_capacity / protocol_v2::kLineSize)
         return false;
     session.clean_holders.insert(line);
@@ -1122,7 +1190,7 @@ bool EndpointSessionRegistry::addModifiedHolder(SessionId id, BindingId binding_
     auto &session = *found->second;
     if (session.modified_holders.contains(line))
         return true;
-    if (session.clean_holders.size() + session.modified_holders.size() >=
+    if (session.clean_holders.size() + session.modified_holders.size() + session.holder_reservations.size() >=
         session.cache_capacity / protocol_v2::kLineSize)
         return false;
     session.modified_holders.insert(line);
@@ -1181,7 +1249,7 @@ bool EndpointSessionRegistry::addCleanHolder(const OperationAuthority &authority
     auto &session = *found->second;
     if (session.clean_holders.contains(line))
         return true;
-    if (session.clean_holders.size() + session.modified_holders.size() >=
+    if (session.clean_holders.size() + session.modified_holders.size() + session.holder_reservations.size() >=
         session.cache_capacity / protocol_v2::kLineSize)
         return false;
     session.clean_holders.insert(line);
@@ -1206,7 +1274,7 @@ bool EndpointSessionRegistry::addModifiedHolder(const OperationAuthority &author
     auto &session = *found->second;
     if (session.modified_holders.contains(line))
         return true;
-    if (session.clean_holders.size() + session.modified_holders.size() >=
+    if (session.clean_holders.size() + session.modified_holders.size() + session.holder_reservations.size() >=
         session.cache_capacity / protocol_v2::kLineSize)
         return false;
     session.modified_holders.insert(line);
@@ -1231,6 +1299,167 @@ bool EndpointSessionRegistry::removeModifiedHolder(const OperationAuthority &aut
         found->second->holder_drain->changed.notify_all();
     }
     return true;
+}
+
+bool EndpointSessionRegistry::reserveHolderTransition(const OperationAuthority &authority, std::uint64_t line,
+                                                      HolderPermission desired) {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validOperationAuthority(*found->second, authority) || !aligned(line))
+        return false;
+
+    auto &session = *found->second;
+    auto &operation = session.operation_records.at(authority.request_id_);
+    if (operation.line_address != line)
+        return false;
+    if (operation.holder_transition_reserved)
+        return operation.desired_permission == desired;
+
+    const bool clean = session.clean_holders.contains(line);
+    const bool modified = session.modified_holders.contains(line);
+    if (clean && modified)
+        return false;
+
+    bool valid = false;
+    switch (operation.opcode) {
+    case protocol_v2::Opcode::Gets:
+        valid = desired == HolderPermission::Clean && !modified;
+        break;
+    case protocol_v2::Opcode::Getm:
+    case protocol_v2::Opcode::AtomicFaa:
+    case protocol_v2::Opcode::AtomicCas:
+        valid = desired == HolderPermission::Modified;
+        break;
+    case protocol_v2::Opcode::Upgrade:
+        valid = desired == HolderPermission::Modified && clean;
+        break;
+    case protocol_v2::Opcode::Puts:
+        valid = desired == HolderPermission::None && clean;
+        break;
+    case protocol_v2::Opcode::Putm:
+        valid = desired == HolderPermission::None && modified;
+        break;
+    default:
+        break;
+    }
+    if (!valid)
+        return false;
+
+    const bool reserve_new_slot = desired != HolderPermission::None && !clean && !modified;
+    if (reserve_new_slot) {
+        if (session.clean_holders.size() + session.modified_holders.size() + session.holder_reservations.size() >=
+                session.cache_capacity / protocol_v2::kLineSize ||
+            session.holder_reservations.contains(line))
+            return false;
+        try {
+            session.holder_reservations.insert(line);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    operation.holder_transition_reserved = true;
+    operation.reserved_new_slot = reserve_new_slot;
+    operation.desired_permission = desired;
+    return true;
+}
+
+bool EndpointSessionRegistry::reconcileCommittedLine(const OperationAuthority &authority, std::uint64_t line,
+                                                     std::uint64_t clean_hosts, std::uint64_t modified_hosts) noexcept {
+    if (!aligned(line) || (clean_hosts & modified_hosts) != 0)
+        return false;
+    const auto valid_hosts =
+        max_hosts_ == 64 ? std::numeric_limits<std::uint64_t>::max() : (std::uint64_t{1} << max_hosts_) - 1;
+    if (((clean_hosts | modified_hosts) & ~valid_hosts) != 0)
+        return false;
+
+    std::lock_guard lock(mutex_);
+    const auto requester = sessions_.find(authority.session_id_);
+    if (requester == sessions_.end() || !validOperationAuthority(*requester->second, authority))
+        return false;
+    auto &operation = requester->second->operation_records.at(authority.request_id_);
+    if (!operation.holder_transition_reserved || operation.line_address != line)
+        return false;
+
+    const auto desiredFor = [&](std::uint16_t host_id) {
+        const auto bit = std::uint64_t{1} << host_id;
+        if ((modified_hosts & bit) != 0)
+            return HolderPermission::Modified;
+        if ((clean_hosts & bit) != 0)
+            return HolderPermission::Clean;
+        return HolderPermission::None;
+    };
+
+    for (std::uint16_t host_id = 0; host_id < max_hosts_; ++host_id) {
+        const auto desired = desiredFor(host_id);
+        if (desired == HolderPermission::None)
+            continue;
+        const auto host = host_sessions_.find(host_id);
+        if (host == host_sessions_.end() || !sessions_.contains(host->second))
+            return false;
+        const auto &session = *sessions_.at(host->second);
+        const bool clean = session.clean_holders.contains(line);
+        const bool modified = session.modified_holders.contains(line);
+        if (clean && modified)
+            return false;
+        if (!clean && !modified &&
+            (&session != requester->second.get() || !operation.reserved_new_slot ||
+             !session.holder_reservations.contains(line)))
+            return false;
+    }
+
+    for (const auto &[host_id, session_id] : host_sessions_) {
+        const auto session_position = sessions_.find(session_id);
+        if (session_position == sessions_.end())
+            return false;
+        auto &session = *session_position->second;
+        const auto desired = desiredFor(host_id);
+        const bool clean = session.clean_holders.contains(line);
+        const bool modified = session.modified_holders.contains(line);
+
+        if (desired == HolderPermission::None) {
+            session.clean_holders.erase(line);
+            session.modified_holders.erase(line);
+        } else if (desired == HolderPermission::Clean && !clean) {
+            auto node = modified ? session.modified_holders.extract(line) : session.holder_reservations.extract(line);
+            if (node.empty())
+                return false;
+            session.clean_holders.insert(std::move(node));
+        } else if (desired == HolderPermission::Modified && !modified) {
+            auto node = clean ? session.clean_holders.extract(line) : session.holder_reservations.extract(line);
+            if (node.empty())
+                return false;
+            session.modified_holders.insert(std::move(node));
+        }
+
+        std::lock_guard drain_lock(session.holder_drain->mutex);
+        session.holder_drain->modified_count = session.modified_holders.size();
+        session.holder_drain->changed.notify_all();
+    }
+
+    if (operation.reserved_new_slot)
+        requester->second->holder_reservations.erase(line);
+    operation.holder_transition_reserved = false;
+    operation.reserved_new_slot = false;
+    operation.desired_permission = HolderPermission::None;
+    return true;
+}
+
+void EndpointSessionRegistry::abortHolderTransition(const OperationAuthority &authority) noexcept {
+    std::lock_guard lock(mutex_);
+    const auto found = sessions_.find(authority.session_id_);
+    if (found == sessions_.end() || !validOperationAuthority(*found->second, authority))
+        return;
+    abortHolderTransitionLocked(*found->second, found->second->operation_records.at(authority.request_id_));
+}
+
+void EndpointSessionRegistry::abortHolderTransitionLocked(Session &session,
+                                                          Session::OperationRecord &operation) noexcept {
+    if (operation.holder_transition_reserved && operation.reserved_new_slot)
+        session.holder_reservations.erase(operation.line_address);
+    operation.holder_transition_reserved = false;
+    operation.reserved_new_slot = false;
+    operation.desired_permission = HolderPermission::None;
 }
 
 bool EndpointSessionRegistry::removeCleanHolder(const CleanupAuthority &authority, std::uint64_t line) {

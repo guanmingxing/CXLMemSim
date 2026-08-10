@@ -23,12 +23,6 @@ namespace cxlmemsim::mesi_v2 {
 
 struct TransactionDependencies;
 
-struct TransactionRequest {
-    std::uint16_t host_id{};
-    std::uint64_t session_id{};
-    std::uint64_t request_id{};
-};
-
 enum class AckDisposition : std::uint8_t { Accepted, Deferred, Duplicate, Stale, Invalid };
 
 struct TransactionResult {
@@ -37,6 +31,21 @@ struct TransactionResult {
     bool granted{};
     std::array<std::byte, 64> data{};
     std::uint64_t old_value{};
+};
+
+struct TransactionRequest {
+    using GrantInstaller = void (*)(void *, const TransactionResult &) noexcept;
+    using CommitInstaller = void (*)(void *, const TransactionResult &) noexcept;
+
+    std::uint16_t host_id{};
+    std::uint64_t session_id{};
+    std::uint64_t request_id{};
+    std::optional<protocol_v2::LineState> local_state;
+    std::uint64_t installed_epoch{};
+    void *grant_context{};
+    GrantInstaller grant_installer{};
+    void *commit_context{};
+    CommitInstaller commit_installer{};
 };
 
 enum class HostFailurePolicy : std::uint8_t { RequireFenceAck, AssertProcessStopped, ForceDataLoss };

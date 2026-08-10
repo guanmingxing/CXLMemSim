@@ -655,33 +655,48 @@ void testResumeDrainCopyFailurePreservesOfflineBinding() {
     CHECK(*deliveries == 1);
 }
 
-void testDuplicatePinRestartsDrainAfterSenderCopyFailure() {
+void testPinnedResponseSenderCopyFailureFailsClosedAndRemainsReplayable() {
     EndpointSessionRegistry registry;
-    auto throw_on_copy = std::make_shared<bool>(false);
+    auto copies = std::make_shared<std::size_t>(0);
     auto deliveries = std::make_shared<std::size_t>(0);
-    ResponseSender sender{ThrowingCopySender{throw_on_copy, deliveries}};
-    const auto registered = registry.registerEndpoint(request(35, "throwing-copy", std::move(sender)));
+    ResponseSender sender{ThrowOnNthCopySender{copies, deliveries, 2}};
+    const auto registered = registry.registerEndpoint(request(35, "second-copy-fails", std::move(sender)));
     const auto heartbeat = protocolRequest(Opcode::Heartbeat, 1, registered.session_id, 35);
     const auto heartbeat_response = response(heartbeat);
     CHECK(registry.admitRequest(registered.session_id, activeBinding(registry, registered.session_id), heartbeat) ==
           RequestAdmissionResult::Accepted);
-    *throw_on_copy = true;
 
-    bool propagated = false;
+    bool threw = false;
+    PinResponseResult pin_result{};
     try {
-        (void)registry.pinResponse(registered.session_id, heartbeat, heartbeat_response);
+        pin_result = registry.pinResponse(registered.session_id, heartbeat, heartbeat_response);
     } catch (const std::runtime_error &) {
-        propagated = true;
+        threw = true;
     }
-    CHECK(propagated);
-    CHECK(registry.inspect(registered.session_id)->state == SessionState::Active);
+    CHECK(!threw);
+    if (threw)
+        return;
+
+    CHECK(pin_result == PinResponseResult::DeliveryFailed);
+    CHECK(*copies == 2);
+    const auto failed = registry.inspect(registered.session_id);
+    CHECK(failed.has_value());
+    CHECK(failed->state == SessionState::OfflineRetained);
+    CHECK(!failed->binding_id);
+    CHECK(!failed->has_sender);
+    CHECK(failed->transport_name.empty());
     CHECK(registry.pinnedResponseIds(registered.session_id) == std::vector<std::uint64_t>{1});
     CHECK(*deliveries == 0);
 
-    *throw_on_copy = false;
-    CHECK(registry.pinResponse(registered.session_id, heartbeat, heartbeat_response) == PinResponseResult::Duplicate);
+    auto resume = request(35, "retry", [deliveries](const CoherenceFrame &) {
+        ++*deliveries;
+        return true;
+    });
+    resume.requested_session_id = registered.session_id;
+    const auto resumed = registry.registerEndpoint(resume);
+    CHECK(resumed.status == Status::Ok);
     CHECK(*deliveries == 1);
-    CHECK(registry.acknowledgeResponses(registered.session_id, activeBinding(registry, registered.session_id), 1));
+    CHECK(registry.acknowledgeResponses(registered.session_id, resumed.binding_id, 1));
     CHECK(registry.pinnedResponseIds(registered.session_id).empty());
 }
 
@@ -872,13 +887,7 @@ void testThrowingReplayReleasesItsBinding() {
     auto resume = request(4, "tcp-throwing",
                           [](const CoherenceFrame &) -> bool { throw std::runtime_error("replay delivery failed"); });
     resume.requested_session_id = registered.session_id;
-    bool propagated = false;
-    try {
-        (void)registry.registerEndpoint(resume);
-    } catch (const std::runtime_error &) {
-        propagated = true;
-    }
-    CHECK(propagated);
+    CHECK(registry.registerEndpoint(resume).status == Status::IoError);
 
     const auto snapshot = registry.inspect(registered.session_id);
     CHECK(snapshot->state == SessionState::OfflineRetained);
@@ -1118,7 +1127,7 @@ void testReentrantAcknowledgementWithFalseDeliveryRequiresReplay() {
     }));
     session_id = registered.session_id;
 
-    CHECK(pinHeartbeat(registry, session_id, 1, 42) == PinResponseResult::Pinned);
+    CHECK(pinHeartbeat(registry, session_id, 1, 42) == PinResponseResult::DeliveryFailed);
     CHECK(acknowledged);
     CHECK(registry.responseWatermark(session_id) == 0);
     CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
@@ -1147,13 +1156,7 @@ void testReentrantAcknowledgementWithThrowingDeliveryRequiresReplay() {
     }));
     session_id = registered.session_id;
 
-    bool propagated = false;
-    try {
-        (void)pinHeartbeat(registry, session_id, 1, 43);
-    } catch (const std::runtime_error &) {
-        propagated = true;
-    }
-    CHECK(propagated);
+    CHECK(pinHeartbeat(registry, session_id, 1, 43) == PinResponseResult::DeliveryFailed);
     CHECK(acknowledged);
     CHECK(registry.responseWatermark(session_id) == 0);
     CHECK(registry.pinnedResponseIds(session_id) == std::vector<std::uint64_t>{1});
@@ -1248,7 +1251,7 @@ void testPublishedLowerAcknowledgementSurvivesHigherPendingFailure() {
           RequestAdmissionResult::Accepted);
 
     CHECK(registry.pinResponse(session_id, first, response(first)) == PinResponseResult::Pinned);
-    CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::Pinned);
+    CHECK(registry.pinResponse(session_id, second, response(second)) == PinResponseResult::DeliveryFailed);
     CHECK(delivered == (std::vector<std::uint64_t>{1, 2}));
     CHECK(higher_acknowledged);
     CHECK(lower_acknowledged);
@@ -1675,14 +1678,8 @@ void testClosedFinalSendFailureResumesWithoutReopeningAdmission() {
                                     unregister_request) == RequestAdmissionResult::Accepted);
         CHECK(registry.gracefulClose(29, registered.session_id, activeBinding(registry, registered.session_id),
                                      unregister_request) == Status::Ok);
-        bool propagated = false;
-        try {
-            CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
-                  PinResponseResult::Pinned);
-        } catch (const std::runtime_error &) {
-            propagated = true;
-        }
-        CHECK(propagated == throws);
+        CHECK(registry.pinResponse(registered.session_id, unregister_request, response(unregister_request)) ==
+              PinResponseResult::DeliveryFailed);
         const auto failed = registry.inspect(registered.session_id);
         CHECK(failed->state == SessionState::Closed);
         CHECK(!failed->has_sender);
@@ -1997,7 +1994,7 @@ int main() {
     testReplacementSenderCopyFailurePreservesClosedSession();
     testResumeSenderCopyFailurePreservesOfflineBinding();
     testResumeDrainCopyFailurePreservesOfflineBinding();
-    testDuplicatePinRestartsDrainAfterSenderCopyFailure();
+    testPinnedResponseSenderCopyFailureFailsClosedAndRemainsReplayable();
     testDeliveryContextBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
     testResponseBookkeepingFailureLeavesDeliveryRetryableAndDisconnectable();
     testResumeDeliveryContextBookkeepingFailureRetiresBindingAndAllowsReplay();

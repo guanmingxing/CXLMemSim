@@ -152,6 +152,7 @@ enum class SessionState { Active, OfflineRetained, Fenced, Closed };
 enum class PinResponseResult {
     Pinned,
     Duplicate,
+    DeliveryFailed,
     Conflict,
     Backpressure,
     StaleRequest,
@@ -181,6 +182,7 @@ struct RegistrationRequest {
     std::uint16_t cache_ways;
     std::string transport_name;
     ResponseSender sender;
+    bool defer_response_replay{};
 };
 
 struct RegistrationResult {
@@ -219,12 +221,15 @@ struct HolderSnapshot {
     std::vector<std::uint64_t> modified;
 };
 
+enum class HolderPermission : std::uint8_t { None, Clean, Modified };
+
 class EndpointSessionRegistry {
 public:
     explicit EndpointSessionRegistry(std::uint16_t max_hosts = protocol_v2::kMaximumHosts,
                                      std::size_t max_pinned_responses_per_session = 1024);
 
     RegistrationResult registerEndpoint(const RegistrationRequest &request);
+    bool publishPendingResponses(SessionId session_id, BindingId binding_id);
     bool disconnectAbruptly(std::uint16_t host_id, SessionId session_id, BindingId binding_id);
     protocol_v2::Status gracefulClose(std::uint16_t host_id, SessionId session_id, BindingId binding_id,
                                       const protocol_v2::CoherenceFrame &unregister_request);
@@ -242,6 +247,10 @@ public:
                                   const protocol_v2::CoherenceFrame &response);
     PinResponseResult pinResponse(const OperationAuthority &authority, const protocol_v2::CoherenceFrame &request,
                                   const protocol_v2::CoherenceFrame &response);
+    PinResponseResult pinAndCompleteOperation(OperationAuthority &authority, const protocol_v2::CoherenceFrame &request,
+                                              const protocol_v2::CoherenceFrame &response);
+    std::optional<protocol_v2::CoherenceFrame> pinnedResponse(SessionId session_id, BindingId binding_id,
+                                                              const protocol_v2::CoherenceFrame &request) const;
     bool acknowledgeResponses(SessionId session_id, BindingId binding_id, std::uint64_t highest_contiguous_consumed);
     std::uint64_t responseWatermark(SessionId session_id) const;
     std::uint64_t replayFloor(SessionId session_id) const;
@@ -312,6 +321,15 @@ public:
     bool removeCleanHolder(const OperationAuthority &authority, std::uint64_t line_address);
     bool addModifiedHolder(const OperationAuthority &authority, std::uint64_t line_address);
     bool removeModifiedHolder(const OperationAuthority &authority, std::uint64_t line_address);
+    // Reserves any cache-capacity increase before the directory can issue snoops or mutate metadata. A committed
+    // directory transition then reconciles the complete per-line reverse index while the directory line lock is held.
+    // The reserved set node is moved into the clean/modified set without allocation. Failed/no-change operations must
+    // abort the reservation before consuming their authority; completeOperation() also cleans it up fail closed.
+    bool reserveHolderTransition(const OperationAuthority &authority, std::uint64_t line_address,
+                                 HolderPermission desired_permission);
+    bool reconcileCommittedLine(const OperationAuthority &authority, std::uint64_t line_address,
+                                std::uint64_t clean_hosts, std::uint64_t modified_hosts) noexcept;
+    void abortHolderTransition(const OperationAuthority &authority) noexcept;
     bool removeCleanHolder(const CleanupAuthority &authority, std::uint64_t line_address);
     bool removeModifiedHolder(const CleanupAuthority &authority, std::uint64_t line_address);
     HolderSnapshot holderSnapshot(const CleanupAuthority &authority) const;
@@ -370,6 +388,9 @@ private:
             bool claimed{};
             bool terminal{};
             bool response_reclaimed{};
+            bool holder_transition_reserved{};
+            bool reserved_new_slot{};
+            HolderPermission desired_permission{HolderPermission::None};
         };
         std::map<std::uint64_t, OperationRecord> operation_records;
         std::optional<std::uint64_t> unregister_request_id;
@@ -383,6 +404,7 @@ private:
         std::uint64_t publisher_generation{};
         std::set<std::uint64_t> clean_holders;
         std::set<std::uint64_t> modified_holders;
+        std::set<std::uint64_t> holder_reservations;
         struct OperationState {
             mutable std::mutex mutex;
             std::condition_variable changed;
@@ -414,8 +436,8 @@ private:
                                           bool claim_operation);
     bool beginDrainLocked(Session &session, std::uint64_t &generation, StoredResponseSender &sender,
                           StoredResponseSender &&staged_sender);
-    PinResponseResult pinResponseImpl(const OperationAuthority *authority, SessionId session_id,
-                                      const protocol_v2::CoherenceFrame &request,
+    PinResponseResult pinResponseImpl(const OperationAuthority *authority, OperationAuthority *completion_authority,
+                                      SessionId session_id, const protocol_v2::CoherenceFrame &request,
                                       const protocol_v2::CoherenceFrame &response);
     bool drainResponses(const std::shared_ptr<Session> &session, std::uint64_t generation,
                         const StoredResponseSender &sender);
@@ -428,6 +450,7 @@ private:
     bool validRegistration(const RegistrationRequest &request) const noexcept;
     static StoredResponseSender copySender(const ResponseSender &sender);
     static void completeOperationStateLocked(Session::OperationState &operations, std::uint64_t request_id);
+    static void abortHolderTransitionLocked(Session &session, Session::OperationRecord &operation) noexcept;
     static void publishBindingGeneration(Session &session);
 
     const std::uint16_t max_hosts_;

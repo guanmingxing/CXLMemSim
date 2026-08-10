@@ -13,7 +13,8 @@ struct MesiDirectory::Shard {
 
 struct MesiDirectory::State {
     TransitionResult commit(DirectoryEntry &entry, DirectoryOperation operation, std::uint16_t requester,
-                            const DirectorySnapshot &expected, DirectorySnapshot next);
+                            const DirectorySnapshot &expected, DirectorySnapshot next,
+                            bool requester_reacquire = false);
     TransitionCounters transitionCounters() const noexcept;
 
 private:
@@ -104,15 +105,15 @@ void MesiDirectory::LockedLine::setPendingTransaction(std::shared_ptr<PendingTra
 }
 
 TransitionResult MesiDirectory::LockedLine::commitGets(std::uint16_t requester, const DirectorySnapshot &expected,
-                                                       const DirectorySnapshot &next) {
+                                                       const DirectorySnapshot &next, bool requester_reacquire) {
     requireLock();
-    return state_->commit(*entry_, DirectoryOperation::Gets, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Gets, requester, expected, next, requester_reacquire);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitGetm(std::uint16_t requester, const DirectorySnapshot &expected,
-                                                       const DirectorySnapshot &next) {
+                                                       const DirectorySnapshot &next, bool requester_reacquire) {
     requireLock();
-    return state_->commit(*entry_, DirectoryOperation::Getm, requester, expected, next);
+    return state_->commit(*entry_, DirectoryOperation::Getm, requester, expected, next, requester_reacquire);
 }
 
 TransitionResult MesiDirectory::LockedLine::commitUpgrade(std::uint16_t requester, const DirectorySnapshot &expected,
@@ -157,12 +158,13 @@ bool MesiDirectory::hasSharer(const DirectorySnapshot &snapshot, std::uint16_t h
 }
 
 bool MesiDirectory::validTransition(DirectoryOperation operation, std::uint16_t requester,
-                                    const DirectorySnapshot &current, const DirectorySnapshot &next) noexcept {
+                                    const DirectorySnapshot &current, const DirectorySnapshot &next,
+                                    bool requester_reacquire) noexcept {
     switch (operation) {
     case DirectoryOperation::Gets:
-        return validGetsTransition(requester, current, next);
+        return validGetsTransition(requester, current, next, requester_reacquire);
     case DirectoryOperation::Getm:
-        return validGetmTransition(requester, current, next);
+        return validGetmTransition(requester, current, next, requester_reacquire);
     case DirectoryOperation::Upgrade:
         return validUpgradeTransition(requester, current, next);
     case DirectoryOperation::Puts:
@@ -178,7 +180,7 @@ bool MesiDirectory::validTransition(DirectoryOperation operation, std::uint16_t 
 }
 
 bool MesiDirectory::validGetsTransition(std::uint16_t requester, const DirectorySnapshot &current,
-                                        const DirectorySnapshot &next) noexcept {
+                                        const DirectorySnapshot &next, bool requester_reacquire) noexcept {
     const auto requester_bit = holderBit(requester);
     switch (current.state) {
     case MesiState::I:
@@ -187,8 +189,10 @@ bool MesiDirectory::validGetsTransition(std::uint16_t requester, const Directory
         return next.state == MesiState::S && next.sharers == (current.sharers | requester_bit);
     case MesiState::E:
     case MesiState::M: {
-        if (current.owner == requester)
-            return false;
+        if (current.owner == requester) {
+            return requester_reacquire && next.state == MesiState::S && next.owner == std::nullopt &&
+                   next.sharers == requester_bit && next.server_copy_current;
+        }
         if (metadataEqual(current, next))
             return true;
         const auto old_owner_bit = holderBit(*current.owner);
@@ -200,12 +204,12 @@ bool MesiDirectory::validGetsTransition(std::uint16_t requester, const Directory
 }
 
 bool MesiDirectory::validGetmTransition(std::uint16_t requester, const DirectorySnapshot &current,
-                                        const DirectorySnapshot &next) noexcept {
+                                        const DirectorySnapshot &next, bool requester_reacquire) noexcept {
     switch (current.state) {
     case MesiState::I:
         return next.state == MesiState::M && next.owner == requester;
     case MesiState::S:
-        if (hasSharer(current, requester))
+        if (hasSharer(current, requester) && !requester_reacquire)
             return false;
         if (next.state == MesiState::M)
             return next.owner == requester;
@@ -214,7 +218,7 @@ bool MesiDirectory::validGetmTransition(std::uint16_t requester, const Directory
         return next.state == MesiState::S && (next.sharers & ~current.sharers) == 0;
     case MesiState::E:
     case MesiState::M:
-        if (current.owner == requester)
+        if (current.owner == requester && !requester_reacquire)
             return false;
         return metadataEqual(current, next) || next.state == MesiState::I ||
                (next.state == MesiState::M && next.owner == requester);
@@ -416,7 +420,7 @@ std::uint64_t &MesiDirectory::diagnosticFor(DirectoryEntry &entry, DirectoryOper
 
 TransitionResult MesiDirectory::State::commit(DirectoryEntry &entry, DirectoryOperation operation,
                                               std::uint16_t requester, const DirectorySnapshot &expected,
-                                              DirectorySnapshot next) {
+                                              DirectorySnapshot next, bool requester_reacquire) {
     const auto current = MesiDirectory::snapshotOf(entry);
     MesiDirectory::validateSnapshot(current);
     if (!MesiDirectory::validHost(requester))
@@ -425,11 +429,15 @@ TransitionResult MesiDirectory::State::commit(DirectoryEntry &entry, DirectoryOp
         return MesiDirectory::rejected(TransitionStatus::InvalidState, current);
     if (!MesiDirectory::snapshotsEqual(current, expected) || next.epoch != expected.epoch)
         return MesiDirectory::rejected(TransitionStatus::StaleMetadata, current);
-    if (!MesiDirectory::validTransition(operation, requester, current, next))
+    if (!MesiDirectory::validTransition(operation, requester, current, next, requester_reacquire))
         return MesiDirectory::rejected(TransitionStatus::InvalidState, current);
     // Atomic data changes are not represented by the coherence metadata. Even when the current M owner remains the
     // owner, committing the new authoritative bytes must advance the epoch and retain the typed atomic accounting.
-    if (operation != DirectoryOperation::Atomic && MesiDirectory::metadataEqual(current, next))
+    const bool force_reacquire_epoch = requester_reacquire && operation == DirectoryOperation::Getm &&
+                                       current.state == MesiState::M && current.owner == requester &&
+                                       MesiDirectory::metadataEqual(current, next);
+    if (operation != DirectoryOperation::Atomic && !force_reacquire_epoch &&
+        MesiDirectory::metadataEqual(current, next))
         return MesiDirectory::rejected(TransitionStatus::NoChange, current);
 
     next.epoch = current.epoch + 1;

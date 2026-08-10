@@ -364,9 +364,8 @@ void testGetsSnoopsModifiedOwnerForDataAndDowngrades() {
     const auto sent = transport.waitFor(1);
     CHECK(sent[0].first == 1);
     CHECK(opcode(sent[0].second) == Opcode::SnpDataDowngrade);
-    CHECK(epoch(sent[0].second) == 1);
+    CHECK(epoch(sent[0].second) == 2);
     auto ack = ackFor(sent[0].second, dirty);
-    setEpoch(ack, 1);
     const auto disposition = engine.handleSnoopAck(ack);
     CHECK(disposition == AckDisposition::Deferred);
     if (disposition != AckDisposition::Deferred)
@@ -433,6 +432,54 @@ void testGetmTakesDirtyDataBeforeGrantingNewOwner() {
     checkState(directory, kLineA, MesiState::M, 2, 0, 2, false);
 }
 
+void testGrantInstallerRunsBeforeDirectoryLineUnlock() {
+    struct InstallBarrier {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool entered{};
+        bool released{};
+        bool saw_grant{};
+
+        static void install(void *opaque, const TransactionResult &result) noexcept {
+            auto &barrier = *static_cast<InstallBarrier *>(opaque);
+            std::unique_lock lock(barrier.mutex);
+            barrier.saw_grant =
+                result.status == Status::Ok && result.granted && result.transition.snapshot.state == MesiState::M;
+            barrier.entered = true;
+            barrier.changed.notify_all();
+            barrier.changed.wait(lock, [&] { return barrier.released; });
+        }
+    } barrier;
+
+    MesiDirectory directory;
+    FakeMemoryBackend memory;
+    FakeTransport transport;
+    MesiTransactionEngine engine(directory, memory, transport, kTestTimeout);
+    bind(engine, {{1, 101}});
+    TransactionRequest request{1, 101, 90031};
+    request.grant_context = &barrier;
+    request.grant_installer = &InstallBarrier::install;
+
+    auto grant = std::async(std::launch::async, [&] { return engine.getm(kLineA, request); });
+    {
+        std::unique_lock lock(barrier.mutex);
+        CHECK(barrier.changed.wait_for(lock, kTestTimeout, [&] { return barrier.entered; }));
+    }
+    auto observer = std::async(std::launch::async, [&] { return directory.inspect(kLineA); });
+    CHECK(observer.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    {
+        std::lock_guard lock(barrier.mutex);
+        barrier.released = true;
+    }
+    barrier.changed.notify_all();
+
+    const auto result = ready(grant, "grant installer");
+    CHECK(result.status == Status::Ok);
+    CHECK(result.granted);
+    CHECK(barrier.saw_grant);
+    CHECK(ready(observer, "directory observer after grant install").has_value());
+}
+
 void testUpgradeInvalidatesOtherSharersWithoutRefetchingData() {
     MesiDirectory directory;
     CHECK(directory.gets(kLineA, 1).committed());
@@ -467,6 +514,8 @@ void testDuplicateAndStaleAcksCannotMutateEpoch() {
 
     auto first = std::async(std::launch::async, [&] { return engine.getm(kLineA, {3, 103, 9005}); });
     const auto sent = transport.waitFor(2);
+    CHECK(epoch(sent[0].second) == 3);
+    CHECK(epoch(sent[1].second) == 3);
     const auto first_ack = ackFor(sent[0].second);
     CHECK(engine.handleSnoopAck(first_ack) == AckDisposition::Accepted);
     CHECK(engine.handleSnoopAck(first_ack) == AckDisposition::Duplicate);
@@ -480,7 +529,7 @@ void testDuplicateAndStaleAcksCannotMutateEpoch() {
 
     auto second = std::async(std::launch::async, [&] { return engine.gets(kLineA, {4, 104, 9006}); });
     const auto later = transport.waitFor(3);
-    CHECK(epoch(later[2].second) == 3);
+    CHECK(epoch(later[2].second) == 4);
     CHECK(engine.handleSnoopAck(first_ack) == AckDisposition::Stale);
     CHECK(second.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
     CHECK(engine.handleSnoopAck(ackFor(later[2].second, bytes(0x44))) == AckDisposition::Deferred);
@@ -1395,6 +1444,7 @@ int main() {
     testGetsSnoopsModifiedOwnerForDataAndDowngrades();
     testGetmInvalidatesAllSharedHoldersBeforeGrant();
     testGetmTakesDirtyDataBeforeGrantingNewOwner();
+    testGrantInstallerRunsBeforeDirectoryLineUnlock();
     testUpgradeInvalidatesOtherSharersWithoutRefetchingData();
     testDuplicateAndStaleAcksCannotMutateEpoch();
     testSynchronousGrantWaitsForEveryAckEffect();

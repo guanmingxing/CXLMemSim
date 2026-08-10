@@ -295,7 +295,11 @@ void expectResponseError(const protocol::CoherenceFrame &response, const protoco
                          protocol::ValidationError expected) {
     const auto result = protocol::validateResponse(response, request);
     CHECK(!result);
-    CHECK(result.error == expected);
+    if (result.error != expected) {
+        std::cerr << __func__ << ": response error=" << protocol::toString(result.error)
+                  << " expected=" << protocol::toString(expected) << '\n';
+        ++failures;
+    }
 }
 
 void expectAckError(const protocol::CoherenceFrame &ack, const protocol::CoherenceFrame &request,
@@ -441,16 +445,14 @@ void testContextualResponses() {
         expectResponseError(bad, request, protocol::ValidationError::UnexpectedState);
     }
 
-    for (const auto op : {protocol::Opcode::Getm, protocol::Opcode::Upgrade, protocol::Opcode::Puts,
-                          protocol::Opcode::Putm, protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas}) {
+    for (const auto op : {protocol::Opcode::Upgrade, protocol::Opcode::Puts, protocol::Opcode::Putm,
+                          protocol::Opcode::AtomicFaa, protocol::Opcode::AtomicCas}) {
         auto request = command(op);
         protocol::setAddress(request,
                              op == protocol::Opcode::AtomicFaa || op == protocol::Opcode::AtomicCas ? 0x1038 : 0x1000);
         protocol::setEpoch(request, 9);
-        if (op == protocol::Opcode::Getm || op == protocol::Opcode::Puts)
+        if (op == protocol::Opcode::Upgrade || op == protocol::Opcode::Puts)
             protocol::setLineState(request, protocol::LineState::S);
-        else if (op == protocol::Opcode::Upgrade)
-            protocol::setLineState(request, protocol::LineState::E);
         else
             protocol::setLineState(request, protocol::LineState::M);
         if (op == protocol::Opcode::Putm)
@@ -466,7 +468,7 @@ void testContextualResponses() {
                         op == protocol::Opcode::Puts || op == protocol::Opcode::Putm ? protocol::LineState::I
                                                                                      : protocol::LineState::M,
                         10);
-        if (op == protocol::Opcode::Getm || op == protocol::Opcode::AtomicFaa || op == protocol::Opcode::AtomicCas)
+        if (op == protocol::Opcode::AtomicFaa || op == protocol::Opcode::AtomicCas)
             fillLine(response);
         CHECK(protocol::validateResponse(response, request));
         for (const auto invalid_epoch : {9ULL, 8ULL}) {
@@ -555,6 +557,12 @@ void testContextualResponses() {
     protocol::setEpoch(lagging_puts, 9);
     CHECK(protocol::validateResponse(responseFor(lagging_puts, protocol::LineState::I, 12), lagging_puts));
 
+    auto lagging_upgrade = command(protocol::Opcode::Upgrade);
+    protocol::setAddress(lagging_upgrade, 0x1000);
+    protocol::setLineState(lagging_upgrade, protocol::LineState::S);
+    protocol::setEpoch(lagging_upgrade, 9);
+    CHECK(protocol::validateResponse(responseFor(lagging_upgrade, protocol::LineState::M, 12), lagging_upgrade));
+
     auto max_epoch_upgrade = command(protocol::Opcode::Upgrade);
     protocol::setAddress(max_epoch_upgrade, 0x1000);
     protocol::setLineState(max_epoch_upgrade, protocol::LineState::E);
@@ -577,8 +585,6 @@ void testContextualResponses() {
         std::uint64_t unchanged_epoch = 0;
         if (op == protocol::Opcode::Getm) {
             protocol::setAddress(request, 0x1000);
-            unchanged_state = protocol::LineState::S;
-            unchanged_epoch = 11;
         } else if (op == protocol::Opcode::Upgrade) {
             protocol::setAddress(request, 0x1000);
             unchanged_state = protocol::LineState::E;
@@ -627,6 +633,32 @@ void testContextualResponses() {
             expectResponseError(bad, request, protocol::ValidationError::UnexpectedOldValue);
         }
     }
+
+    auto partial_upgrade = command(protocol::Opcode::Upgrade);
+    protocol::setAddress(partial_upgrade, 0x1000);
+    protocol::setLineState(partial_upgrade, protocol::LineState::S);
+    protocol::setEpoch(partial_upgrade, 3);
+    for (const auto failure_status :
+         {protocol::Status::CoherenceTimeout, protocol::Status::HostFenced, protocol::Status::IoError}) {
+        auto committed = responseFor(partial_upgrade, protocol::LineState::S, 4);
+        protocol::setStatus(committed, failure_status);
+        CHECK(protocol::validateResponse(committed, partial_upgrade));
+    }
+
+    auto invalid_failure = responseFor(partial_upgrade, protocol::LineState::S, 4);
+    protocol::setStatus(invalid_failure, protocol::Status::StaleEpoch);
+    expectResponseError(invalid_failure, partial_upgrade, protocol::ValidationError::UnexpectedEpoch);
+    protocol::setStatus(invalid_failure, protocol::Status::CoherenceTimeout);
+    protocol::setLineState(invalid_failure, protocol::LineState::M);
+    expectResponseError(invalid_failure, partial_upgrade, protocol::ValidationError::UnexpectedState);
+
+    auto partial_puts = command(protocol::Opcode::Puts);
+    protocol::setAddress(partial_puts, 0x1000);
+    protocol::setLineState(partial_puts, protocol::LineState::S);
+    protocol::setEpoch(partial_puts, 3);
+    auto invalid_puts_failure = responseFor(partial_puts, protocol::LineState::I, 4);
+    protocol::setStatus(invalid_puts_failure, protocol::Status::CoherenceTimeout);
+    expectResponseError(invalid_puts_failure, partial_puts, protocol::ValidationError::UnexpectedState);
 
     auto request = command(protocol::Opcode::Gets);
     protocol::setAddress(request, 0x1000);
@@ -791,9 +823,9 @@ void testRequestStateEpochMatrixAndUnusedFields() {
         check_line(protocol::Opcode::Gets, state, state == protocol::LineState::I ? 0 : 2,
                    state == protocol::LineState::I);
         check_line(protocol::Opcode::Getm, state, state == protocol::LineState::I ? 0 : 2,
-                   state == protocol::LineState::I || state == protocol::LineState::S);
+                   state == protocol::LineState::I);
         check_line(protocol::Opcode::Upgrade, state, state == protocol::LineState::I ? 0 : 2,
-                   state == protocol::LineState::E);
+                   state == protocol::LineState::S || state == protocol::LineState::E);
         check_line(protocol::Opcode::Puts, state, state == protocol::LineState::I ? 0 : 2,
                    state == protocol::LineState::S || state == protocol::LineState::E);
         check_line(protocol::Opcode::Putm, state, state == protocol::LineState::I ? 0 : 2,

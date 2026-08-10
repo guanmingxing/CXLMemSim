@@ -56,6 +56,11 @@ set(SOURCE_FILES
     src/mesi_directory.cpp
     src/mesi_transaction_engine.cpp
     src/coherence_protocol_v2.cpp
+    src/coherence_endpoint_cache.cpp
+    src/coherence_server_v2.cpp
+    src/coherence_tcp_transport_v2.cpp
+    src/coherence_shm_transport_v2.cpp
+    src/coherence_rdma_transport_v2.cpp
     src/endpoint_session_registry.cpp
     src/policy.cpp
     src/helper.cpp
@@ -112,7 +117,8 @@ else()
 endif()
 
 # Server library (shared between server executable and tests)
-set(SERVER_LIB_SOURCES src/shared_memory_manager.cc src/shm_communication.cpp src/distributed_server.cpp src/tcp_communication.cpp src/rdma_communication.cpp)
+set(SERVER_LIB_SOURCES src/shared_memory_manager.cc src/shm_communication.cpp src/distributed_server.cpp src/tcp_communication.cpp src/rdma_communication.cpp
+                       src/coherence_server_runtime_v2.cpp)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/ssd_streaming_backend.h" AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ssd_streaming_backend.cpp")
     message(STATUS "SSD streaming backend enabled")
@@ -212,6 +218,64 @@ target_include_directories(test_mesi_writeback_and_atomics PRIVATE include)
 target_link_libraries(test_mesi_writeback_and_atomics cxlmemsim)
 add_test(NAME test_mesi_writeback_and_atomics COMMAND test_mesi_writeback_and_atomics)
 set_tests_properties(test_mesi_writeback_and_atomics PROPERTIES TIMEOUT 30)
+
+add_executable(test_type2_coherence_litmus tests/test_type2_coherence_litmus.cpp)
+target_include_directories(test_type2_coherence_litmus PRIVATE include)
+target_link_libraries(test_type2_coherence_litmus cxlmemsim)
+add_test(NAME test_type2_coherence_litmus COMMAND test_type2_coherence_litmus)
+set_tests_properties(test_type2_coherence_litmus PROPERTIES TIMEOUT 30)
+
+add_executable(test_type2_device_litmus_contract tests/test_type2_device_litmus_contract.c)
+target_compile_options(test_type2_device_litmus_contract PRIVATE -std=gnu11)
+add_test(NAME test_type2_device_litmus_contract COMMAND test_type2_device_litmus_contract)
+
+add_executable(test_endpoint_eviction_race tests/test_endpoint_eviction_race.cpp)
+target_include_directories(test_endpoint_eviction_race PRIVATE include)
+target_link_libraries(test_endpoint_eviction_race cxlmemsim)
+add_test(NAME test_endpoint_eviction_race COMMAND test_endpoint_eviction_race)
+set_tests_properties(test_endpoint_eviction_race PROPERTIES TIMEOUT 15)
+
+add_executable(test_endpoint_completion_semantics tests/test_endpoint_completion_semantics.cpp)
+target_include_directories(test_endpoint_completion_semantics PRIVATE include)
+target_link_libraries(test_endpoint_completion_semantics cxlmemsim)
+add_test(NAME test_endpoint_completion_semantics COMMAND test_endpoint_completion_semantics)
+set_tests_properties(test_endpoint_completion_semantics PROPERTIES TIMEOUT 15)
+
+add_executable(test_coherence_server_v2 tests/test_coherence_server_v2.cpp)
+target_include_directories(test_coherence_server_v2 PRIVATE include)
+target_link_libraries(test_coherence_server_v2 cxlmemsim)
+add_test(NAME test_coherence_server_v2 COMMAND test_coherence_server_v2)
+set_tests_properties(test_coherence_server_v2 PROPERTIES TIMEOUT 30)
+
+add_executable(test_coherence_tcp_transport_v2 tests/test_coherence_tcp_transport_v2.cpp)
+target_include_directories(test_coherence_tcp_transport_v2 PRIVATE include)
+target_link_libraries(test_coherence_tcp_transport_v2 cxlmemsim)
+add_test(NAME test_coherence_tcp_transport_v2 COMMAND test_coherence_tcp_transport_v2)
+set_tests_properties(test_coherence_tcp_transport_v2 PROPERTIES TIMEOUT 10)
+
+add_executable(test_coherence_server_runtime_v2 tests/test_coherence_server_runtime_v2.cpp)
+target_include_directories(test_coherence_server_runtime_v2 PRIVATE include src)
+target_link_libraries(test_coherence_server_runtime_v2 cxlmemsim_server_lib cxlmemsim ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_coherence_server_runtime_v2 COMMAND test_coherence_server_runtime_v2)
+set_tests_properties(test_coherence_server_runtime_v2 PROPERTIES TIMEOUT 10)
+
+add_executable(test_coherence_shm_transport_v2 tests/test_coherence_shm_transport_v2.cpp)
+target_include_directories(test_coherence_shm_transport_v2 PRIVATE include)
+target_link_libraries(test_coherence_shm_transport_v2 cxlmemsim ${RT_LIB})
+add_test(NAME test_coherence_shm_transport_v2 COMMAND test_coherence_shm_transport_v2)
+set_tests_properties(test_coherence_shm_transport_v2 PROPERTIES TIMEOUT 15)
+
+add_executable(test_coherence_rdma_transport_v2 tests/test_coherence_rdma_transport_v2.cpp)
+target_include_directories(test_coherence_rdma_transport_v2 PRIVATE include)
+target_link_libraries(test_coherence_rdma_transport_v2 cxlmemsim)
+add_test(NAME test_coherence_rdma_transport_v2 COMMAND test_coherence_rdma_transport_v2)
+set_tests_properties(test_coherence_rdma_transport_v2 PROPERTIES TIMEOUT 15)
+
+add_executable(test_mesi_reported_state_recovery tests/test_mesi_reported_state_recovery.cpp)
+target_include_directories(test_mesi_reported_state_recovery PRIVATE include)
+target_link_libraries(test_mesi_reported_state_recovery cxlmemsim)
+add_test(NAME test_mesi_reported_state_recovery COMMAND test_mesi_reported_state_recovery)
+set_tests_properties(test_mesi_reported_state_recovery PROPERTIES TIMEOUT 15)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.

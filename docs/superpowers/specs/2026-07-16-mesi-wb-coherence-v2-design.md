@@ -342,8 +342,8 @@ Endpoint reads behave as follows:
 Endpoint writes behave as follows:
 
 - `M` hit: merge locally and remain `M`;
-- `E` hit: send explicit `UPGRADE`, then merge locally;
-- `S`, `I`, or miss: send `GETM`, install the complete line as `M`, then merge.
+- `S` or `E` hit: send explicit `UPGRADE`, then merge locally;
+- `I` or miss: send `GETM`, install the complete line as `M`, then merge.
 
 An access spanning line boundaries is split into increasing-address line
 operations. Each partial write first obtains the complete line and merges only
@@ -458,8 +458,7 @@ sharer, because another sharer can be added or removed without changing this
 endpoint's bytes or state. Request validation therefore follows these rules:
 
 - a miss or local `I` request uses `epoch = 0`;
-- `UPGRADE`, `PUTS`, `PUTM`, and a cache-resident `GETM` carry the endpoint's
-  installed epoch and state;
+- `UPGRADE`, `PUTS`, and `PUTM` carry the endpoint's installed epoch and state;
 - a request reconciling an unresolved snoop completion uses `state = I` and
   `epoch = 0`, while the completion record remains available to the progress
   thread for a server re-snoop;

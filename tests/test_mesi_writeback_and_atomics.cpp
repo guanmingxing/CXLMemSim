@@ -1400,7 +1400,7 @@ void testUnregisterRejectsInFlightResponseRetirementBeforeMutation() {
         release_sender = true;
     }
     sender_changed.notify_all();
-    CHECK(ready(publishing, "in-flight response retirement") == PinResponseResult::Pinned);
+    CHECK(ready(publishing, "in-flight response retirement") == PinResponseResult::DeliveryFailed);
 }
 
 void testRound2AuthorityAndStickyLossSurfacesArePresent() {

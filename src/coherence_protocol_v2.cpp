@@ -111,9 +111,9 @@ bool validRequestState(Opcode op, LineState state, std::uint64_t request_epoch) 
     if (op == Opcode::Gets)
         return state == LineState::I && request_epoch == 0;
     if (op == Opcode::Getm)
-        return (state == LineState::I && request_epoch == 0) || (state == LineState::S && request_epoch != 0);
+        return state == LineState::I && request_epoch == 0;
     if (op == Opcode::Upgrade)
-        return state == LineState::E && request_epoch != 0;
+        return (state == LineState::S || state == LineState::E) && request_epoch != 0;
     if (op == Opcode::Puts)
         return (state == LineState::S || state == LineState::E) && request_epoch != 0;
     if (op == Opcode::Putm)
@@ -412,10 +412,38 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
         value(response) != 0 || size(response) != 0)
         return bad(ValidationError::UnexpectedValue);
     if (status(response) != Status::Ok) {
-        if (lineState(response) != lineState(request))
-            return bad(ValidationError::UnexpectedState);
-        if (epoch(response) != epoch(request))
-            return bad(ValidationError::UnexpectedEpoch);
+        const bool state_changed = lineState(response) != lineState(request);
+        const bool epoch_changed = epoch(response) != epoch(request);
+        if (state_changed || epoch_changed) {
+            if (state_changed && !epoch_changed)
+                return bad(ValidationError::UnexpectedState);
+            const auto failure_status = status(response);
+            const bool post_snoop_status = failure_status == Status::CoherenceTimeout ||
+                                           failure_status == Status::HostFenced || failure_status == Status::IoError;
+            bool post_snoop_state = false;
+            switch (request_op) {
+            case Opcode::Gets:
+                post_snoop_state = lineState(request) == LineState::I && lineState(response) == LineState::S;
+                break;
+            case Opcode::Getm:
+            case Opcode::AtomicFaa:
+            case Opcode::AtomicCas:
+                post_snoop_state = lineState(response) == LineState::I || lineState(response) == LineState::S;
+                break;
+            case Opcode::Upgrade:
+                post_snoop_state = lineState(request) == LineState::S && lineState(response) == LineState::S;
+                break;
+            default:
+                break;
+            }
+            if (!post_snoop_status || !post_snoop_state) {
+                if (state_changed)
+                    return bad(ValidationError::UnexpectedState);
+                return bad(ValidationError::UnexpectedEpoch);
+            }
+            if (epoch(response) <= epoch(request))
+                return bad(ValidationError::UnexpectedEpoch);
+        }
         if (payloadLength(response) != 0)
             return bad(ValidationError::InvalidPayloadLength);
         if (status(response) == Status::StaleRequest ? oldValue(response) <= requestId(request)
@@ -435,7 +463,7 @@ ValidationResult validateResponse(const CoherenceFrame &response, const Coherenc
     if (state_changing_response && epoch(response) <= epoch(request))
         return bad(ValidationError::UnexpectedEpoch);
     const bool exact_owner_epoch =
-        request_op == Opcode::Upgrade || request_op == Opcode::Putm ||
+        (request_op == Opcode::Upgrade && lineState(request) == LineState::E) || request_op == Opcode::Putm ||
         (request_op == Opcode::Puts && lineState(request) == LineState::E) ||
         (isAtomic(request_op) && (lineState(request) == LineState::E || lineState(request) == LineState::M));
     if (exact_owner_epoch && epoch(response) - epoch(request) != 1)

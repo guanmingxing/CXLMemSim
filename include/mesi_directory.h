@@ -120,9 +120,9 @@ public:
         // metadata change commits next with epoch + 1 and increments exactly
         // one matching global and per-entry counter.
         TransitionResult commitGets(std::uint16_t requester, const DirectorySnapshot &expected,
-                                    const DirectorySnapshot &next);
+                                    const DirectorySnapshot &next, bool requester_reacquire = false);
         TransitionResult commitGetm(std::uint16_t requester, const DirectorySnapshot &expected,
-                                    const DirectorySnapshot &next);
+                                    const DirectorySnapshot &next, bool requester_reacquire = false);
         TransitionResult commitUpgrade(std::uint16_t requester, const DirectorySnapshot &expected,
                                        const DirectorySnapshot &next);
         TransitionResult commitPuts(std::uint16_t requester, const DirectorySnapshot &expected,
@@ -183,11 +183,11 @@ private:
     static std::uint64_t holderBit(std::uint16_t host_id) noexcept;
     static bool hasSharer(const DirectorySnapshot &snapshot, std::uint16_t host_id) noexcept;
     static bool validTransition(DirectoryOperation operation, std::uint16_t requester, const DirectorySnapshot &current,
-                                const DirectorySnapshot &next) noexcept;
+                                const DirectorySnapshot &next, bool requester_reacquire = false) noexcept;
     static bool validGetsTransition(std::uint16_t requester, const DirectorySnapshot &current,
-                                    const DirectorySnapshot &next) noexcept;
+                                    const DirectorySnapshot &next, bool requester_reacquire = false) noexcept;
     static bool validGetmTransition(std::uint16_t requester, const DirectorySnapshot &current,
-                                    const DirectorySnapshot &next) noexcept;
+                                    const DirectorySnapshot &next, bool requester_reacquire = false) noexcept;
     static bool validUpgradeTransition(std::uint16_t requester, const DirectorySnapshot &current,
                                        const DirectorySnapshot &next) noexcept;
     static bool validPutsTransition(std::uint16_t requester, const DirectorySnapshot &current,

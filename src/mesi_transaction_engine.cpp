@@ -37,6 +37,40 @@ bool isAtomicOperation(MesiTransactionEngine::Operation operation) noexcept {
            operation == MesiTransactionEngine::Operation::AtomicCas;
 }
 
+protocol_v2::Status validateReportedPermission(const TransactionRequest &request,
+                                               MesiTransactionEngine::Operation operation,
+                                               const DirectorySnapshot &current) noexcept {
+    if (!request.local_state)
+        return protocol_v2::Status::Ok;
+
+    const auto state = *request.local_state;
+    const bool valid_command_state =
+        ((operation == MesiTransactionEngine::Operation::Gets || operation == MesiTransactionEngine::Operation::Getm) &&
+         state == protocol_v2::LineState::I) ||
+        (operation == MesiTransactionEngine::Operation::Upgrade &&
+         (state == protocol_v2::LineState::S || state == protocol_v2::LineState::E)) ||
+        isAtomicOperation(operation);
+    if (!valid_command_state || (state == protocol_v2::LineState::I) != (request.installed_epoch == 0))
+        return protocol_v2::Status::InvalidState;
+    if (state == protocol_v2::LineState::I)
+        return protocol_v2::Status::Ok;
+    if (request.installed_epoch > current.epoch)
+        return protocol_v2::Status::StaleEpoch;
+
+    if (state == protocol_v2::LineState::S) {
+        if (current.state != MesiState::S || (current.sharers & holder(request.host_id)) == 0)
+            return protocol_v2::Status::InvalidState;
+        return protocol_v2::Status::Ok;
+    }
+
+    const auto expected_state = state == protocol_v2::LineState::E   ? MesiState::E
+                                : state == protocol_v2::LineState::M ? MesiState::M
+                                                                     : MesiState::I;
+    if (current.state != expected_state || current.owner != request.host_id)
+        return protocol_v2::Status::InvalidState;
+    return request.installed_epoch == current.epoch ? protocol_v2::Status::Ok : protocol_v2::Status::StaleEpoch;
+}
+
 class FencedCleanupLease {
 public:
     FencedCleanupLease(EndpointSessionRegistry &registry, CleanupAuthority &authority)
@@ -368,7 +402,10 @@ TransactionResult MesiTransactionEngine::puts(std::uint64_t line_address, Transa
         next = {MesiState::I, std::nullopt, 0, current.epoch, true};
     }
     const auto transition = line->commitPuts(request.host_id, current, next);
-    return {statusFor(transition.status), transition, false, {}};
+    const TransactionResult result{statusFor(transition.status), transition, false, {}};
+    if (transition.committed() && request.commit_installer != nullptr)
+        request.commit_installer(request.commit_context, result);
+    return result;
 }
 
 TransactionResult MesiTransactionEngine::putm(std::uint64_t line_address, TransactionRequest request,
@@ -404,7 +441,10 @@ TransactionResult MesiTransactionEngine::putm(std::uint64_t line_address, Transa
     }
     const auto transition =
         line->commitPutm(request.host_id, current, {MesiState::I, std::nullopt, 0, current.epoch, true});
-    return {statusFor(transition.status), transition, false, {}};
+    const TransactionResult result{statusFor(transition.status), transition, false, {}};
+    if (transition.committed() && request.commit_installer != nullptr)
+        request.commit_installer(request.commit_context, result);
+    return result;
 }
 
 TransitionResult MesiTransactionEngine::puts(std::uint64_t line_address, std::uint16_t requester) {
@@ -434,8 +474,17 @@ TransactionResult MesiTransactionEngine::acquire(std::uint64_t line_address, Tra
     const auto current = locked->snapshot();
     if (locked->pendingTransaction())
         return {protocol_v2::Status::InvalidState, unchanged(TransitionStatus::InvalidState, current), false, {}};
+    if (const auto reported = validateReportedPermission(request, operation, current);
+        reported != protocol_v2::Status::Ok)
+        return {reported,
+                unchanged(reported == protocol_v2::Status::StaleEpoch ? TransitionStatus::StaleMetadata
+                                                                      : TransitionStatus::InvalidState,
+                          current),
+                false,
+                {}};
+    const bool requester_reports_invalid = request.local_state && *request.local_state == protocol_v2::LineState::I;
     if ((operation == Operation::Getm && current.state == MesiState::S &&
-         (current.sharers & holder(request.host_id)) != 0) ||
+         (current.sharers & holder(request.host_id)) != 0 && !requester_reports_invalid) ||
         (operation == Operation::Upgrade &&
          !((current.state == MesiState::E && current.owner == request.host_id) ||
            (current.state == MesiState::S && (current.sharers & holder(request.host_id)) != 0)))) {
@@ -445,13 +494,13 @@ TransactionResult MesiTransactionEngine::acquire(std::uint64_t line_address, Tra
     bool needs_snoops = false;
     switch (operation) {
     case Operation::Gets:
-        needs_snoops =
-            (current.state == MesiState::E || current.state == MesiState::M) && current.owner != request.host_id;
+        needs_snoops = (current.state == MesiState::E || current.state == MesiState::M) &&
+                       (current.owner != request.host_id || requester_reports_invalid);
         break;
     case Operation::Getm:
         needs_snoops =
-            current.state == MesiState::S ||
-            ((current.state == MesiState::E || current.state == MesiState::M) && current.owner != request.host_id);
+            current.state == MesiState::S || ((current.state == MesiState::E || current.state == MesiState::M) &&
+                                              (current.owner != request.host_id || requester_reports_invalid));
         break;
     case Operation::Upgrade:
         needs_snoops = current.state == MesiState::S && (current.sharers & ~holder(request.host_id)) != 0;
@@ -544,12 +593,14 @@ TransactionResult MesiTransactionEngine::direct(MesiDirectory::LockedLine &line,
         return {protocol_v2::Status::HostFenced, unchanged(TransitionStatus::InvalidState, current), false, {}};
 
     TransitionResult transition{TransitionStatus::InvalidState, current};
+    const bool requester_reacquire =
+        request.local_state && *request.local_state == protocol_v2::LineState::I && current.state != MesiState::I;
     switch (operation) {
     case Operation::Gets:
-        transition = line.commitGets(request.host_id, current, next);
+        transition = line.commitGets(request.host_id, current, next, requester_reacquire);
         break;
     case Operation::Getm:
-        transition = line.commitGetm(request.host_id, current, next);
+        transition = line.commitGetm(request.host_id, current, next, requester_reacquire);
         break;
     case Operation::Upgrade:
         transition = line.commitUpgrade(request.host_id, current, next);
@@ -561,7 +612,12 @@ TransactionResult MesiTransactionEngine::direct(MesiDirectory::LockedLine &line,
     }
     const auto status = statusFor(transition.status);
     const bool granted = status == protocol_v2::Status::Ok;
-    return {status, transition, granted, data, old_value};
+    const TransactionResult result{status, transition, granted, data, old_value};
+    if (transition.committed() && request.commit_installer != nullptr)
+        request.commit_installer(request.commit_context, result);
+    if (granted && request.grant_installer != nullptr)
+        request.grant_installer(request.grant_context, result);
+    return result;
 }
 
 std::optional<std::uint64_t> MesiTransactionEngine::allocateSnoopId() noexcept {
@@ -659,7 +715,7 @@ TransactionResult MesiTransactionEngine::transact(MesiDirectory::LockedLine &lin
         protocol_v2::setSessionId(snoop, session_id);
         protocol_v2::setSnoopId(snoop, *snoop_id);
         protocol_v2::setAddress(snoop, pending->line_address);
-        protocol_v2::setEpoch(snoop, pending->starting_epoch);
+        protocol_v2::setEpoch(snoop, pending->target_epoch);
         pending->expected.push_back({host_id, session_id, protocol_v2::snoopId(snoop), prior_state, snoop});
         return true;
     };
@@ -968,13 +1024,16 @@ TransactionResult MesiTransactionEngine::reconcile(MesiDirectory::LockedLine &li
     }
 
     TransitionResult transition = unchanged(TransitionStatus::NoChange, current);
+    const bool requester_reacquire = pending->requester.local_state &&
+                                     *pending->requester.local_state == protocol_v2::LineState::I &&
+                                     current.state != MesiState::I;
     if (has_effect) {
         switch (pending->operation) {
         case Operation::Gets:
-            transition = line.commitGets(pending->requester.host_id, current, next);
+            transition = line.commitGets(pending->requester.host_id, current, next, requester_reacquire);
             break;
         case Operation::Getm:
-            transition = line.commitGetm(pending->requester.host_id, current, next);
+            transition = line.commitGetm(pending->requester.host_id, current, next, requester_reacquire);
             break;
         case Operation::Upgrade:
             transition = line.commitUpgrade(pending->requester.host_id, current, next);
@@ -1021,7 +1080,12 @@ TransactionResult MesiTransactionEngine::reconcile(MesiDirectory::LockedLine &li
                         pending->requester.session_id, pending->line_address, current.epoch);
         }
     }
-    return {status, transition, granted, data, pending->atomic_old_value};
+    const TransactionResult result{status, transition, granted, data, pending->atomic_old_value};
+    if (transition.committed() && pending->requester.commit_installer != nullptr)
+        pending->requester.commit_installer(pending->requester.commit_context, result);
+    if (granted && pending->requester.grant_installer != nullptr)
+        pending->requester.grant_installer(pending->requester.grant_context, result);
+    return result;
 }
 
 AckDisposition MesiTransactionEngine::handleSnoopAck(const protocol_v2::CoherenceFrame &ack) {
@@ -1059,7 +1123,7 @@ AckDisposition MesiTransactionEngine::handleSnoopAck(const protocol_v2::Coherenc
     if (!expected->dispatched)
         return stale();
     if (protocol_v2::srcHost(ack) != expected->host_id || protocol_v2::sessionId(ack) != expected->session_id ||
-        protocol_v2::address(ack) != pending->line_address || protocol_v2::epoch(ack) != pending->starting_epoch ||
+        protocol_v2::address(ack) != pending->line_address || protocol_v2::epoch(ack) != pending->target_epoch ||
         pending->target_epoch != pending->starting_epoch + 1)
         return stale();
     if (expected->acknowledged)
