@@ -157,3 +157,6 @@ target_compile_options(test_dax_litmus_atomic PRIVATE -std=gnu11)
 add_executable(test_dax_litmus_tearing test_dax_litmus_tearing.c)
 target_compile_options(test_dax_litmus_tearing PRIVATE -std=gnu11)
 target_compile_definitions(st_serial256 PRIVATE -DFENCE_COUNT=256)
+
+add_executable(type2_device_litmus type2_device_litmus.c)
+target_compile_options(type2_device_litmus PRIVATE -std=gnu11)

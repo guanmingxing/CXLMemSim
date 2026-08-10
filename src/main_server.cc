@@ -9,6 +9,10 @@
  */
 
 #include "../include/shared_memory_manager.h"
+#include "coherence_server_runtime_v2.h"
+#include "coherence_server_v2.h"
+#include "coherence_shm_transport_v2.h"
+#include "coherence_tcp_transport_v2.h"
 #include "cxl_backend.h"
 #include "cxlcontroller.h"
 #include "cxlendpoint.h"
@@ -30,9 +34,9 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <set>
 #include <shared_mutex>
 #include <signal.h>
-#include <set>
 #include <spdlog/cfg/env.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
@@ -154,6 +158,21 @@ private:
     SharedMemoryManager::BackingMode backing_mode_;
     SharedMemoryManager::SsdStreamingConfig ssd_config_;
 
+    // Explicit protocol-v2 coherent domain. These objects are absent unless
+    // --coherence-v2 is enabled, leaving the v1 server behavior unchanged.
+    bool coherence_v2_enabled_;
+    std::chrono::milliseconds coherence_v2_snoop_timeout_;
+    std::unique_ptr<cxlmemsim::SharedMemoryCoherenceBackend> coherence_v2_memory_;
+    std::unique_ptr<cxlmemsim::mesi_v2::MesiDirectory> coherence_v2_directory_;
+    std::unique_ptr<cxlmemsim::EndpointSessionRegistry> coherence_v2_registry_;
+    std::unique_ptr<cxlmemsim::mesi_v2::MesiTransactionEngine> coherence_v2_engine_;
+    std::unique_ptr<cxlmemsim::CoherenceServerV2> coherence_v2_server_;
+    std::atomic<std::uint64_t> next_coherence_v2_connection_id_{1};
+    std::string coherence_v2_shm_name_;
+    std::unique_ptr<cxlmemsim::CoherenceShmTransportV2> coherence_v2_shm_listener_;
+    std::vector<std::thread> coherence_v2_shm_threads_;
+    std::mutex coherence_v2_shm_threads_mutex_;
+
     // Memory storage with coherency tracking (metadata only)
     // Actual data is in shared memory managed by shm_manager
     std::shared_mutex memory_mutex;
@@ -221,15 +240,18 @@ private:
     }
 
 public:
-    ThreadPerConnectionServer(int port, CXLController *ctrl, size_t capacity_mb, const std::string &backing_file = "",
-                              CommMode mode = CommMode::TCP,
-                              const std::string &pgas_shm_name = "/cxlmemsim_pgas",
-                              SharedMemoryManager::BackingMode backing_mode =
-                                  SharedMemoryManager::BackingMode::SharedMemory,
-                              const SharedMemoryManager::SsdStreamingConfig &ssd_config = {})
+    ThreadPerConnectionServer(
+        int port, CXLController *ctrl, size_t capacity_mb, const std::string &backing_file = "",
+        CommMode mode = CommMode::TCP, const std::string &pgas_shm_name = "/cxlmemsim_pgas",
+        SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory,
+        const SharedMemoryManager::SsdStreamingConfig &ssd_config = {}, bool coherence_v2_enabled = false,
+        std::chrono::milliseconds coherence_v2_snoop_timeout = std::chrono::milliseconds(1000),
+        std::string coherence_v2_shm_name = "/cxlmemsim_coherence_v2")
         : server_fd(-1), port(port), controller(ctrl), running(true), next_thread_id(0), comm_mode(mode),
           pgas_shm_name_(pgas_shm_name), pgas_shm_fd_(-1), pgas_shm_header_(nullptr), pgas_memory_(nullptr),
-          pgas_memory_size_(0), backing_file_(backing_file), backing_mode_(backing_mode), ssd_config_(ssd_config) {
+          pgas_memory_size_(0), backing_file_(backing_file), backing_mode_(backing_mode), ssd_config_(ssd_config),
+          coherence_v2_enabled_(coherence_v2_enabled), coherence_v2_snoop_timeout_(coherence_v2_snoop_timeout),
+          coherence_v2_shm_name_(std::move(coherence_v2_shm_name)) {
         congestion_info.active_requests = 0;
         congestion_info.total_bandwidth_used = 0;
         congestion_info.last_reset = std::chrono::steady_clock::now();
@@ -243,6 +265,16 @@ public:
             shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, "/cxlmemsim_shared", true, backing_file_);
         } else {
             shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb);
+        }
+
+        if (coherence_v2_enabled_) {
+            coherence_v2_memory_ = std::make_unique<cxlmemsim::SharedMemoryCoherenceBackend>(*shm_manager);
+            coherence_v2_directory_ = std::make_unique<cxlmemsim::mesi_v2::MesiDirectory>();
+            coherence_v2_registry_ = std::make_unique<cxlmemsim::EndpointSessionRegistry>();
+            coherence_v2_engine_ =
+                std::make_unique<cxlmemsim::mesi_v2::MesiTransactionEngine>(*coherence_v2_directory_);
+            coherence_v2_server_ = std::make_unique<cxlmemsim::CoherenceServerV2>(
+                *coherence_v2_engine_, *coherence_v2_registry_, *coherence_v2_memory_, coherence_v2_snoop_timeout_);
         }
 
         // Initialize LSA storage (256KB default per CXL spec)
@@ -259,6 +291,7 @@ public:
     // Shared memory mode methods
     void run_shm_mode();
     void handle_shm_requests();
+    void handle_coherence_v2_shm_connections();
 
     // PGAS Shared memory mode methods (cxl_backend.h protocol)
     bool init_pgas_shm(const std::string &shm_name, size_t memory_size);
@@ -306,7 +339,7 @@ void signal_handler(int sig) {
 static bool shutdown_requested() { return g_shutdown_requested != 0; }
 
 static void install_signal_handlers() {
-    struct sigaction action {};
+    struct sigaction action{};
     action.sa_handler = signal_handler;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
@@ -356,6 +389,9 @@ struct ServerOptions {
     uint32_t gfam_hosts = 16;
     double gfam_fabric_latency = 80.0;
     double gfam_bandwidth = 64.0;
+    bool coherence_v2 = false;
+    std::uint64_t coherence_v2_snoop_timeout_ms = 1000;
+    std::string coherence_v2_shm_name = "/cxlmemsim_coherence_v2";
 };
 
 static void print_server_help(const char *program) {
@@ -392,7 +428,10 @@ static void print_server_help(const char *program) {
               << "      --enable-gfam[=true|false]     Enable GFAM model\n"
               << "      --gfam-hosts <count>           Number of GFAM host ports\n"
               << "      --gfam-fabric-latency <ns>     GFAM fabric traversal latency\n"
-              << "      --gfam-bandwidth <GB/s>        Aggregate GFAM fabric bandwidth\n";
+              << "      --gfam-bandwidth <GB/s>        Aggregate GFAM fabric bandwidth\n"
+              << "      --coherence-v2[=true|false]    Enable registered MESI v2 endpoints\n"
+              << "      --coherence-v2-snoop-timeout-ms <ms>  Synchronous snoop timeout\n"
+              << "      --coherence-v2-shm-name <name> Separate v2 duplex SHM object\n";
 }
 
 static bool option_has_value(const std::string &arg) { return !arg.empty() && arg[0] != '-'; }
@@ -584,6 +623,12 @@ static bool parse_server_options(int argc, char *argv[], ServerOptions &opts, st
                 opts.gfam_fabric_latency = std::stod(get_value(key));
             } else if (key == "gfam-bandwidth") {
                 opts.gfam_bandwidth = std::stod(get_value(key));
+            } else if (key == "coherence-v2") {
+                opts.coherence_v2 = parse_optional_bool_option(argc, argv, i, value, has_inline_value);
+            } else if (key == "coherence-v2-snoop-timeout-ms") {
+                opts.coherence_v2_snoop_timeout_ms = std::stoull(get_value(key));
+            } else if (key == "coherence-v2-shm-name") {
+                opts.coherence_v2_shm_name = get_value(key);
             } else {
                 throw std::invalid_argument("Unknown option: --" + key);
             }
@@ -638,14 +683,15 @@ int main(int argc, char *argv[]) {
     uint32_t gfam_hosts = opts.gfam_hosts;
     double gfam_fabric_latency = opts.gfam_fabric_latency;
     double gfam_bandwidth = opts.gfam_bandwidth;
+    bool coherence_v2 = opts.coherence_v2;
+    auto coherence_v2_snoop_timeout = std::chrono::milliseconds(opts.coherence_v2_snoop_timeout_ms);
+    const auto &coherence_v2_shm_name = opts.coherence_v2_shm_name;
 
     SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory;
     if (!backing_mode_str.empty()) {
-        if (backing_mode_str == "shm" || backing_mode_str == "shared-memory" ||
-            backing_mode_str == "shared_memory") {
+        if (backing_mode_str == "shm" || backing_mode_str == "shared-memory" || backing_mode_str == "shared_memory") {
             backing_mode = SharedMemoryManager::BackingMode::SharedMemory;
-        } else if (backing_mode_str == "file" || backing_mode_str == "mmap-file" ||
-                   backing_mode_str == "mmap_file") {
+        } else if (backing_mode_str == "file" || backing_mode_str == "mmap-file" || backing_mode_str == "mmap_file") {
             backing_mode = SharedMemoryManager::BackingMode::FileMmap;
         } else if (backing_mode_str == "ssd-stream" || backing_mode_str == "ssd_stream") {
             backing_mode = SharedMemoryManager::BackingMode::SsdStream;
@@ -691,8 +737,7 @@ int main(int argc, char *argv[]) {
     ssd_config.page_size = opts.ssd_page_size;
     ssd_config.io_chunk_size = opts.ssd_io_chunk_size;
     ssd_config.cache_pages = static_cast<size_t>(
-        (static_cast<uint64_t>(opts.ssd_cache_mb) * 1024ULL * 1024ULL + opts.ssd_page_size - 1) /
-        opts.ssd_page_size);
+        (static_cast<uint64_t>(opts.ssd_cache_mb) * 1024ULL * 1024ULL + opts.ssd_page_size - 1) / opts.ssd_page_size);
     ssd_config.read_ahead_pages = opts.ssd_read_ahead_pages;
     ssd_config.use_io_uring = opts.ssd_io_uring;
     ssd_config.use_odirect = opts.ssd_odirect;
@@ -720,6 +765,15 @@ int main(int argc, char *argv[]) {
         comm_mode = CommMode::DISTRIBUTED;
     } else if (comm_mode_str != "tcp") {
         SPDLOG_ERROR("Invalid communication mode: {}. Use 'tcp', 'shm', 'pgas-shm', or 'distributed'", comm_mode_str);
+        return 1;
+    }
+
+    if (coherence_v2 && comm_mode != CommMode::TCP && comm_mode != CommMode::SHM) {
+        SPDLOG_ERROR("--coherence-v2 requires --comm-mode=tcp or --comm-mode=shm");
+        return 1;
+    }
+    if (coherence_v2 && opts.coherence_v2_snoop_timeout_ms == 0) {
+        SPDLOG_ERROR("--coherence-v2-snoop-timeout-ms must be non-zero");
         return 1;
     }
 
@@ -786,7 +840,7 @@ int main(int argc, char *argv[]) {
     }
 
     SPDLOG_INFO("========================================");
-    SPDLOG_INFO("CXLMemSim CXL Type3 Memory Server");
+    SPDLOG_INFO("CXLMemSim CXL Type-2/Type-3 Memory Server");
     SPDLOG_INFO("========================================");
     SPDLOG_INFO("Server Configuration:");
     const char *mode_str = (comm_mode == CommMode::TCP)        ? "TCP"
@@ -794,6 +848,12 @@ int main(int argc, char *argv[]) {
                            : (comm_mode == CommMode::PGAS_SHM) ? "PGAS Shared Memory (cxl_backend.h)"
                                                                : "Distributed Multi-Node";
     SPDLOG_INFO("  Communication Mode: {}", mode_str);
+    SPDLOG_INFO("  Coherence protocol: {}", coherence_v2 ? "v2 MESI (explicit)" : "v1 legacy");
+    if (coherence_v2) {
+        SPDLOG_INFO("  Coherence v2 snoop timeout: {} ms", opts.coherence_v2_snoop_timeout_ms);
+        if (comm_mode == CommMode::SHM)
+            SPDLOG_INFO("  Coherence v2 SHM object: {}", coherence_v2_shm_name);
+    }
     if (comm_mode == CommMode::PGAS_SHM) {
         SPDLOG_INFO("  PGAS SHM Name: {}", pgas_shm_name);
     }
@@ -826,10 +886,10 @@ int main(int argc, char *argv[]) {
     SPDLOG_INFO("  Port: {}", port);
     SPDLOG_INFO("  Topology: {}", topology);
     SPDLOG_INFO("  Capacity: {} MB", capacity);
-    const char *backing_mode_label = backing_mode == SharedMemoryManager::BackingMode::SsdStream
-                                         ? "SSD streaming"
-                                     : backing_mode == SharedMemoryManager::BackingMode::FileMmap ? "mmap file"
-                                                                                                   : "POSIX shared memory";
+    const char *backing_mode_label = backing_mode == SharedMemoryManager::BackingMode::SsdStream ? "SSD streaming"
+                                     : backing_mode == SharedMemoryManager::BackingMode::FileMmap
+                                         ? "mmap file"
+                                         : "POSIX shared memory";
     SPDLOG_INFO("  Backing Mode: {}", backing_mode_label);
     if (backing_mode == SharedMemoryManager::BackingMode::FileMmap) {
         SPDLOG_INFO("  Backing File: {}", backing_file);
@@ -983,7 +1043,8 @@ int main(int argc, char *argv[]) {
 
     try {
         ThreadPerConnectionServer server(port, controller, capacity, backing_file, comm_mode, pgas_shm_name,
-                                         backing_mode, ssd_config);
+                                         backing_mode, ssd_config, coherence_v2, coherence_v2_snoop_timeout,
+                                         coherence_v2_shm_name);
 
         if (!server.start()) {
             SPDLOG_ERROR("Failed to start server");
@@ -1023,6 +1084,14 @@ bool ThreadPerConnectionServer::start() {
         if (!shm_comm_manager->initialize()) {
             SPDLOG_ERROR("Failed to initialize shared memory communication");
             return false;
+        }
+        if (coherence_v2_enabled_) {
+            coherence_v2_shm_listener_ = cxlmemsim::CoherenceShmTransportV2::createServer(coherence_v2_shm_name_);
+            if (!coherence_v2_shm_listener_) {
+                SPDLOG_ERROR("Failed to create coherence v2 shared memory transport {}", coherence_v2_shm_name_);
+                return false;
+            }
+            SPDLOG_INFO("Coherence v2 duplex SHM listener ready at {}", coherence_v2_shm_name_);
         }
         SPDLOG_INFO("Server using shared memory communication mode");
         SPDLOG_INFO("No TCP port binding - communication via /dev/shm only");
@@ -1148,6 +1217,8 @@ void ThreadPerConnectionServer::stop() {
             server_fd = -1;
         }
     }
+    if (coherence_v2_shm_listener_)
+        coherence_v2_shm_listener_->close();
 
     std::vector<int> fds_to_close;
     {
@@ -1169,6 +1240,14 @@ void ThreadPerConnectionServer::stop() {
         }
         client_threads.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(coherence_v2_shm_threads_mutex_);
+        for (auto &thread : coherence_v2_shm_threads_) {
+            if (thread.joinable())
+                thread.join();
+        }
+        coherence_v2_shm_threads_.clear();
+    }
 
     // Print final server operation statistics
     SPDLOG_INFO("Server Statistics:");
@@ -1180,6 +1259,25 @@ void ThreadPerConnectionServer::stop() {
     SPDLOG_INFO("  Coherency Invalidations: {}", coherency_invalidations.load());
     SPDLOG_INFO("  Coherency Downgrades: {}", coherency_downgrades.load());
     SPDLOG_INFO("  Back Invalidations: {}", back_invalidations.load());
+
+    if (coherence_v2_directory_ && coherence_v2_engine_) {
+        const auto transitions = coherence_v2_directory_->transitionCounters();
+        const auto audit = coherence_v2_engine_->auditCounters();
+        SPDLOG_INFO("Coherence v2 MESI Statistics:");
+        SPDLOG_INFO("  Directory Lines: {}", coherence_v2_directory_->allocatedLineCount());
+        SPDLOG_INFO("  GETS: {}", transitions.gets);
+        SPDLOG_INFO("  GETM: {}", transitions.getm);
+        SPDLOG_INFO("  UPGRADE: {}", transitions.upgrade);
+        SPDLOG_INFO("  PUTS: {}", transitions.puts);
+        SPDLOG_INFO("  PUTM: {}", transitions.putm);
+        SPDLOG_INFO("  Atomic: {}", transitions.atomic);
+        SPDLOG_INFO("  Administrative Evict: {}", transitions.administrative_evict);
+        SPDLOG_INFO("  Timeout: {}", audit.timeout);
+        SPDLOG_INFO("  Partial ACK: {}", audit.partial_ack);
+        SPDLOG_INFO("  Stale ACK: {}", audit.stale_ack);
+        SPDLOG_INFO("  Invalid Ownership: {}", audit.invalid_ownership);
+        SPDLOG_INFO("Legacy controller counters below exclude coherence v2 endpoint traffic");
+    }
 
     // Print CXL controller topology statistics (switches/expanders/counters)
     if (controller) {
@@ -1753,8 +1851,8 @@ void ThreadPerConnectionServer::handle_bi_request(int thread_id, const ServerReq
         uint64_t cacheline_addr = req.addr & SHM_CACHELINE_MASK;
         std::vector<uint8_t> dirty_data(req.data, req.data + size);
 
-        if (req.addr > std::numeric_limits<uint64_t>::max() - (size - 1) ||
-            !shm_manager->is_valid_address(req.addr) || !shm_manager->is_valid_address(req.addr + size - 1)) {
+        if (req.addr > std::numeric_limits<uint64_t>::max() - (size - 1) || !shm_manager->is_valid_address(req.addr) ||
+            !shm_manager->is_valid_address(req.addr + size - 1)) {
             SPDLOG_ERROR("Thread {}: Invalid BI writeback address 0x{:x}", thread_id, req.addr);
             resp.status = 1;
             break;
@@ -1979,7 +2077,28 @@ void ThreadPerConnectionServer::handle_client(int client_fd, int thread_id) {
         SPDLOG_INFO("Thread {}: Client connected (fd={})", thread_id, client_fd);
     }
 
-    while (running && !shutdown_requested()) {
+    bool serve_legacy = true;
+    const auto client_protocol = cxlmemsim::detectServerClientProtocol(client_fd, coherence_v2_enabled_);
+    if (client_protocol == cxlmemsim::ServerClientProtocol::CoherenceV2) {
+        const auto connection_id = next_coherence_v2_connection_id_.fetch_add(1, std::memory_order_relaxed);
+        if (connection_id == 0 || coherence_v2_server_ == nullptr) {
+            SPDLOG_ERROR("Thread {}: Coherence v2 connection ID space exhausted or server unavailable", thread_id);
+        } else {
+            SPDLOG_INFO("Thread {}: Entering registered coherence v2 domain as connection {}", thread_id,
+                        connection_id);
+            if (!cxlmemsim::serveCoherenceV2Stream(*coherence_v2_server_, connection_id, client_fd, "tcp")) {
+                SPDLOG_WARN("Thread {}: Coherence v2 transport ended with an I/O or protocol error", thread_id);
+            }
+        }
+        serve_legacy = false;
+    } else if (client_protocol == cxlmemsim::ServerClientProtocol::Closed) {
+        serve_legacy = false;
+    } else if (client_protocol == cxlmemsim::ServerClientProtocol::Error) {
+        SPDLOG_WARN("Thread {}: Could not classify client protocol", thread_id);
+        serve_legacy = false;
+    }
+
+    while (serve_legacy && running && !shutdown_requested()) {
         ServerRequest req;
         ssize_t received = recv(client_fd, &req, sizeof(req), MSG_WAITALL);
 
@@ -2056,7 +2175,8 @@ void ThreadPerConnectionServer::handle_client(int client_fd, int thread_id) {
 
         // Clamp size to data buffer limit to prevent out-of-bounds reads
         if ((req.op_type == OP_READ || req.op_type == OP_WRITE || req.op_type == OP_LSA_READ ||
-             req.op_type == OP_LSA_WRITE) && req.size > sizeof(req.data)) {
+             req.op_type == OP_LSA_WRITE) &&
+            req.size > sizeof(req.data)) {
             SPDLOG_WARN("Thread {}: Clamping request size from {} to {} (data buffer limit)", thread_id,
                         (uint64_t)req.size, sizeof(req.data));
             req.size = sizeof(req.data);
@@ -2163,6 +2283,9 @@ void ThreadPerConnectionServer::run_shm_mode() {
     const int num_workers = 4; // Configurable number of worker threads
     std::vector<std::thread> workers;
 
+    if (coherence_v2_shm_listener_)
+        workers.emplace_back(&ThreadPerConnectionServer::handle_coherence_v2_shm_connections, this);
+
     for (int i = 0; i < num_workers; i++) {
         workers.emplace_back(&ThreadPerConnectionServer::handle_shm_requests, this);
     }
@@ -2172,6 +2295,30 @@ void ThreadPerConnectionServer::run_shm_mode() {
         if (worker.joinable()) {
             worker.join();
         }
+    }
+
+    if (coherence_v2_shm_listener_)
+        coherence_v2_shm_listener_->close();
+    std::lock_guard<std::mutex> lock(coherence_v2_shm_threads_mutex_);
+    for (auto &thread : coherence_v2_shm_threads_) {
+        if (thread.joinable())
+            thread.join();
+    }
+    coherence_v2_shm_threads_.clear();
+}
+
+void ThreadPerConnectionServer::handle_coherence_v2_shm_connections() {
+    while (running && !shutdown_requested()) {
+        auto channel = coherence_v2_shm_listener_->accept(std::chrono::milliseconds(100));
+        if (!channel)
+            continue;
+        std::lock_guard<std::mutex> lock(coherence_v2_shm_threads_mutex_);
+        coherence_v2_shm_threads_.emplace_back([this, channel = std::move(*channel)]() mutable {
+            const auto connection = channel.connectionId();
+            SPDLOG_INFO("Accepted coherence v2 SHM channel {}", connection);
+            if (!cxlmemsim::serveCoherenceV2ShmChannel(*coherence_v2_server_, channel))
+                SPDLOG_WARN("Coherence v2 SHM channel {} ended with a protocol error", connection);
+        });
     }
 }
 

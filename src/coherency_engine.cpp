@@ -18,7 +18,8 @@ DirectoryEntry::DirectoryEntry()
 
 CoherencyEngine::CoherencyEngine(uint32_t local_node, HDMDecoder *decoder, LogPModel *logp, uint32_t max_heads,
                                  double bandwidth_gbps)
-    : local_node_id_(local_node), hdm_decoder_(decoder), logp_model_(logp), bandwidth_gbps_(bandwidth_gbps) {
+    : local_node_id_(local_node), hdm_decoder_(decoder), logp_model_(logp), bandwidth_gbps_(bandwidth_gbps),
+      strict_v2_transaction_engine_(std::make_unique<cxlmemsim::mesi_v2::MesiTransactionEngine>(strict_v2_directory_)) {
     heads_.resize(max_heads);
     for (uint32_t i = 0; i < max_heads; i++) {
         heads_[i].head_id = i;
@@ -26,6 +27,8 @@ CoherencyEngine::CoherencyEngine(uint32_t local_node, HDMDecoder *decoder, LogPM
         heads_[i].bandwidth_share = 0.0;
     }
 }
+
+CoherencyEngine::~CoherencyEngine() = default;
 
 DirectoryEntry *CoherencyEngine::get_or_create_entry(uint64_t addr) {
     uint64_t cl_addr = addr & ~(CACHELINE_SIZE - 1);
@@ -518,6 +521,66 @@ CoherencyEngine::Stats CoherencyEngine::get_stats() const {
     stats.avg_coherency_latency = ops > 0 ? static_cast<double>(lat) / ops : 0.0;
 
     return stats;
+}
+
+namespace {
+
+cxlmemsim::mesi_v2::TransitionResult
+strictCompatibilityResult(const cxlmemsim::mesi_v2::TransactionResult &transaction) {
+    if (transaction.status == cxlmemsim::protocol_v2::Status::Ok && transaction.granted)
+        return transaction.transition;
+    const auto failure = transaction.status == cxlmemsim::protocol_v2::Status::StaleEpoch
+                             ? cxlmemsim::mesi_v2::TransitionStatus::StaleMetadata
+                             : cxlmemsim::mesi_v2::TransitionStatus::InvalidState;
+    return {failure, transaction.transition.snapshot};
+}
+
+} // namespace
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Gets(uint64_t line_address, std::uint16_t requester) {
+    const auto session = strict_v2_transaction_engine_->sessionFor(requester);
+    return strictCompatibilityResult(strict_v2_transaction_engine_->gets(line_address, {requester, session, 0}));
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Getm(uint64_t line_address, std::uint16_t requester) {
+    const auto session = strict_v2_transaction_engine_->sessionFor(requester);
+    return strictCompatibilityResult(strict_v2_transaction_engine_->getm(line_address, {requester, session, 0}));
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Upgrade(uint64_t line_address, std::uint16_t requester) {
+    const auto session = strict_v2_transaction_engine_->sessionFor(requester);
+    return strictCompatibilityResult(strict_v2_transaction_engine_->upgrade(line_address, {requester, session, 0}));
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Puts(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_transaction_engine_->puts(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionResult CoherencyEngine::strictV2Putm(uint64_t line_address, std::uint16_t requester) {
+    return strict_v2_transaction_engine_->putm(line_address, requester);
+}
+
+cxlmemsim::mesi_v2::TransitionCounters CoherencyEngine::strictV2TransitionCounters() const noexcept {
+    return strict_v2_directory_.transitionCounters();
+}
+
+void CoherencyEngine::configureStrictV2(cxlmemsim::CoherenceMemoryBackend &memory,
+                                        cxlmemsim::CoherenceTransport &transport,
+                                        cxlmemsim::mesi_v2::MesiTransactionEngine::Duration snoop_timeout) {
+    strict_v2_transaction_engine_->configure(memory, transport, snoop_timeout);
+}
+
+cxlmemsim::mesi_v2::AckDisposition
+CoherencyEngine::strictV2HandleSnoopAck(const cxlmemsim::protocol_v2::CoherenceFrame &ack) {
+    return strict_v2_transaction_engine_->handleSnoopAck(ack);
+}
+
+std::size_t CoherencyEngine::strictV2Progress(cxlmemsim::mesi_v2::MesiTransactionEngine::TimePoint now) {
+    return strict_v2_transaction_engine_->progress(now);
+}
+
+std::size_t CoherencyEngine::strictV2NotifyDisconnect(std::uint16_t host_id, std::uint64_t session_id) {
+    return strict_v2_transaction_engine_->notifyDisconnect(host_id, session_id);
 }
 
 double CoherencyEngine::send_remote_invalidate(uint32_t target, uint64_t addr, uint64_t ts) {
